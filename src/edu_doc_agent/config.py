@@ -41,6 +41,8 @@ class Settings(BaseSettings):
     llm_provider: str | None = None
     llm_api_key: str | None = None
     llm_model: str | None = None
+    llm_base_url: str | None = None
+    llm_rpm: int | None = None  # лимит запросов в минуту у ключа; None — без ограничения
     embedding_model: str | None = None
 
     @field_validator("data_dir", mode="before")
