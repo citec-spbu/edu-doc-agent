@@ -9,8 +9,11 @@ dependencies = [
     "httpx>=0.28.1",
     "pydantic-settings>=2.15.0",
     "python-docx>=1.2.0",
+    # pymorphy2 (зависимость yargy) импортирует pkg_resources, удалённый в setuptools>=81
+    "setuptools<81",
     "streamlit>=1.65.0",
     "uvicorn[standard]>=0.54.0",
+    "yargy>=0.16.0",
 ]
 
 [project.scripts]
