@@ -1,6 +1,6 @@
 # edu-doc-agent
 
-![CI](https://github.com/Apophis142/edu-doc-agent/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/citec-spbu/edu-doc-agent/actions/workflows/ci.yml/badge.svg)
 
 Агентная ИИ-система интеллектуального анализа, автоматизированного формирования
 и проверки учебно-методических документов образовательной программы.
@@ -11,6 +11,7 @@
 и протокол проверки с рекомендациями.
 
 **Заказчик:** ОЦАД СПбГУ
+
 **Кураторы:** Коваленко Лев, Севрюков С.Ю., И.С. Блеканов
 
 ## Быстрый старт
@@ -19,7 +20,7 @@
 Команды ниже рассчитаны на Bash (Linux/macOS или WSL).
 
 ```bash
-git clone https://github.com/Apophis142/edu-doc-agent.git
+git clone https://github.com/citec-spbu/edu-doc-agent.git
 cd edu-doc-agent
 
 # 1. Зависимости
@@ -104,10 +105,10 @@ data/                реальные документы — вне git
 
 ## Документация
 
-- [Разбор проекта](#)
-- [Архитектура](#)
-- [Как мы работаем](#)
-- [Решения (ADR)](#)
+- [Разбор проекта](docs/project-review.md)
+- [Архитектура](docs/architecture.md)
+- [Как мы работаем](docs/contributing.md)
+- [Решения (ADR)](docs/adr/index.md)
 
 ## Лицензия
 

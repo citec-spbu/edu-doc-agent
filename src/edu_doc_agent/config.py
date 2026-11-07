@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from arq.connections import RedisSettings
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -50,12 +50,16 @@ class Settings(BaseSettings):
     llm_provider: str | None = None
     llm_api_key: str | None = None
     llm_model: str | None = None
+    llm_base_url: str | None = None
+    llm_rpm: int | None = Field(
+        default=None, gt=0
+    )  # лимит запросов в минуту у ключа; None — без ограничения
     embedding_model: str | None = None
 
-    @field_validator("data_dir", mode="before")
+    @field_validator("data_dir", "llm_rpm", mode="before")
     @classmethod
     def _empty_string_is_none(cls, value: object) -> object:
-        # DATA_DIR= в .env — это пустая строка, а не валидный Path.
+        # DATA_DIR= / LLM_RPM= в .env — это пустая строка, а не валидный Path.
         # Приводим её к None, чтобы не падать при старте.
         if value == "":
             return None

@@ -40,3 +40,7 @@ Thumbs.db
 
 # Логи
 *.log
+
+# Локальные заметки для Claude Code и других агентов
+CLAUDE.md
+AGENTS.md

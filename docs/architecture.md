@@ -91,7 +91,7 @@ flowchart LR
 - локально у разработчика — путь в `DATA_DIR`.
 
 В `tests/fixtures/` — только синтетические документы, см.
-[CONTRIBUTING.md](https://github.com/Apophis142/edu-doc-agent/blob/main/CONTRIBUTING.md).
+[CONTRIBUTING.md](https://github.com/citec-spbu/edu-doc-agent/blob/main/CONTRIBUTING.md).
 
 ## Конфигурация
 
