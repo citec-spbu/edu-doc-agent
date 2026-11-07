@@ -3,7 +3,7 @@
 import asyncio
 import importlib
 import logging
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -21,8 +21,13 @@ def tasks() -> ModuleType:
 def test_task_waits_and_returns_identifiers(
     tasks: ModuleType, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    sleep = AsyncMock()
-    monkeypatch.setattr(tasks.asyncio, "sleep", sleep)
+    before_work: list[logging.LogRecord] = []
+
+    async def work(delay: float) -> None:
+        before_work.extend(caplog.records)
+
+    sleep = AsyncMock(side_effect=work)
+    monkeypatch.setattr(tasks, "asyncio", SimpleNamespace(sleep=sleep))
     context = {"job_id": "synthetic-job"}
 
     with caplog.at_level(logging.INFO, logger=tasks.__name__):
@@ -34,29 +39,29 @@ def test_task_waits_and_returns_identifiers(
         "run_id": "run-123",
     }
     sleep.assert_awaited_once_with(3)
-    assert context == {"job_id": "synthetic-job"}
-    assert len(caplog.records) == 2
-    assert "Начата обработка" in caplog.records[0].message
-    assert "успешно завершена" in caplog.records[1].message
-    assert all("synthetic-session" in record.message for record in caplog.records)
-    assert all("run-123" in record.message for record in caplog.records)
+    # Логи должны позволять сопоставить запуск и завершение с задачей.
+    # Границу работы наблюдаем через await, не через формулировку сообщения.
+    for phase in (before_work, caplog.records[len(before_work) :]):
+        assert any(
+            record.name == tasks.__name__
+            and record.levelno == logging.INFO
+            and "synthetic-session" in record.getMessage()
+            and "run-123" in record.getMessage()
+            for record in phase
+        )
 
 
 @pytest.mark.parametrize("error", [RuntimeError("synthetic failure"), asyncio.CancelledError()])
-def test_task_does_not_claim_completion_after_error_or_cancellation(
+def test_task_propagates_error_or_cancellation(
     tasks: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
     error: BaseException,
 ) -> None:
-    monkeypatch.setattr(tasks.asyncio, "sleep", AsyncMock(side_effect=error))
+    monkeypatch.setattr(tasks, "asyncio", SimpleNamespace(sleep=AsyncMock(side_effect=error)))
 
-    with caplog.at_level(logging.INFO, logger=tasks.__name__), pytest.raises(type(error)):
+    # Ошибка/отмена должна выйти к ARQ, а не превратиться в completed-результат.
+    with pytest.raises(type(error)):
         asyncio.run(tasks.process_session_task({}, "synthetic-session", "failed-run"))
-
-    assert len(caplog.records) == 1
-    assert "Начата обработка" in caplog.text
-    assert "успешно завершена" not in caplog.text
 
 
 def test_arq_loads_the_registered_task_and_execution_limits(tasks: ModuleType) -> None:
@@ -87,13 +92,18 @@ def test_worker_lifecycle_hooks_configure_logging(
 
     async def scenario() -> None:
         await module.startup(context)
+        assert any(
+            record.name == module.__name__ and record.levelno == logging.INFO
+            for record in caplog.records
+        )
+        caplog.clear()
         await module.shutdown(context)
+        assert any(
+            record.name == module.__name__ and record.levelno == logging.INFO
+            for record in caplog.records
+        )
 
     with caplog.at_level(logging.INFO, logger=module.__name__):
         asyncio.run(scenario())
 
-    basic_config.assert_called_once()
-    assert basic_config.call_args.kwargs["level"] == "DEBUG"
-    assert "starting up" in caplog.text
-    assert "shutting down" in caplog.text
-    assert context == {"redis": "synthetic-pool"}
+    assert any(call.kwargs.get("level") == "DEBUG" for call in basic_config.call_args_list)

@@ -1,16 +1,30 @@
 """Контракт HTTP → очередь, включая регрессии из PR #29."""
 
 import asyncio
+import logging
 from contextlib import suppress
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 from uuid import UUID
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import RedisError, ResponseError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
+from edu_doc_agent.api import router as api_router
 from edu_doc_agent.main import app
+
+
+@pytest.fixture
+def fast_enqueue_timeout(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    """Проверяем продуктовый deadline, исполняя ожидание с коротким таймером."""
+    timeout = Mock(side_effect=lambda delay: asyncio.timeout(0.05))
+    # Подмена ссылки только в роуте; таймеры HTTP-клиента и самого теста не меняются.
+    monkeypatch.setattr(api_router, "asyncio", SimpleNamespace(timeout=timeout))
+    return timeout
 
 
 @pytest.mark.parametrize("session_id", ["test-123", "сессия-ОП", "arbitrary.string"])
@@ -22,7 +36,7 @@ def test_process_enqueues_job_with_response_identifiers(
     assert response.status_code == 202
     body = response.json()
     assert set(body) == {"run_id", "session_id", "status"}
-    assert UUID(body["run_id"]).version == 4
+    UUID(body["run_id"])  # Контракт требует корректный UUID без ограничения версии.
     assert body["session_id"] == session_id
     assert body["status"] == "queued"
     redis_pool.enqueue_job.assert_awaited_once_with(
@@ -33,8 +47,11 @@ def test_process_enqueues_job_with_response_identifiers(
     )
 
 
-def test_repeated_requests_create_distinct_runs(client: TestClient, redis_pool: AsyncMock) -> None:
-    responses = [client.post("/api/v1/sessions/same-session/process") for _ in range(2)]
+def test_different_sessions_create_distinct_runs(client: TestClient, redis_pool: AsyncMock) -> None:
+    responses = [
+        client.post(f"/api/v1/sessions/{session_id}/process")
+        for session_id in ("first-session", "second-session")
+    ]
 
     assert [response.status_code for response in responses] == [202, 202]
     ids = [response.json()["run_id"] for response in responses]
@@ -66,33 +83,82 @@ def test_enqueue_conflict_does_not_claim_a_new_job(
     redis_pool.enqueue_job.assert_awaited_once()
 
 
-@pytest.mark.parametrize("error", [RedisConnectionError("synthetic failure"), TimeoutError()])
+@pytest.mark.parametrize(
+    ("error", "expected_status"),
+    [
+        pytest.param(TimeoutError("synthetic-private-details"), 503, id="python-timeout"),
+        pytest.param(RedisConnectionError("synthetic-private-details"), 503, id="redis-connection"),
+        pytest.param(RedisTimeoutError("synthetic-private-details"), 503, id="redis-timeout"),
+        pytest.param(RedisError("synthetic-private-details"), 503, id="redis-base-error"),
+        pytest.param(ResponseError("synthetic-private-details"), 503, id="redis-response-error"),
+        pytest.param(RuntimeError("synthetic-private-details"), 500, id="internal-error"),
+    ],
+)
 # PR #29 P2: https://github.com/citec-spbu/edu-doc-agent/pull/29#discussion_r4478029967
 @pytest.mark.pr_review
 def test_queue_errors_have_a_service_error_response(
-    redis_pool: AsyncMock, error: Exception
+    redis_pool: AsyncMock, error: Exception, expected_status: int
 ) -> None:
     app.state.redis_pool = redis_pool
     redis_pool.enqueue_job.side_effect = error
     with TestClient(app, raise_server_exceptions=False) as client:
         response = client.post("/api/v1/sessions/unavailable/process")
 
-    assert response.status_code in {503, 504}
-    assert isinstance(response.json()["detail"], str)
+    assert response.status_code == expected_status
+    body = response.json()
+    assert set(body) == {"detail"}
+    assert isinstance(body["detail"], str) and body["detail"]
+    assert str(error) not in response.text
     redis_pool.enqueue_job.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status"),
+    [
+        pytest.param(RedisError("synthetic redis failure"), 503, id="redis"),
+        pytest.param(RuntimeError("synthetic internal failure"), 500, id="internal"),
+    ],
+)
+def test_queue_error_logs_include_session_and_cause(
+    client: TestClient,
+    redis_pool: AsyncMock,
+    caplog: pytest.LogCaptureFixture,
+    error: Exception,
+    expected_status: int,
+) -> None:
+    redis_pool.enqueue_job.side_effect = error
+
+    with caplog.at_level(logging.ERROR, logger=api_router.__name__):
+        response = client.post("/api/v1/sessions/logged-session/process")
+
+    assert response.status_code == expected_status
+    records = [record for record in caplog.records if record.name == api_router.__name__]
+    assert any(
+        record.levelno == logging.ERROR
+        and "logged-session" in record.getMessage()
+        and str(error) in record.getMessage()
+        for record in records
+    )
+    assert str(error) not in response.text
 
 
 # PR #29 P2: https://github.com/citec-spbu/edu-doc-agent/pull/29#discussion_r4478029967
 @pytest.mark.pr_review
-def test_silent_redis_has_a_deadline_without_blind_retry(redis_pool: AsyncMock) -> None:
+def test_silent_redis_has_a_deadline_without_blind_retry(
+    redis_pool: AsyncMock, fast_enqueue_timeout: Mock
+) -> None:
     async def scenario() -> None:
         started = asyncio.Event()
+        cancelled = asyncio.Event()
         recorded_jobs = []
 
         async def written_but_no_reply(*args, **kwargs):
             recorded_jobs.append(kwargs["_job_id"])
             started.set()
-            await asyncio.Event().wait()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
 
         redis_pool.enqueue_job.side_effect = written_but_no_reply
         app.state.redis_pool = redis_pool
@@ -105,20 +171,57 @@ def test_silent_redis_has_a_deadline_without_blind_retry(redis_pool: AsyncMock) 
                 await asyncio.wait_for(started.wait(), timeout=1)
                 health = await client.get("/health")
                 assert health.status_code == 200
-                # Защитный предел теста; production deadline должен быть меньше него.
+                # Watchdog с запасом относительно короткого тестового таймера.
                 done, _ = await asyncio.wait({request}, timeout=2)
-                assert done, "enqueue_job must have a server-side deadline below 2 seconds"
+                assert done, "enqueue_job did not stop after its deadline"
                 response = request.result()
-                assert response.status_code in {503, 504}
-                assert isinstance(response.json()["detail"], str)
+                assert response.status_code == 503
+                assert set(response.json()) == {"detail"}
+                assert isinstance(response.json()["detail"], str) and response.json()["detail"]
+                assert cancelled.is_set()
                 assert len(recorded_jobs) == 1
                 redis_pool.enqueue_job.assert_awaited_once()
+                fast_enqueue_timeout.assert_called_once_with(2.0)
             finally:
                 request.cancel()
                 with suppress(asyncio.CancelledError):
                     await request
 
     asyncio.run(scenario())
+
+
+def test_external_cancellation_reaches_enqueue_without_error_response_or_retry(
+    redis_pool: AsyncMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def scenario() -> None:
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def pending_enqueue(*args, **kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        redis_pool.enqueue_job.side_effect = pending_enqueue
+        request = asyncio.create_task(api_router.process_session("cancelled-session", redis_pool))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=1)
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+            assert request.cancelled()
+            assert cancelled.is_set()
+            redis_pool.enqueue_job.assert_awaited_once()
+        finally:
+            request.cancel()
+            with suppress(asyncio.CancelledError):
+                await request
+
+    with caplog.at_level(logging.ERROR, logger=api_router.__name__):
+        asyncio.run(scenario())
+    assert not [record for record in caplog.records if record.name == api_router.__name__]
 
 
 def test_openapi_exposes_process_contract(client: TestClient) -> None:

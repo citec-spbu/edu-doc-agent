@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -30,6 +31,55 @@ from edu_doc_agent.api import router
 from edu_doc_agent.config import Settings
 
 pytestmark = pytest.mark.integration
+
+
+def _redis_container_command(*arguments: str, missing_ok: bool = False) -> str:
+    completed = subprocess.run(
+        ["docker", *arguments], capture_output=True, text=True, timeout=30, check=False
+    )
+    if completed.returncode:
+        if missing_ok and "No such container" in completed.stderr:
+            return ""
+        raise RuntimeError(
+            f"Redis test container command failed: {arguments!r}\n{completed.stderr}"
+        )
+    return completed.stdout.strip()
+
+
+def _start_redis_container(name: str, port: int | None = None) -> None:
+    _redis_container_command(
+        "run",
+        "--detach",
+        "--pull=never",
+        "--name",
+        name,
+        "--publish",
+        f"127.0.0.1:{port or ''}:6379",
+        "redis:7-alpine",
+        "redis-server",
+        "--save",
+        "",
+        "--appendonly",
+        "no",
+    )
+
+
+@pytest.fixture
+def managed_redis() -> Iterator[tuple[str, int]]:
+    """Отдельный Redis для fault-тестов; TEST_REDIS_URL не затрагивается."""
+    name = f"edu-doc-recovery-{uuid4().hex}"
+    try:
+        _start_redis_container(name)
+        address = _redis_container_command("port", name, "6379")
+        yield name, int(address.rsplit(":", 1)[1])
+    finally:
+        _redis_container_command("rm", "--force", name, missing_ok=True)
+
+
+async def _wait_for_managed_redis(port: int) -> None:
+    settings = RedisSettings(host="127.0.0.1", port=port, conn_retries=5, conn_retry_delay=1)
+    probe = await asyncio.wait_for(create_pool(settings), timeout=10)
+    await probe.aclose(close_connection_pool=True)
 
 
 @pytest.fixture
@@ -102,6 +152,7 @@ def test_http_to_redis_to_worker(redis_dsn: str, monkeypatch: pytest.MonkeyPatch
                 job = Job(body["run_id"], pool, _queue_name=name)
                 assert await job.status() == JobStatus.queued
                 info = await job.info()
+                assert info is not None
                 assert info.function == "process_session_task"
                 assert info.kwargs == {
                     "session_id": "integration-session",
@@ -232,14 +283,13 @@ def test_local_api_and_arq_cli_process_a_session(
 
 # PR #29 P3: https://github.com/citec-spbu/edu-doc-agent/pull/29#discussion_r4478047239
 @pytest.mark.pr_review
-def test_duplicate_job_id_is_not_reported_as_a_new_run(
+def test_active_session_rejects_a_second_run(
     redis_dsn: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def scenario() -> None:
-        async with queue(redis_dsn, monkeypatch) as (pool, name, identifiers):
-            fixed_id = uuid4()
-            identifiers.append(str(fixed_id))
-            monkeypatch.setattr(router, "uuid4", lambda: fixed_id)
+        # Документированный контракт: один активный run на сессию.
+        # Worker не запущен: первая задача остаётся в очереди до второго запроса.
+        async with queue(redis_dsn, monkeypatch) as (pool, name, _):
             main.app.state.redis_pool = pool
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=main.app), base_url="http://test"
@@ -247,8 +297,129 @@ def test_duplicate_job_id_is_not_reported_as_a_new_run(
                 first = await client.post("/api/v1/sessions/synthetic-duplicate/process")
                 second = await client.post("/api/v1/sessions/synthetic-duplicate/process")
             assert first.status_code == 202
-            assert await pool.zcard(name) == 1
             assert second.status_code == 409
             assert isinstance(second.json()["detail"], str)
+            assert "run_id" not in second.json()
+            assert await pool.zcard(name) == 1
+            first_job = await Job(first.json()["run_id"], pool, _queue_name=name).info()
+            assert first_job is not None
+            assert first_job.kwargs["session_id"] == "synthetic-duplicate"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.pr_review
+@pytest.mark.parametrize(
+    ("session_names", "expected_statuses"),
+    [
+        pytest.param(("same", "same"), [202, 409], id="same-session"),
+        pytest.param(("first", "second"), [202, 202], id="different-sessions"),
+    ],
+)
+def test_concurrent_requests_preserve_session_isolation(
+    redis_dsn: str,
+    monkeypatch: pytest.MonkeyPatch,
+    session_names: tuple[str, str],
+    expected_statuses: list[int],
+) -> None:
+    """Одна сессия допускает один run; разные сессии не блокируют друг друга."""
+
+    async def scenario() -> None:
+        suffix = uuid4().hex
+        session_ids = [f"synthetic-{name}-{suffix}" for name in session_names]
+        async with queue(redis_dsn, monkeypatch) as (pool, name, _):
+            main.app.state.redis_pool = pool
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=main.app), base_url="http://test"
+            ) as client:
+                ready = asyncio.Barrier(2)
+
+                async def post(session_id: str) -> httpx.Response:
+                    # Оба запроса готовы до начала обработки, без произвольных sleep.
+                    await ready.wait()
+                    return await client.post(f"/api/v1/sessions/{session_id}/process")
+
+                responses = await asyncio.wait_for(
+                    asyncio.gather(*(post(session_id) for session_id in session_ids)), timeout=10
+                )
+
+            # Worker не запущен: очередь отражает все принятые задачи.
+            queued_ids = {value.decode() for value in await pool.zrange(name, 0, -1)}
+            actual_statuses = sorted(response.status_code for response in responses)
+            assert actual_statuses == expected_statuses, (
+                f"statuses={actual_statuses}, queued_jobs={len(queued_ids)}"
+            )
+            accepted = [response for response in responses if response.status_code == 202]
+            run_ids = {response.json()["run_id"] for response in accepted}
+            assert len(run_ids) == expected_statuses.count(202)
+            assert queued_ids == run_ids
+
+            for session_id, response in zip(session_ids, responses, strict=True):
+                body = response.json()
+                if response.status_code == 409:
+                    assert isinstance(body["detail"], str) and body["detail"]
+                    assert "run_id" not in body
+                    continue
+                assert body["session_id"] == session_id
+                assert body["status"] == "queued"
+                job = await Job(body["run_id"], pool, _queue_name=name).info()
+                assert job is not None
+                assert job.kwargs == {"session_id": session_id, "run_id": body["run_id"]}
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("outage", ["stopped", "paused"])
+def test_redis_recovers_after_outage_with_the_same_api_pool(
+    managed_redis: tuple[str, int], monkeypatch: pytest.MonkeyPatch, outage: str
+) -> None:
+    """503 при отказе/молчании Redis и 202 после восстановления на том же адресе."""
+    container, port = managed_redis
+
+    async def scenario() -> None:
+        await _wait_for_managed_redis(port)
+        dsn = f"redis://127.0.0.1:{port}/15"
+        async with queue(dsn, monkeypatch) as (pool, name, _):
+            main.app.state.redis_pool = pool
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=main.app), base_url="http://test"
+            ) as client:
+                before = await client.post("/api/v1/sessions/before-outage/process")
+                assert before.status_code == 202
+                before_info = await Job(before.json()["run_id"], pool, _queue_name=name).info()
+                assert before_info is not None
+
+                if outage == "paused":
+                    _redis_container_command("pause", container)
+                else:
+                    _redis_container_command("stop", "--timeout", "1", container)
+                try:
+                    assert (await client.get("/health")).status_code == 200
+                    failed = await asyncio.wait_for(
+                        client.post("/api/v1/sessions/during-outage/process"), timeout=5
+                    )
+                    assert failed.status_code == 503
+                    assert set(failed.json()) == {"detail"}
+                    assert isinstance(failed.json()["detail"], str) and failed.json()["detail"]
+                finally:
+                    if outage == "paused":
+                        _redis_container_command("unpause", container)
+                    else:
+                        _redis_container_command("rm", container)
+                        _start_redis_container(container, port)
+
+                await _wait_for_managed_redis(port)
+                after = await client.post("/api/v1/sessions/after-outage/process")
+                assert after.status_code == 202
+                assert main.app.state.redis_pool is pool
+                assert after.json()["run_id"] != before.json()["run_id"]
+                after_info = await Job(after.json()["run_id"], pool, _queue_name=name).info()
+                assert after_info is not None
+                assert after_info.kwargs == {
+                    "session_id": "after-outage",
+                    "run_id": after.json()["run_id"],
+                }
+                # После timeout результат записи неизвестен: не требуем отсутствия
+                # задания during-outage, которое Redis мог успеть принять.
 
     asyncio.run(scenario())
