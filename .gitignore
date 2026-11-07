@@ -40,3 +40,6 @@ Thumbs.db
 
 # Логи
 *.log
+
+# Локальные заметки для Claude Code
+CLAUDE.md
