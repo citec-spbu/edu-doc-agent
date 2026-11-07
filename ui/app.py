@@ -58,4 +58,4 @@ with tab_report:
     st.info("Протокол проверки и карты связей появятся в M3–M4.")
 
 st.divider()
-st.caption(f"Документация: https://apophis142.github.io/edu-doc-agent/ · API URL: `{API_URL}`")
+st.caption(f"Документация: https://citec-spbu.github.io/edu-doc-agent/ · API URL: `{API_URL}`")

@@ -23,7 +23,7 @@ jobs:
       LLM_PROVIDER: ${{ vars.LLM_PROVIDER }}
       MODEL: ${{ inputs.model }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
@@ -33,7 +33,7 @@ jobs:
             --dataset "${{ inputs.dataset }}" \
             --model "$MODEL" \
             --out eval-report
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: eval-report-${{ inputs.model }}
           path: eval-report

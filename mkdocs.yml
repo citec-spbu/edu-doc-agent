@@ -1,7 +1,7 @@
 site_name: edu-doc-agent
 site_description: Агентная ИИ-система проверки учебно-методических документов
-site_url: https://apophis142.github.io/edu-doc-agent/
-repo_url: https://github.com/Apophis142/edu-doc-agent
+site_url: https://citec-spbu.github.io/edu-doc-agent/
+repo_url: https://github.com/citec-spbu/edu-doc-agent
 edit_uri: edit/main/docs/
 
 theme:
@@ -42,5 +42,6 @@ nav:
   - Главная: index.md
   - Разбор проекта: project-review.md
   - Архитектура: architecture.md
+  - Архитектура бекенда: backend-architecture.md
   - Как мы работаем: contributing.md
   - Решения (ADR): adr/index.md
