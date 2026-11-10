@@ -7,7 +7,7 @@ import inspect
 import logging
 from collections.abc import Coroutine
 from contextlib import suppress
-from typing import Annotated, Any, TypeVar
+from typing import Annotated, Any
 from uuid import uuid4
 
 from arq.connections import ArqRedis
@@ -31,8 +31,6 @@ else
     return 0
 end
 """
-
-T = TypeVar("T")
 
 
 def get_session_lock_key(redis_pool: Any, session_id: str) -> str:
@@ -73,7 +71,7 @@ def _consume_task_result(task: asyncio.Task[Any]) -> None:
         task.exception()
 
 
-async def run_with_deadline(coro: Coroutine[Any, Any, T], timeout: float) -> T:
+async def run_with_deadline[T](coro: Coroutine[Any, Any, T], timeout: float) -> T:
     """
     Ждёт результат не дольше timeout секунд.
 
