@@ -88,7 +88,6 @@ def test_failed_redis_connection_aborts_startup(monkeypatch: pytest.MonkeyPatch)
     create_pool.assert_awaited_once()
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="lifespan lacks try/finally cleanup")
 def test_lifespan_closes_its_pool_when_context_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

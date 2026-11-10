@@ -26,10 +26,12 @@ async def lifespan(app: FastAPI):
         app.state.redis_pool = await create_pool(settings.arq_redis_settings)
         pool_created_here = True
 
-    yield  # Сервер работает и принимает запросы
-
-    if pool_created_here:
-        await app.state.redis_pool.close()
+    try:
+        yield  # Сервер работает и принимает запросы
+    finally:
+        if pool_created_here:
+            await app.state.redis_pool.close()
+            del app.state.redis_pool
 
 
 app = FastAPI(
