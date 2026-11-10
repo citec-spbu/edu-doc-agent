@@ -3,8 +3,7 @@
 import asyncio
 import logging
 from contextlib import suppress
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import httpx
@@ -19,12 +18,12 @@ from edu_doc_agent.main import app
 
 
 @pytest.fixture
-def fast_enqueue_timeout(monkeypatch: pytest.MonkeyPatch) -> Mock:
-    """Проверяем продуктовый deadline, исполняя ожидание с коротким таймером."""
-    timeout = Mock(side_effect=lambda delay: asyncio.timeout(0.05))
-    # Подмена ссылки только в роуте; таймеры HTTP-клиента и самого теста не меняются.
-    monkeypatch.setattr(api_router, "asyncio", SimpleNamespace(timeout=timeout))
-    return timeout
+def fast_enqueue_timeout(monkeypatch: pytest.MonkeyPatch) -> float:
+    """Ускоряем продуктовый deadline постановки в очередь: 0.05 с вместо 2.0 с."""
+    deadline = 0.05
+    # Меняется только число в роуте; таймеры HTTP-клиента и самого теста не затронуты.
+    monkeypatch.setattr(api_router, "ENQUEUE_DEADLINE_SECONDS", deadline)
+    return deadline
 
 
 @pytest.mark.parametrize("session_id", ["test-123", "сессия-ОП", "arbitrary.string"])
@@ -145,7 +144,7 @@ def test_queue_error_logs_include_session_and_cause(
 # PR #29 P2: https://github.com/citec-spbu/edu-doc-agent/pull/29#discussion_r4478029967
 @pytest.mark.pr_review
 def test_silent_redis_has_a_deadline_without_blind_retry(
-    redis_pool: AsyncMock, fast_enqueue_timeout: Mock
+    redis_pool: AsyncMock, fast_enqueue_timeout: float
 ) -> None:
     async def scenario() -> None:
         started = asyncio.Event()
@@ -178,16 +177,19 @@ def test_silent_redis_has_a_deadline_without_blind_retry(
                 assert response.status_code == 503
                 assert set(response.json()) == {"detail"}
                 assert isinstance(response.json()["detail"], str) and response.json()["detail"]
-                assert cancelled.is_set()
+                await asyncio.wait_for(cancelled.wait(), timeout=1)
                 assert len(recorded_jobs) == 1
                 redis_pool.enqueue_job.assert_awaited_once()
-                fast_enqueue_timeout.assert_called_once_with(2.0)
             finally:
                 request.cancel()
                 with suppress(asyncio.CancelledError):
                     await request
 
     asyncio.run(scenario())
+
+
+def test_enqueue_deadline_default() -> None:
+    assert api_router.ENQUEUE_DEADLINE_SECONDS == 2.0
 
 
 def test_external_cancellation_reaches_enqueue_without_error_response_or_retry(
