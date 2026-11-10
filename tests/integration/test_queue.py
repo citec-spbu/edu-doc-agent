@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -25,6 +26,8 @@ from arq.constants import (
 )
 from arq.jobs import Job, JobStatus
 from arq.worker import create_worker
+from redis.asyncio import Redis
+from redis.asyncio.client import Pipeline
 
 from edu_doc_agent import main
 from edu_doc_agent.api import router
@@ -346,9 +349,9 @@ def test_concurrent_requests_preserve_session_isolation(
             # Worker не запущен: очередь отражает все принятые задачи.
             queued_ids = {value.decode() for value in await pool.zrange(name, 0, -1)}
             actual_statuses = sorted(response.status_code for response in responses)
-            assert actual_statuses == expected_statuses, (
-                f"statuses={actual_statuses}, queued_jobs={len(queued_ids)}"
-            )
+            assert (
+                actual_statuses == expected_statuses
+            ), f"statuses={actual_statuses}, queued_jobs={len(queued_ids)}"
             accepted = [response for response in responses if response.status_code == 202]
             run_ids = {response.json()["run_id"] for response in accepted}
             assert len(run_ids) == expected_statuses.count(202)
@@ -421,5 +424,53 @@ def test_redis_recovers_after_outage_with_the_same_api_pool(
                 }
                 # После timeout результат записи неизвестен: не требуем отсутствия
                 # задания during-outage, которое Redis мог успеть принять.
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.pr_review
+def test_enqueue_deadline_holds_when_redis_hangs_after_watch(
+    managed_redis: tuple[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Redis замолкает между WATCH и EXISTS: ответ 503 приходит в пределах дедлайна."""
+    _, port = managed_redis
+    pause_ms = 6000
+    max_response_seconds = 3.0  # дедлайн постановки 2.0 + запас
+
+    async def scenario() -> None:
+        await _wait_for_managed_redis(port)
+        dsn = f"redis://127.0.0.1:{port}/15"
+        admin = Redis.from_url(dsn)
+        injected: list[bool] = []
+        original_exists = Pipeline.exists
+
+        async def exists_after_pause(self, *args, **kwargs):
+            # WATCH уже выполнен; замораживаем Redis один раз, до первого EXISTS.
+            if not injected:
+                injected.append(True)
+                await admin.execute_command("CLIENT", "PAUSE", pause_ms, "ALL")
+            return await original_exists(self, *args, **kwargs)
+
+        try:
+            async with queue(dsn, monkeypatch) as (pool, _, _):
+                main.app.state.redis_pool = pool
+                monkeypatch.setattr(Pipeline, "exists", exists_after_pause)
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=main.app), base_url="http://test"
+                ) as client:
+                    started = time.monotonic()
+                    response = await client.post("/api/v1/sessions/hang-after-watch/process")
+                    elapsed = time.monotonic() - started
+
+                assert injected, "пауза не была внедрена: тест не проверил нужный этап"
+                assert response.status_code == 503
+                assert set(response.json()) == {"detail"}
+                assert elapsed < max_response_seconds, (
+                    f"503 пришёл через {elapsed:.2f}s: очистка pipeline "
+                    f"продлила запрос сверх дедлайна"
+                )
+        finally:
+            # Закрытие (в том числе cleanup очереди выше) дождётся конца паузы.
+            await admin.aclose()
 
     asyncio.run(scenario())
