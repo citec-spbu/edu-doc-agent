@@ -349,9 +349,9 @@ def test_concurrent_requests_preserve_session_isolation(
             # Worker не запущен: очередь отражает все принятые задачи.
             queued_ids = {value.decode() for value in await pool.zrange(name, 0, -1)}
             actual_statuses = sorted(response.status_code for response in responses)
-            assert (
-                actual_statuses == expected_statuses
-            ), f"statuses={actual_statuses}, queued_jobs={len(queued_ids)}"
+            assert actual_statuses == expected_statuses, (
+                f"statuses={actual_statuses}, queued_jobs={len(queued_ids)}"
+            )
             accepted = [response for response in responses if response.status_code == 202]
             run_ids = {response.json()["run_id"] for response in accepted}
             assert len(run_ids) == expected_statuses.count(202)
