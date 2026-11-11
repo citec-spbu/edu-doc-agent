@@ -21,3 +21,11 @@ def test_openapi_schema_available(client: TestClient) -> None:
     schema = response.json()
     assert schema["info"]["title"] == "edu-doc-agent"
     assert "/health" in schema["paths"]
+
+
+def test_root_still_redirects_to_docs(client: TestClient) -> None:
+    response = client.get("/", follow_redirects=False)
+
+    assert response.status_code == 307
+    assert response.headers["location"] == "/docs"
+    assert "/" not in client.get("/openapi.json").json()["paths"]

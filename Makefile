@@ -1,4 +1,4 @@
-.PHONY: help sync lint fmt test test-llm cov run-api run-ui up up-db down logs clean
+.PHONY: help sync lint fmt test test-llm cov run-api run-ui run-worker up up-db down logs clean
 
 help:  ## Показать список целей
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -28,6 +28,9 @@ run-api:  ## API локально с автоперезагрузкой
 
 run-ui:  ## UI локально
 	uv run streamlit run ui/app.py
+
+run-worker:  ## ARQ-воркер локально
+	uv run arq edu_doc_agent.worker.settings.WorkerSettings
 
 up:  ## Вся система в Docker
 	docker compose up --build

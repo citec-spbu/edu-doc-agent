@@ -25,9 +25,10 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
 
-  test:
-    name: test
+  unit-integration:
+    name: unit-integration
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     services:
       db:
         image: pgvector/pgvector:pg17
@@ -41,26 +42,67 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     env:
       DATABASE_URL: postgresql+psycopg://edu:edu@localhost:5432/edu
+      TEST_REDIS_URL: redis://127.0.0.1:6379/15
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       - run: uv sync --locked
-      - run: uv run pytest --cov=edu_doc_agent --cov-report=term-missing
+      - name: Unit and Redis integration tests
+        run: uv run --no-sync pytest --run-integration --cov=edu_doc_agent --cov-branch --cov-report=term-missing -ra
 
   docker-build:
     name: docker-build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv sync --locked
       - uses: docker/setup-buildx-action@v4
-      - uses: docker/build-push-action@v7
+      - name: Build and load test image
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: false
+          load: true
           tags: edu-doc-agent:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Prepare Compose service images
+        run: |
+          docker pull pgvector/pgvector:pg17
+          docker pull redis:7-alpine
+      - name: Compose smoke test
+        env:
+          TEST_APP_IMAGE: edu-doc-agent:ci
+        run: uv run --no-sync pytest tests/integration/test_compose_smoke.py --run-compose -ra
+
+  # protect-main требует именно этот status check от GitHub Actions.
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    needs: [unit-integration, docker-build]
+    if: ${{ always() }}
+    steps:
+      - name: Require successful unit, integration and Compose tests
+        env:
+          UNIT_INTEGRATION_RESULT: ${{ needs.unit-integration.result }}
+          COMPOSE_RESULT: ${{ needs.docker-build.result }}
+        run: |
+          test "$UNIT_INTEGRATION_RESULT" = "success"
+          test "$COMPOSE_RESULT" = "success"

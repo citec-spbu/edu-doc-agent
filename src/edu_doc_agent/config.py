@@ -3,6 +3,7 @@
 from functools import lru_cache
 from pathlib import Path
 
+from arq.connections import RedisSettings
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -31,6 +32,14 @@ class Settings(BaseSettings):
     postgres_password: str = "edu"
     postgres_db: str = "edu"
     database_url: str = "postgresql+psycopg://edu:edu@localhost:5432/edu"
+
+    # --- Очередь (Redis / ARQ) ---
+    redis_url: str = "redis://localhost:6379/0"
+
+    @property
+    def arq_redis_settings(self) -> RedisSettings:
+        """Настройки подключения для воркера ARQ."""
+        return RedisSettings.from_dsn(self.redis_url)
 
     # --- Данные ---
     # Путь к папке с реальными документами ОП на машине разработчика.
