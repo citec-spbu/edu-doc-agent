@@ -4,12 +4,14 @@ import asyncio
 import importlib
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
 from collections.abc import Iterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
@@ -28,6 +30,7 @@ from arq.jobs import Job, JobStatus
 from arq.worker import create_worker
 from redis.asyncio import Redis
 from redis.asyncio.client import Pipeline
+from redis.exceptions import ConnectionError as RedisConnectionError
 
 from edu_doc_agent import main
 from edu_doc_agent.api import router
@@ -94,7 +97,9 @@ def redis_dsn() -> str:
 
 
 @asynccontextmanager
-async def queue(redis_dsn: str, monkeypatch: pytest.MonkeyPatch):
+async def queue(
+    redis_dsn: str, monkeypatch: pytest.MonkeyPatch, *, session_ids: tuple[str, ...] = ()
+):
     name = f"edu-doc-agent:test:{uuid4().hex}"
     settings = RedisSettings.from_dsn(redis_dsn)
     settings.conn_retries = 0
@@ -113,6 +118,7 @@ async def queue(redis_dsn: str, monkeypatch: pytest.MonkeyPatch):
     finally:
         # Не использовать FLUSHDB/FLUSHALL, SCAN по общим префиксам или рабочую очередь.
         keys = [name, name + health_check_key_suffix]
+        keys.extend(router.get_session_lock_key(pool, session_id) for session_id in session_ids)
         for identifier in identifiers:
             keys.extend(
                 prefix + identifier
@@ -135,8 +141,6 @@ def test_http_to_redis_to_worker(redis_dsn: str, monkeypatch: pytest.MonkeyPatch
         tasks = importlib.import_module("edu_doc_agent.worker.tasks")
         sleep = AsyncMock()
         # Сохраняем реальный asyncio.sleep для ARQ; подменяем только ссылку в tasks.
-        from types import SimpleNamespace
-
         monkeypatch.setattr(tasks, "asyncio", SimpleNamespace(sleep=sleep))
         async with queue(redis_dsn, monkeypatch) as (pool, name, _):
             factory = AsyncMock(return_value=pool)
@@ -472,5 +476,165 @@ def test_enqueue_deadline_holds_when_redis_hangs_after_watch(
         finally:
             # Закрытие (в том числе cleanup очереди выше) дождётся конца паузы.
             await admin.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.pr_review
+def test_session_can_retry_after_enqueue_times_out_before_exec(
+    redis_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Если Redis не получил транзакцию, повтор той же сессии должен создать задание."""
+    session_id = "timeout-before-exec"
+    url = f"/api/v1/sessions/{session_id}/process"
+
+    async def scenario() -> None:
+        async with queue(redis_dsn, monkeypatch, session_ids=(session_id,)) as (pool, name, _):
+            main.app.state.redis_pool = pool
+            watch_reached = asyncio.Event()
+
+            async def wait_before_exec(pipeline: Pipeline, *args, **kwargs) -> None:
+                assert pipeline.watching
+                watch_reached.set()
+                await asyncio.Event().wait()
+
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=main.app), base_url="http://test"
+            ) as client:
+                # Блокируем EXISTS после WATCH. EXEC ещё не был отправлен.
+                with monkeypatch.context() as fault:
+                    fault.setattr(Pipeline, "exists", wait_before_exec)
+                    first = await asyncio.wait_for(client.post(url), timeout=5)
+                assert watch_reached.is_set()
+                assert first.status_code == 503
+                assert await pool.zcard(name) == 0
+
+                retry = await client.post(url)
+
+            assert retry.status_code == 202, retry.text
+            assert await pool.zrange(name, 0, -1) == [retry.json()["run_id"].encode()]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.pr_review
+def test_lost_enqueue_confirmation_does_not_admit_a_second_run(
+    redis_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Потеря подтверждения записи не делает уже принятое задание неактивным."""
+    session_id = "lost-enqueue-confirmation"
+    url = f"/api/v1/sessions/{session_id}/process"
+
+    async def scenario() -> None:
+        async with queue(redis_dsn, monkeypatch, session_ids=(session_id,)) as (pool, name, _):
+            main.app.state.redis_pool = pool
+            enqueue_job = pool.enqueue_job
+
+            async def enqueue_without_confirmation(*args, **kwargs) -> None:
+                job = await enqueue_job(*args, **kwargs)
+                assert job is not None
+                raise RedisConnectionError("synthetic failure after enqueue committed")
+
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=main.app), base_url="http://test"
+            ) as client:
+                with monkeypatch.context() as fault:
+                    fault.setattr(pool, "enqueue_job", enqueue_without_confirmation)
+                    first = await client.post(url)
+                assert first.status_code == 503
+                queued_ids = await pool.zrange(name, 0, -1)
+                assert len(queued_ids) == 1
+
+                retry = await client.post(url)
+
+            assert retry.status_code == 409, retry.text
+            assert await pool.zrange(name, 0, -1) == queued_ids
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.pr_review
+def test_queued_run_remains_exclusive_after_reservation_ttl(
+    redis_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Долгое ожидание воркера не должно разрешать второй активный run."""
+    session_id = "queued-past-reservation-ttl"
+    url = f"/api/v1/sessions/{session_id}/process"
+    reservation_ttl = 1
+    monkeypatch.setattr(router, "SESSION_LOCK_TTL_SECONDS", reservation_ttl)
+
+    async def scenario() -> None:
+        async with queue(redis_dsn, monkeypatch, session_ids=(session_id,)) as (pool, name, _):
+            main.app.state.redis_pool = pool
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=main.app), base_url="http://test"
+            ) as client:
+                first = await client.post(url)
+                assert first.status_code == 202
+                run_id = first.json()["run_id"]
+                job = Job(run_id, pool, _queue_name=name)
+
+                # Ждём короткий TTL Redis. Воркер в этом сценарии не запущен.
+                await asyncio.sleep(reservation_ttl + 0.1)
+                assert await job.status() == JobStatus.queued
+                retry = await client.post(url)
+
+            assert retry.status_code == 409, retry.text
+            assert await pool.zrange(name, 0, -1) == [run_id.encode()]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.pr_review
+def test_run_scheduled_for_retry_after_worker_shutdown_remains_exclusive(
+    redis_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """При штатной остановке ARQ первый run остаётся активным до retry."""
+    session_id = "worker-shutdown-retry"
+    url = f"/api/v1/sessions/{session_id}/process"
+
+    async def scenario() -> None:
+        settings = importlib.import_module("edu_doc_agent.worker.settings")
+        tasks = importlib.import_module("edu_doc_agent.worker.tasks")
+        started = asyncio.Event()
+
+        async def wait_for_shutdown(delay: float) -> None:
+            started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(tasks, "asyncio", SimpleNamespace(sleep=wait_for_shutdown))
+        async with queue(redis_dsn, monkeypatch, session_ids=(session_id,)) as (pool, name, _):
+            main.app.state.redis_pool = pool
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=main.app), base_url="http://test"
+            ) as client:
+                first = await client.post(url)
+                assert first.status_code == 202
+                run_id = first.json()["run_id"]
+                job = Job(run_id, pool, _queue_name=name)
+                worker = create_worker(
+                    settings.WorkerSettings,
+                    redis_pool=pool,
+                    queue_name=name,
+                    poll_delay=0.01,
+                    handle_signals=False,
+                )
+                running = asyncio.create_task(worker.async_run())
+                try:
+                    await asyncio.wait_for(started.wait(), timeout=5)
+                    worker.handle_sig(signal.SIGTERM)
+                    with suppress(asyncio.CancelledError):
+                        await running
+                    await asyncio.wait_for(asyncio.gather(*worker.tasks.values()), timeout=5)
+                    assert worker.jobs_retried == 1
+                    assert await job.status() == JobStatus.queued
+
+                    retry = await client.post(url)
+                    assert retry.status_code == 409, retry.text
+                    assert await pool.zrange(name, 0, -1) == [run_id.encode()]
+                finally:
+                    running.cancel()
+                    await asyncio.gather(running, return_exceptions=True)
+                    await worker.close()
 
     asyncio.run(scenario())
