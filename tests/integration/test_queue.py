@@ -97,9 +97,7 @@ def redis_dsn() -> str:
 
 
 @asynccontextmanager
-async def queue(
-    redis_dsn: str, monkeypatch: pytest.MonkeyPatch, *, session_ids: tuple[str, ...] = ()
-):
+async def queue(redis_dsn: str, monkeypatch: pytest.MonkeyPatch):
     name = f"edu-doc-agent:test:{uuid4().hex}"
     settings = RedisSettings.from_dsn(redis_dsn)
     settings.conn_retries = 0
@@ -118,7 +116,6 @@ async def queue(
     finally:
         # Не использовать FLUSHDB/FLUSHALL, SCAN по общим префиксам или рабочую очередь.
         keys = [name, name + health_check_key_suffix]
-        keys.extend(router.get_session_lock_key(pool, session_id) for session_id in session_ids)
         for identifier in identifiers:
             keys.extend(
                 prefix + identifier
@@ -288,48 +285,20 @@ def test_local_api_and_arq_cli_process_a_session(
     asyncio.run(scenario())
 
 
-# PR #29 P3: https://github.com/citec-spbu/edu-doc-agent/pull/29#discussion_r4478047239
-@pytest.mark.pr_review
-def test_active_session_rejects_a_second_run(
-    redis_dsn: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    async def scenario() -> None:
-        # Документированный контракт: один активный run на сессию.
-        # Worker не запущен: первая задача остаётся в очереди до второго запроса.
-        async with queue(redis_dsn, monkeypatch) as (pool, name, _):
-            main.app.state.redis_pool = pool
-            async with httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=main.app), base_url="http://test"
-            ) as client:
-                first = await client.post("/api/v1/sessions/synthetic-duplicate/process")
-                second = await client.post("/api/v1/sessions/synthetic-duplicate/process")
-            assert first.status_code == 202
-            assert second.status_code == 409
-            assert isinstance(second.json()["detail"], str)
-            assert "run_id" not in second.json()
-            assert await pool.zcard(name) == 1
-            first_job = await Job(first.json()["run_id"], pool, _queue_name=name).info()
-            assert first_job is not None
-            assert first_job.kwargs["session_id"] == "synthetic-duplicate"
-
-    asyncio.run(scenario())
-
-
 @pytest.mark.pr_review
 @pytest.mark.parametrize(
     ("session_names", "expected_statuses"),
     [
-        pytest.param(("same", "same"), [202, 409], id="same-session"),
         pytest.param(("first", "second"), [202, 202], id="different-sessions"),
     ],
 )
-def test_concurrent_requests_preserve_session_isolation(
+def test_concurrent_requests_for_different_sessions(
     redis_dsn: str,
     monkeypatch: pytest.MonkeyPatch,
     session_names: tuple[str, str],
     expected_statuses: list[int],
 ) -> None:
-    """Одна сессия допускает один run; разные сессии не блокируют друг друга."""
+    """Конкурентные запросы разных сессий создают отдельные задания."""
 
     async def scenario() -> None:
         suffix = uuid4().hex
@@ -363,10 +332,6 @@ def test_concurrent_requests_preserve_session_isolation(
 
             for session_id, response in zip(session_ids, responses, strict=True):
                 body = response.json()
-                if response.status_code == 409:
-                    assert isinstance(body["detail"], str) and body["detail"]
-                    assert "run_id" not in body
-                    continue
                 assert body["session_id"] == session_id
                 assert body["status"] == "queued"
                 job = await Job(body["run_id"], pool, _queue_name=name).info()
@@ -436,7 +401,7 @@ def test_redis_recovers_after_outage_with_the_same_api_pool(
 def test_enqueue_deadline_holds_when_redis_hangs_after_watch(
     managed_redis: tuple[str, int], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Redis замолкает между WATCH и EXISTS: ответ 503 приходит в пределах дедлайна."""
+    """Redis замолкает после настоящего WATCH; cleanup не продлевает HTTP-дедлайн."""
     _, port = managed_redis
     pause_ms = 6000
     max_response_seconds = 3.0  # дедлайн постановки 2.0 + запас
@@ -450,6 +415,7 @@ def test_enqueue_deadline_holds_when_redis_hangs_after_watch(
 
         async def exists_after_pause(self, *args, **kwargs):
             # WATCH уже выполнен; замораживаем Redis один раз, до первого EXISTS.
+            assert self.watching
             if not injected:
                 injected.append(True)
                 await admin.execute_command("CLIENT", "PAUSE", pause_ms, "ALL")
@@ -484,12 +450,12 @@ def test_enqueue_deadline_holds_when_redis_hangs_after_watch(
 def test_session_can_retry_after_enqueue_times_out_before_exec(
     redis_dsn: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Если Redis не получил транзакцию, повтор той же сессии должен создать задание."""
+    """До EXEC задание не записано; после восстановления возможна подтверждённая постановка."""
     session_id = "timeout-before-exec"
     url = f"/api/v1/sessions/{session_id}/process"
 
     async def scenario() -> None:
-        async with queue(redis_dsn, monkeypatch, session_ids=(session_id,)) as (pool, name, _):
+        async with queue(redis_dsn, monkeypatch) as (pool, name, _):
             main.app.state.redis_pool = pool
             watch_reached = asyncio.Event()
 
@@ -501,14 +467,12 @@ def test_session_can_retry_after_enqueue_times_out_before_exec(
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=main.app), base_url="http://test"
             ) as client:
-                # Блокируем EXISTS после WATCH. EXEC ещё не был отправлен.
                 with monkeypatch.context() as fault:
                     fault.setattr(Pipeline, "exists", wait_before_exec)
                     first = await asyncio.wait_for(client.post(url), timeout=5)
                 assert watch_reached.is_set()
                 assert first.status_code == 503
                 assert await pool.zcard(name) == 0
-
                 retry = await client.post(url)
 
             assert retry.status_code == 202, retry.text
@@ -518,53 +482,91 @@ def test_session_can_retry_after_enqueue_times_out_before_exec(
 
 
 @pytest.mark.pr_review
-def test_lost_enqueue_confirmation_does_not_admit_a_second_run(
-    redis_dsn: str, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("failure", ["before-exec", "after-exec", "after-exec-timeout"])
+def test_pipeline_failure_does_not_blindly_retry_enqueue(
+    redis_dsn: str, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
-    """Потеря подтверждения записи не делает уже принятое задание неактивным."""
+    """Настоящие redis-py/ARQ обрабатывают обрыв WATCH-транзакции внутри pipeline."""
     session_id = "lost-enqueue-confirmation"
-    url = f"/api/v1/sessions/{session_id}/process"
 
     async def scenario() -> None:
-        async with queue(redis_dsn, monkeypatch, session_ids=(session_id,)) as (pool, name, _):
+        async with queue(redis_dsn, monkeypatch) as (pool, name, identifiers):
             main.app.state.redis_pool = pool
-            enqueue_job = pool.enqueue_job
+            watch = Pipeline.watch
+            execute_transaction = Pipeline._execute_transaction
+            parse_response = Pipeline.parse_response
+            watched, attempts, injected = [], [], []
 
-            async def enqueue_without_confirmation(*args, **kwargs) -> None:
-                job = await enqueue_job(*args, **kwargs)
-                assert job is not None
-                raise RedisConnectionError("synthetic failure after enqueue committed")
+            async def watch_once(pipeline, *keys):
+                watched.append(keys)
+                return await watch(pipeline, *keys)
+
+            async def fail_before_exec(pipeline, connection, commands, raise_on_error):
+                assert pipeline.watching
+                attempts.append(True)
+                if failure == "before-exec":
+                    injected.append(True)
+                    raise RedisConnectionError("synthetic disconnect before MULTI/EXEC")
+                return await execute_transaction(pipeline, connection, commands, raise_on_error)
+
+            async def lose_exec_response(pipeline, connection, command_name, **options):
+                response = await parse_response(pipeline, connection, command_name, **options)
+                if command_name == "_" and isinstance(response, list):
+                    # MULTI/QUEUED уже прочитаны, EXEC реально выполнен. Теряем
+                    # его ответ до сброса watching в _execute_transaction().
+                    assert pipeline.watching
+                    assert len(response) == len(pipeline.command_stack) == 2
+                    injected.append(True)
+                    if failure == "after-exec-timeout":
+                        await asyncio.Event().wait()
+                    raise RedisConnectionError("synthetic disconnect after EXEC committed")
+                return response
 
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=main.app), base_url="http://test"
             ) as client:
                 with monkeypatch.context() as fault:
-                    fault.setattr(pool, "enqueue_job", enqueue_without_confirmation)
-                    first = await client.post(url)
-                assert first.status_code == 503
-                queued_ids = await pool.zrange(name, 0, -1)
-                assert len(queued_ids) == 1
-
-                retry = await client.post(url)
-
-            assert retry.status_code == 409, retry.text
-            assert await pool.zrange(name, 0, -1) == queued_ids
+                    # enqueue_job() не подменяем: redis-py сам превращает обрыв
+                    # в WatchError, а ARQ сам возвращает None. WATCH считает
+                    # каждую попытку, включая повтор с уже существующим job_id.
+                    fault.setattr(Pipeline, "watch", watch_once)
+                    fault.setattr(Pipeline, "_execute_transaction", fail_before_exec)
+                    fault.setattr(Pipeline, "parse_response", lose_exec_response)
+                    response = await asyncio.wait_for(
+                        client.post(f"/api/v1/sessions/{session_id}/process"), timeout=5
+                    )
+            assert response.status_code == 503
+            assert set(response.json()) == {"detail"}
+            assert len(identifiers) == len(attempts) == len(injected) == 1
+            run_id = identifiers[0]
+            assert watched == [(job_key_prefix + run_id,)]
+            queued_ids = await pool.zrange(name, 0, -1)
+            if failure == "before-exec":
+                assert queued_ids == []
+                assert not await pool.exists(job_key_prefix + run_id)
+            else:
+                assert queued_ids == [run_id.encode()]
+                info = await Job(run_id, pool, _queue_name=name).info()
+                assert info is not None
+                assert info.kwargs == {"session_id": session_id, "run_id": run_id}
 
     asyncio.run(scenario())
 
 
-@pytest.mark.pr_review
-def test_queued_run_remains_exclusive_after_reservation_ttl(
-    redis_dsn: str, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("failure", ["task-error", "max-tries", "expired"])
+def test_arq_records_terminal_failure(
+    redis_dsn: str, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
-    """Долгое ожидание воркера не должно разрешать второй активный run."""
-    session_id = "queued-past-reservation-ttl"
+    """Включая исходы ARQ, при которых coroutine задачи вообще не вызывается."""
+    session_id = f"terminal-{failure}"
     url = f"/api/v1/sessions/{session_id}/process"
-    reservation_ttl = 1
-    monkeypatch.setattr(router, "SESSION_LOCK_TTL_SECONDS", reservation_ttl)
 
     async def scenario() -> None:
-        async with queue(redis_dsn, monkeypatch, session_ids=(session_id,)) as (pool, name, _):
+        settings = importlib.import_module("edu_doc_agent.worker.settings")
+        tasks = importlib.import_module("edu_doc_agent.worker.tasks")
+        sleep = AsyncMock(side_effect=RuntimeError("synthetic task error"))
+        monkeypatch.setattr(tasks, "asyncio", SimpleNamespace(sleep=sleep))
+        async with queue(redis_dsn, monkeypatch) as (pool, name, _):
             main.app.state.redis_pool = pool
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=main.app), base_url="http://test"
@@ -572,24 +574,40 @@ def test_queued_run_remains_exclusive_after_reservation_ttl(
                 first = await client.post(url)
                 assert first.status_code == 202
                 run_id = first.json()["run_id"]
-                job = Job(run_id, pool, _queue_name=name)
-
-                # Ждём короткий TTL Redis. Воркер в этом сценарии не запущен.
-                await asyncio.sleep(reservation_ttl + 0.1)
-                assert await job.status() == JobStatus.queued
-                retry = await client.post(url)
-
-            assert retry.status_code == 409, retry.text
-            assert await pool.zrange(name, 0, -1) == [run_id.encode()]
+                if failure == "expired":
+                    # Моделируем истечение payload, не меняя членство в очереди.
+                    await pool.delete(job_key_prefix + run_id)
+                worker = create_worker(
+                    settings.WorkerSettings,
+                    redis_pool=pool,
+                    queue_name=name,
+                    burst=True,
+                    max_burst_jobs=1,
+                    max_tries=0 if failure == "max-tries" else 3,
+                    poll_delay=0.01,
+                    handle_signals=False,
+                )
+                try:
+                    await asyncio.wait_for(worker.async_run(), timeout=5)
+                    assert worker.jobs_failed == 1
+                    if failure == "task-error":
+                        sleep.assert_awaited_once_with(3)
+                    else:
+                        sleep.assert_not_called()
+                    info = await Job(run_id, pool, _queue_name=name).result_info()
+                    assert info is not None and not info.success
+                    assert await pool.zcard(name) == 0
+                finally:
+                    await worker.close()
 
     asyncio.run(scenario())
 
 
 @pytest.mark.pr_review
-def test_run_scheduled_for_retry_after_worker_shutdown_remains_exclusive(
+def test_worker_shutdown_leaves_job_queued_for_retry(
     redis_dsn: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """При штатной остановке ARQ первый run остаётся активным до retry."""
+    """Штатная остановка worker оставляет задание ARQ для retry с тем же ID."""
     session_id = "worker-shutdown-retry"
     url = f"/api/v1/sessions/{session_id}/process"
 
@@ -603,7 +621,7 @@ def test_run_scheduled_for_retry_after_worker_shutdown_remains_exclusive(
             await asyncio.Event().wait()
 
         monkeypatch.setattr(tasks, "asyncio", SimpleNamespace(sleep=wait_for_shutdown))
-        async with queue(redis_dsn, monkeypatch, session_ids=(session_id,)) as (pool, name, _):
+        async with queue(redis_dsn, monkeypatch) as (pool, name, _):
             main.app.state.redis_pool = pool
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=main.app), base_url="http://test"
@@ -628,9 +646,6 @@ def test_run_scheduled_for_retry_after_worker_shutdown_remains_exclusive(
                     await asyncio.wait_for(asyncio.gather(*worker.tasks.values()), timeout=5)
                     assert worker.jobs_retried == 1
                     assert await job.status() == JobStatus.queued
-
-                    retry = await client.post(url)
-                    assert retry.status_code == 409, retry.text
                     assert await pool.zrange(name, 0, -1) == [run_id.encode()]
                 finally:
                     running.cancel()

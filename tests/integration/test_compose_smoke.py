@@ -126,7 +126,18 @@ def test_compose_stack_processes_a_session(tmp_path: Path) -> None:
         api_port = compose("port", "api", "8000").strip().rsplit(":", 1)[1]
         ui_port = compose("port", "ui", "8501").strip().rsplit(":", 1)[1]
         with httpx.Client(base_url=f"http://127.0.0.1:{api_port}", trust_env=False) as client:
-            assert client.get("/health").status_code == 200
+            # Docker Desktop/WSL может открыть опубликованный порт чуть позже
+            # внутреннего healthcheck контейнера.
+            deadline = time.monotonic() + 15
+            while True:
+                try:
+                    ready = client.get("/health").status_code == 200
+                except httpx.TransportError:
+                    ready = False
+                if ready:
+                    break
+                assert time.monotonic() < deadline, "Published API port did not become ready"
+                time.sleep(0.05)
             assert client.get("/docs").status_code == 200
             response = client.post("/api/v1/sessions/compose-synthetic/process")
             assert response.status_code == 202

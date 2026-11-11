@@ -70,14 +70,15 @@ def test_response_does_not_wait_for_worker(client: TestClient, redis_pool: Async
 
 # PR #29 P3: https://github.com/citec-spbu/edu-doc-agent/pull/29#discussion_r4478047239
 @pytest.mark.pr_review
-def test_enqueue_conflict_does_not_claim_a_new_job(
+def test_unconfirmed_enqueue_does_not_claim_a_new_job(
     client: TestClient, redis_pool: AsyncMock
 ) -> None:
     redis_pool.enqueue_job.return_value = None
 
-    response = client.post("/api/v1/sessions/conflict/process")
+    response = client.post("/api/v1/sessions/unconfirmed/process")
 
-    assert response.status_code == 409
+    assert response.status_code == 503
+    assert set(response.json()) == {"detail"}
     assert isinstance(response.json()["detail"], str)
     redis_pool.enqueue_job.assert_awaited_once()
 
