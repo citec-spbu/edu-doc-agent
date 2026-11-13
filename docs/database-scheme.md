@@ -13,5 +13,7 @@ erDiagram
         string session_id FK
         string status
         datetime last_heartbeat_at
+        integer reconcile_attempts
         datetime created_at
+        datetime updated_at
     }

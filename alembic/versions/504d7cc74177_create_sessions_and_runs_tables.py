@@ -1,8 +1,8 @@
 """Create sessions and runs tables
 
-Revision ID: b0461a90259e
+Revision ID: 504d7cc74177
 Revises:
-Create Date: 2026-11-13 23:12:58.096488
+Create Date: 2026-11-14 00:19:30.730634
 
 """
 
@@ -13,7 +13,7 @@ import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "b0461a90259e"
+revision: str = "504d7cc74177"
 down_revision: str | Sequence[str] | None = None
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
@@ -46,8 +46,15 @@ def upgrade() -> None:
         sa.Column("session_id", sa.String(), nullable=False),
         sa.Column("status", sa.String(), nullable=False),
         sa.Column("last_heartbeat_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("reconcile_attempts", sa.Integer(), server_default="0", nullable=False),
         sa.Column(
             "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.Column(
+            "updated_at",
             sa.DateTime(timezone=True),
             server_default=sa.text("now()"),
             nullable=False,
