@@ -38,6 +38,12 @@ up:  ## Вся система в Docker
 up-db:  ## Только база в Docker (для локальной разработки)
 	docker compose up -d db
 
+migrate:  ## Применить все миграции к БД
+	uv run alembic upgrade head
+
+migrate-down:  ## Откатить последнюю миграцию на один шаг назад
+	uv run alembic downgrade -1
+
 down:  ## Остановить Docker
 	docker compose down
 
