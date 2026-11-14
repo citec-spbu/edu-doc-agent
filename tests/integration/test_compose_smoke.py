@@ -12,6 +12,8 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 import yaml
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 
 ROOT = Path(__file__).resolve().parents[2]
 pytestmark = pytest.mark.compose
@@ -107,9 +109,10 @@ def test_compose_stack_processes_a_session(tmp_path: Path) -> None:
         # Не выдавать smoke устаревшего локального образа за проверку текущего кода.
         sources = {
             str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
-            for directory in ("src", "ui")
+            for directory in ("src", "ui", "alembic")
             for path in (ROOT / directory).rglob("*.py")
         }
+        sources["alembic.ini"] = hashlib.sha256((ROOT / "alembic.ini").read_bytes()).hexdigest()
         check_sources = dedent("""\
             import hashlib, json, sys
             from pathlib import Path
@@ -121,6 +124,40 @@ def test_compose_stack_processes_a_session(tmp_path: Path) -> None:
             assert not mismatched, f'TEST_APP_IMAGE has stale sources: {mismatched}'
         """)
         compose("exec", "--no-TTY", "api", "python", "-c", check_sources, json.dumps(sources))
+
+        # Alembic использует исходный пароль и остальные POSTGRES_* из Compose.
+        compose("exec", "--no-TTY", "api", "alembic", "upgrade", "head")
+        expected_revision = ScriptDirectory.from_config(
+            Config(str(ROOT / "alembic.ini"))
+        ).get_current_head()
+        actual_revision = compose(
+            "exec",
+            "--no-TTY",
+            "db",
+            "psql",
+            "--username=edu",
+            "--dbname=edu",
+            "--tuples-only",
+            "--no-align",
+            "--command=SELECT version_num FROM alembic_version",
+        )
+        assert actual_revision.strip() == expected_revision
+        dao_revision_script = dedent("""\
+            import asyncio
+            from sqlalchemy import text
+            from edu_doc_agent.dao.database import async_session_maker, engine
+
+            async def check():
+                try:
+                    async with async_session_maker() as session:
+                        print(await session.scalar(text("SELECT version_num FROM alembic_version")))
+                finally:
+                    await engine.dispose()
+
+            asyncio.run(check())
+        """)
+        dao_revision = compose("exec", "--no-TTY", "api", "python", "-c", dao_revision_script)
+        assert dao_revision.strip() == expected_revision
 
         api_port = compose("port", "api", "8000").strip().rsplit(":", 1)[1]
         ui_port = compose("port", "ui", "8501").strip().rsplit(":", 1)[1]
