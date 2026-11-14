@@ -81,6 +81,25 @@ make migrate-docker && make up
 подключаются к `localhost:5432` и учитывают явно заданный `DATABASE_URL`.
 Контейнеры API, worker и Alembic собирают подключение к `db:5432` из `POSTGRES_*`.
 
+Для буквального `$NAME` в общем `.env`, который читают Compose и Pydantic,
+используйте одинарные кавычки:
+
+```dotenv
+POSTGRES_PASSWORD='synthetic@pass%40$NAME'
+```
+
+Для буквального `${NAME}` передавайте пароль через окружение процесса,
+поскольку Pydantic может интерполировать эту форму в `.env` даже в кавычках:
+
+```bash
+export POSTGRES_PASSWORD='synthetic@pass%40${NAME}'
+```
+
+Запускайте Compose и локальные команды из того же окружения. Пароль из
+`POSTGRES_*` передаётся в `URL.create()` без ручного URL-кодирования. Явный
+`DATABASE_URL` сохраняет приоритет для локальных команд; в полном DSN
+спецсимволы пароля нужно URL-кодировать.
+
 В этом режиме API и worker используют `redis://redis:6379/0`, заданный в
 [compose.yaml](compose.yaml); публиковать Redis на localhost не требуется.
 
