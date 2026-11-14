@@ -3,7 +3,7 @@ from logging.config import fileConfig
 
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
-from sqlalchemy.ext.asyncio import async_engine_from_config
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from alembic import context
 from edu_doc_agent.config import get_settings
@@ -42,12 +42,8 @@ def run_migrations_offline() -> None:
     script output.
 
     """
-    settings = get_settings()
-    config.set_main_option("sqlalchemy.url", settings.database_url)
-
-    url = config.get_main_option("sqlalchemy.url")
     context.configure(
-        url=url,
+        url=get_settings().database_url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -70,23 +66,20 @@ async def run_async_migrations() -> None:
 
     """
 
-    connectable = async_engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
+    # URL не проходит через ConfigParser: percent-encoding должен остаться буквальным.
+    connectable = create_async_engine(
+        get_settings().database_url,
         poolclass=pool.NullPool,
     )
-
-    async with connectable.connect() as connection:
-        await connection.run_sync(do_run_migrations)
-
-    await connectable.dispose()
+    try:
+        async with connectable.connect() as connection:
+            await connection.run_sync(do_run_migrations)
+    finally:
+        await connectable.dispose()
 
 
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode."""
-    settings = get_settings()
-    config.set_main_option("sqlalchemy.url", settings.database_url)
-
     asyncio.run(run_async_migrations())
 
 

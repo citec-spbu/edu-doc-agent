@@ -15,5 +15,11 @@ async_session_maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_
 
 # Зависимость для FastAPI, чтобы получать сессию БД в эндпоинтах
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """Выдаёт сессию; commit выполняет вызывающий код, незавершённое откатывается.
+
+    При ORM-обновлении Session/Run updated_at загружается во время flush и
+    доступен на том же объекте после commit без refresh (expire_on_commit=False).
+    Для raw SQL и bulk UPDATE это не контракт синхронизации ORM-объектов.
+    """
     async with async_session_maker() as session:
         yield session
