@@ -35,7 +35,7 @@ class Session(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
-        onupdate=func.now(),
+        onupdate=func.clock_timestamp(),
         server_onupdate=FetchedValue(),
     )
 
@@ -51,6 +51,7 @@ class Run(Base):
             "'completed', 'failed', 'cancelled')",
             name="ck_runs_status",
         ),
+        CheckConstraint("reconcile_attempts >= 0", name="ck_runs_reconcile_attempts_nonnegative"),
         Index(
             "uq_runs_active_session",
             "session_id",
@@ -73,7 +74,7 @@ class Run(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
-        onupdate=func.now(),
+        onupdate=func.clock_timestamp(),
         server_onupdate=FetchedValue(),
     )
 

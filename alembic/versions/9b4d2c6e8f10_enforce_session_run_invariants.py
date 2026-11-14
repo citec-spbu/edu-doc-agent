@@ -1,4 +1,4 @@
-"""Enforce session/run statuses and one active run per session.
+"""Enforce statuses, one active run per session and a nonnegative counter.
 
 Revision ID: 9b4d2c6e8f10
 Revises: 504d7cc74177
@@ -33,9 +33,13 @@ def upgrade() -> None:
         unique=True,
         postgresql_where=sa.text("status IN ('queued', 'running', 'waiting_for_input')"),
     )
+    op.create_check_constraint(
+        "ck_runs_reconcile_attempts_nonnegative", "runs", "reconcile_attempts >= 0"
+    )
 
 
 def downgrade() -> None:
+    op.drop_constraint("ck_runs_reconcile_attempts_nonnegative", "runs", type_="check")
     op.drop_index("uq_runs_active_session", table_name="runs")
     op.drop_constraint("ck_runs_status", "runs", type_="check")
     op.drop_constraint("ck_sessions_status", "sessions", type_="check")

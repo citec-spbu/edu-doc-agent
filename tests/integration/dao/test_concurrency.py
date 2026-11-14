@@ -16,12 +16,12 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.mark.parametrize("commit_first", [True, False], ids=["commit", "rollback"])
-def test_competing_transactions(migrated_database: Database, commit_first: bool) -> None:
-    with migrated_database.engine.begin() as connection:
+def test_competing_transactions(schema_database: Database, commit_first: bool) -> None:
+    with schema_database.engine.begin() as connection:
         connection.execute(insert(Session).values(id="session", status="active"))
 
     async def scenario() -> None:
-        engine = create_async_engine(migrated_database.url, poolclass=NullPool)
+        engine = create_async_engine(schema_database.url, poolclass=NullPool)
         try:
             async with (
                 engine.connect() as first,

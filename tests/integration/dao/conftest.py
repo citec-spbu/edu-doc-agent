@@ -11,6 +11,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.pool import NullPool
 from sqlalchemy.schema import CreateSchema, DropSchema
 
+from edu_doc_agent.dao.models import Base
 from tests.integration.dao.support import Database
 
 
@@ -47,4 +48,13 @@ def database(tmp_path: Path) -> Iterator[Database]:
 @pytest.fixture
 def migrated_database(database: Database) -> Database:
     database.migrate()
+    return database
+
+
+@pytest.fixture(params=["alembic", "metadata"])
+def schema_database(database: Database, request: pytest.FixtureRequest) -> Database:
+    if request.param == "alembic":
+        database.migrate()
+    else:
+        Base.metadata.create_all(database.engine)
     return database
