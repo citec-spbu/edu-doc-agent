@@ -1,7 +1,7 @@
 services:
   db:
     image: pgvector/pgvector:pg17
-    environment:
+    environment: &postgres_environment
       POSTGRES_USER: ${POSTGRES_USER:-edu}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-edu}
       POSTGRES_DB: ${POSTGRES_DB:-edu}
@@ -28,8 +28,12 @@ services:
     env_file:
       - path: .env
         required: false
-    environment:
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-edu}:${POSTGRES_PASSWORD:-edu}@db:5432/${POSTGRES_DB:-edu}
+    environment: &backend_environment
+      <<: *postgres_environment
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      # Сбрасывает хостовый DSN из .env, подключение собирается из POSTGRES_*.
+      DATABASE_URL: ""
       REDIS_URL: redis://redis:6379/0
     ports:
       - "8000:8000"
@@ -52,9 +56,7 @@ services:
     env_file:
       - path: .env
         required: false
-    environment:
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-edu}:${POSTGRES_PASSWORD:-edu}@db:5432/${POSTGRES_DB:-edu}
-      REDIS_URL: redis://redis:6379/0
+    environment: *backend_environment
     volumes:
       - ./storage:/app/storage
     depends_on:

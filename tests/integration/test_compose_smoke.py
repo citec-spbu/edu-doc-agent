@@ -35,16 +35,14 @@ def test_compose_stack_processes_a_session(tmp_path: Path) -> None:
             service["image"] = image
         service.pop("ports", None)
 
-    services["db"]["environment"] = {
+    environment = {
+        **os.environ,
         "POSTGRES_USER": "edu",
-        "POSTGRES_PASSWORD": "synthetic",
+        "POSTGRES_PASSWORD": "synthetic@pass%40",
         "POSTGRES_DB": "edu",
     }
     for name in ("api", "worker"):
-        services[name]["environment"] = {
-            "DATABASE_URL": "postgresql+psycopg://edu:synthetic@db:5432/edu",
-            "REDIS_URL": "redis://redis:6379/15",
-        }
+        services[name]["environment"]["REDIS_URL"] = "redis://redis:6379/15"
         services[name]["volumes"] = [f"{storage}:/app/storage"]
     services["api"]["ports"] = ["127.0.0.1::8000"]
     services["ui"]["ports"] = ["127.0.0.1::8501"]
@@ -69,6 +67,7 @@ def test_compose_stack_processes_a_session(tmp_path: Path) -> None:
         completed = subprocess.run(
             [*command, *arguments],
             cwd=tmp_path,
+            env=environment,
             check=False,
             capture_output=True,
             text=True,

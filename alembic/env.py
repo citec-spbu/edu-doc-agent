@@ -43,7 +43,7 @@ def run_migrations_offline() -> None:
 
     """
     context.configure(
-        url=get_settings().database_url,
+        url=get_settings().database_connection_url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -68,7 +68,7 @@ async def run_async_migrations() -> None:
 
     # URL не проходит через ConfigParser: percent-encoding должен остаться буквальным.
     connectable = create_async_engine(
-        get_settings().database_url,
+        get_settings().database_connection_url,
         poolclass=pool.NullPool,
     )
     try:
