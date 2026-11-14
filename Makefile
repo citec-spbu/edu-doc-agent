@@ -1,4 +1,5 @@
-.PHONY: help sync lint fmt test test-llm cov run-api run-ui run-worker up up-db down logs clean
+.PHONY: help sync lint fmt test test-llm cov run-api run-ui run-worker up up-db \
+	migrate migrate-down migrate-docker down logs clean
 
 help:  ## Показать список целей
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -43,6 +44,10 @@ migrate:  ## Применить все миграции к БД
 
 migrate-down:  ## Откатить последнюю миграцию на один шаг назад
 	uv run alembic downgrade -1
+
+migrate-docker:  ## Применить миграции из Docker-образа API
+	docker compose up -d --wait db
+	docker compose run --rm --no-deps --build api alembic upgrade head
 
 down:  ## Остановить Docker
 	docker compose down

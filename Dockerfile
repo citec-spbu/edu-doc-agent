@@ -19,6 +19,9 @@ COPY rules ./rules
 COPY prompts ./prompts
 RUN uv sync --locked --no-dev
 
+COPY alembic.ini ./
+COPY alembic ./alembic
+
 ENV PATH="/app/.venv/bin:$PATH"
 EXPOSE 8000
 
