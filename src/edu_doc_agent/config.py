@@ -6,6 +6,7 @@ from pathlib import Path
 from arq.connections import RedisSettings
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import URL
 
 
 class Settings(BaseSettings):
@@ -31,7 +32,23 @@ class Settings(BaseSettings):
     postgres_user: str = "edu"
     postgres_password: str = "edu"
     postgres_db: str = "edu"
-    database_url: str = "postgresql+psycopg://edu:edu@localhost:5432/edu"
+    postgres_host: str = "localhost"
+    postgres_port: int = 5432
+    database_url: str | None = None
+
+    @property
+    def database_connection_url(self) -> str | URL:
+        """Использует явный DSN или собирает подключение из параметров PostgreSQL."""
+        if self.database_url:
+            return self.database_url
+        return URL.create(
+            "postgresql+psycopg",
+            username=self.postgres_user,
+            password=self.postgres_password,
+            host=self.postgres_host,
+            port=self.postgres_port,
+            database=self.postgres_db,
+        )
 
     # --- Очередь (Redis / ARQ) ---
     redis_url: str = "redis://localhost:6379/0"

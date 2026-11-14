@@ -52,6 +52,7 @@ jobs:
           --health-retries 10
     env:
       DATABASE_URL: postgresql+psycopg://edu:edu@localhost:5432/edu
+      TEST_DATABASE_URL: postgresql+psycopg://edu:edu@localhost:5432/edu
       TEST_REDIS_URL: redis://127.0.0.1:6379/15
     steps:
       - uses: actions/checkout@v7
@@ -59,7 +60,7 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --locked
-      - name: Unit and Redis integration tests
+      - name: Unit and PostgreSQL/Redis integration tests
         run: uv run --no-sync pytest --run-integration --cov=edu_doc_agent --cov-branch --cov-report=term-missing -ra
 
   docker-build:
