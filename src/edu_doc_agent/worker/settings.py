@@ -12,6 +12,7 @@ from typing import Any
 from arq.connections import RedisSettings
 
 from edu_doc_agent.config import get_settings
+from edu_doc_agent.dao import SessionRunDAO
 from edu_doc_agent.worker.tasks import process_session_task
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,7 @@ async def startup(ctx: dict[str, Any]) -> None:
     logging.basicConfig(
         level=settings.log_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
+    ctx.setdefault("dao", SessionRunDAO())
     logger.info("Worker is starting up. Connected to Redis.")
 
 

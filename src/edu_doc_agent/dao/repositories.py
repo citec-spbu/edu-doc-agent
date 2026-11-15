@@ -145,6 +145,19 @@ class SessionRunDAO:
             await db.commit()
             return result.scalar_one_or_none() is not None
 
+    async def requeue_running_run(self, run_id: UUID) -> bool:
+        """Возвращает 'running' -> 'queued' при штатной отмене задачи воркера (SIGTERM/retry ARQ)"""
+        async with self._session_factory() as db:
+            stmt = (
+                update(Run)
+                .where(Run.id == run_id, Run.status == "running")
+                .values(status="queued", updated_at=func.clock_timestamp())
+                .returning(Run.id)
+            )
+            result = await db.execute(stmt)
+            await db.commit()
+            return result.scalar_one_or_none() is not None
+
     async def get_run(self, session_id: str, run_id: UUID) -> Run | None:
         """Читает Run строго по паре (session_id, run_id)."""
         async with self._session_factory() as db:
