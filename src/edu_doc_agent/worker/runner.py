@@ -49,6 +49,7 @@ class SessionRunner:
                 "run_id": str(run_uuid),
             }
 
+        logger.info("Запущено выполнение сессии: session_id=%s, run_id=%s", session_id, run_uuid)
         try:
             await logic_callable(session_id)
         except asyncio.CancelledError:
@@ -71,6 +72,7 @@ class SessionRunner:
             raise
 
         await self._dao.mark_run_completed(run_uuid)
+        logger.info("Выполнение сессии завершено: session_id=%s, run_id=%s", session_id, run_uuid)
         return {
             "status": "completed",
             "session_id": session_id,

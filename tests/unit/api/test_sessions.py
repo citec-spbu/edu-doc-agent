@@ -1,4 +1,4 @@
-"""Контракт HTTP → очередь, включая регрессии из PR #29."""
+"""Контракт HTTP → очередь и управление статусами Run, включая регрессии из PR #29."""
 
 import asyncio
 import logging
@@ -15,6 +15,7 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from edu_doc_agent.api import router as api_router
 from edu_doc_agent.main import app
+from tests.conftest import InMemorySessionRunDAO
 
 
 @pytest.fixture
@@ -71,7 +72,7 @@ def test_response_does_not_wait_for_worker(client: TestClient, redis_pool: Async
 # PR #29 P3: https://github.com/citec-spbu/edu-doc-agent/pull/29#discussion_r4478047239
 @pytest.mark.pr_review
 def test_unconfirmed_enqueue_does_not_claim_a_new_job(
-    client: TestClient, redis_pool: AsyncMock
+    client: TestClient, redis_pool: AsyncMock, session_run_dao: InMemorySessionRunDAO
 ) -> None:
     redis_pool.enqueue_job.return_value = None
 
@@ -81,6 +82,9 @@ def test_unconfirmed_enqueue_does_not_claim_a_new_job(
     assert set(response.json()) == {"detail"}
     assert isinstance(response.json()["detail"], str)
     redis_pool.enqueue_job.assert_awaited_once()
+    # Сбой постановки компенсирует созданный run в 'failed', освобождая сессию
+    runs = [r for r in session_run_dao.runs.values() if r.session_id == "unconfirmed"]
+    assert len(runs) == 1 and runs[0].status == "failed"
 
 
 @pytest.mark.parametrize(
@@ -97,7 +101,10 @@ def test_unconfirmed_enqueue_does_not_claim_a_new_job(
 # PR #29 P2: https://github.com/citec-spbu/edu-doc-agent/pull/29#discussion_r4478029967
 @pytest.mark.pr_review
 def test_queue_errors_have_a_service_error_response(
-    redis_pool: AsyncMock, error: Exception, expected_status: int
+    redis_pool: AsyncMock,
+    session_run_dao: InMemorySessionRunDAO,
+    error: Exception,
+    expected_status: int,
 ) -> None:
     app.state.redis_pool = redis_pool
     redis_pool.enqueue_job.side_effect = error
@@ -110,6 +117,8 @@ def test_queue_errors_have_a_service_error_response(
     assert isinstance(body["detail"], str) and body["detail"]
     assert str(error) not in response.text
     redis_pool.enqueue_job.assert_awaited_once()
+    runs = [r for r in session_run_dao.runs.values() if r.session_id == "unavailable"]
+    assert len(runs) == 1 and runs[0].status == "failed"
 
 
 @pytest.mark.parametrize(
