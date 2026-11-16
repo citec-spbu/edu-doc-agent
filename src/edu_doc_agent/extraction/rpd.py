@@ -254,21 +254,25 @@ def _extract_outcome_table(table: MdTable, file: str, result: RPDExtraction) -> 
             continue
         ref = _ref(table, idx, file)
 
-        if parsed := _parse_competence_cell(comp_cell):
-            current_code, name = parsed
-            known = competences.get(current_code)
+        cell_competences = _parse_competence_cells(comp_cell)
+        for code, name in cell_competences:
+            known = competences.get(code)
             if known is None:
-                competences[current_code] = Competence(code=current_code, name=name, source=ref)
+                competences[code] = Competence(code=code, name=name, source=ref)
             elif known.name is None and name:
                 known.name = name
+        if cell_competences:
+            current_code = cell_competences[0][0]
+        # в ячейке могут быть несколько компетенций: индикатор и результат относим к той, чей код
+        # входит в их собственный код («ПКП-ППК-ДА2.1» → «ПКП-ППК-ДА2»), иначе к первой
+        cell_codes = [code for code, _ in cell_competences]
 
         for code, text, level in _parse_indicators(ind_cell):
-            if (code, current_code) not in seen_indicators:
-                seen_indicators.add((code, current_code))
+            owner = _owner(code, cell_codes, current_code)
+            if (code, owner) not in seen_indicators:
+                seen_indicators.add((code, owner))
                 result.indicators.append(
-                    Indicator(
-                        code=code, competence_code=current_code, text=text, level=level, source=ref
-                    )
+                    Indicator(code=code, competence_code=owner, text=text, level=level, source=ref)
                 )
         if repeated:
             for outcome in group:
@@ -277,11 +281,12 @@ def _extract_outcome_table(table: MdTable, file: str, result: RPDExtraction) -> 
         elif out_key:
             group = []
         for kind, code, text in _parse_outcomes(out_cell):
+            owner = _owner(_indicator_of(code), cell_codes, current_code)
             outcome = LearningOutcome(
                 kind=kind,
                 code=code,
                 indicator_code=_indicator_of(code),
-                competence_codes=[current_code] if current_code else [],
+                competence_codes=[owner] if owner else [],
                 text=text,
                 source=ref,
             )
@@ -306,6 +311,31 @@ def _outcome_header(table: MdTable) -> tuple[int, int | None, int, int | None] |
         ind = next((j for j, c in enumerate(low) if "индикатор" in c), None)
         return i, comp, outs[0], ind
     return None
+
+
+def _parse_competence_cells(cell: str) -> list[tuple[str, str | None]]:
+    """Все компетенции ячейки: каждая строка с кодом в начале начинает новую, остальные строки
+    продолжают название предыдущей («ПКП-ППК-Р1. …<br>ПКП-ППК-ДА2. …» — две компетенции)."""
+    entries: list[list[str | None]] = []
+    for line in clean_text(cell).split("\n"):
+        if m := COMPETENCE_CELL_RE.match(line):
+            entries.append([m.group(1), _one_line(m.group(2) or "")])
+        elif entries and line.strip():
+            entries[-1][1] = _one_line(f"{entries[-1][1]} {line}")
+    if entries:
+        return [(code, name or None) for code, name in entries]  # type: ignore[misc]
+    single = _parse_competence_cell(cell)
+    return [single] if single else []
+
+
+def _owner(code: str | None, cell_codes: list[str], current: str | None) -> str | None:
+    """Компетенция ячейки, которой принадлежит индикатор/результат с кодом `code`."""
+    if code and len(cell_codes) > 1:
+        base = code_key(code).rsplit(".", 1)[0]
+        for candidate in cell_codes:
+            if code_key(candidate) == base:
+                return candidate
+    return current
 
 
 def _parse_competence_cell(cell: str) -> tuple[str, str | None] | None:

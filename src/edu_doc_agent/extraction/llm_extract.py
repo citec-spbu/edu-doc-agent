@@ -124,14 +124,16 @@ def quote_in_text(quote: str, text: str) -> bool:
     return bool(parts)
 
 
-def run_task(task: LLMTask, text: str, client: LLMClient) -> tuple[BaseModel | None, str | None]:
+def run_task(
+    task: LLMTask, text: str, client: LLMClient, *, system: str = prompts.SYSTEM
+) -> tuple[BaseModel | None, str | None]:
     """Один запрос с повторами. Возвращает (ответ, None) или (None, причина отказа)."""
     user = task.prompt.replace("{text}", text)
     schema = task.output.model_json_schema()
     error = ""
     for _ in range(MAX_RETRIES + 1):
         raw = client.complete_json(
-            system=prompts.SYSTEM,
+            system=system,
             user=user + prompts.REPAIR.format(error=error) if error else user,
             schema=schema,
         )
