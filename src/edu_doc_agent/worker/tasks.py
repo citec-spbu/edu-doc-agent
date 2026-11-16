@@ -20,14 +20,19 @@ async def _stub_session_logic(session_id: str) -> None:
 
 
 async def process_session_task(ctx: dict[str, Any], session_id: str, run_id: str) -> dict[str, str]:
-    """Тонкая точка входа ARQ: достаёт DAO из контекста и делегирует управление в SessionRunner."""
     dao = ctx.get("dao")
     if not isinstance(dao, SessionRunDAO):
         dao = SessionRunDAO()
+
+    # Достаем метаданные попыток из ARQ контекста
+    job_try = ctx.get("job_try", 1)
+    max_tries = ctx.get("max_tries", 3)
 
     runner = SessionRunner(dao=dao)
     return await runner.execute(
         session_id=session_id,
         run_id=run_id,
+        job_try=job_try,
+        max_tries=max_tries,
         logic_callable=_stub_session_logic,
     )
