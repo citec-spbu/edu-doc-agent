@@ -57,6 +57,7 @@ class SessionRunner:
         job_try: int = 1,
         max_tries: int = 3,
         execution_timeout: float | None = None,
+        job_deadline: float | None = None,
     ) -> dict[str, str]:
         """Атомарно переводит Run в 'running', вызывает бизнес-логику и фиксирует исход."""
         run_uuid = UUID(str(run_id)) if not isinstance(run_id, UUID) else run_id
@@ -127,8 +128,13 @@ class SessionRunner:
             if not claimed:
                 # Не возвращаем в очередь run, который выполняет другой worker.
                 raise
+            # wait_for ARQ превращает отмену по истечении срока в окончательный
+            # TimeoutError без retry. Только остановка до срока допускает requeue.
+            deadline_expired = (
+                job_deadline is not None and asyncio.get_running_loop().time() >= job_deadline
+            )
             try:
-                if is_last_try:
+                if is_last_try or deadline_expired:
                     await _finish_status_update(self._dao.mark_run_failed(run_uuid))
                 else:
                     await _finish_status_update(self._dao.requeue_running_run(run_uuid))

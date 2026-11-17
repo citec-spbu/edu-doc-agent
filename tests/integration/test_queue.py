@@ -641,6 +641,66 @@ def test_arq_records_terminal_failure(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("job_try", [1, 2])
+def test_arq_timeout_fails_run_and_allows_a_new_post(
+    redis_dsn: str, monkeypatch: pytest.MonkeyPatch, job_try: int
+) -> None:
+    """Окончательный TimeoutError настоящего ARQ освобождает активный слот в PostgreSQL."""
+
+    async def scenario() -> None:
+        settings = importlib.import_module("edu_doc_agent.worker.settings")
+        tasks = importlib.import_module("edu_doc_agent.worker.tasks")
+        started = asyncio.Event()
+
+        async def wait_for_timeout(delay: float) -> None:
+            started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(tasks, "asyncio", SimpleNamespace(sleep=wait_for_timeout))
+        # Меняется единственная настройка, из которой ARQ и hook старта берут бюджет.
+        # Внутренний execution_timeout Runner не используется.
+        monkeypatch.setattr(settings.WorkerSettings, "job_timeout", 0.2)
+        async with queue(redis_dsn, monkeypatch) as (pool, name, _):
+            main.app.state.redis_pool = pool
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=main.app), base_url="http://test"
+            ) as client:
+                url = "/api/v1/sessions/arq-timeout-session/process"
+                first = await client.post(url)
+                assert first.status_code == 202
+                run_id = first.json()["run_id"]
+                if job_try > 1:
+                    await pool.set(retry_key_prefix + run_id, job_try - 1)
+                worker = create_worker(
+                    settings.WorkerSettings,
+                    redis_pool=pool,
+                    queue_name=name,
+                    burst=True,
+                    max_burst_jobs=1,
+                    poll_delay=0.01,
+                    handle_signals=False,
+                )
+                try:
+                    await asyncio.wait_for(worker.async_run(), timeout=5)
+                    assert started.is_set()
+                    assert worker.jobs_failed == 1 and worker.jobs_retried == 0
+                    job = Job(run_id, pool, _queue_name=name)
+                    info = await job.result_info()
+                    assert info is not None and not info.success
+                    assert info.job_try == job_try and isinstance(info.result, TimeoutError)
+                    assert await job.status() == JobStatus.complete
+                    assert await pool.zcard(name) == 0
+                    status = await client.get(f"/api/v1/sessions/arq-timeout-session/runs/{run_id}")
+                    assert status.status_code == 200 and status.json()["status"] == "failed"
+                    retry = await client.post(url)
+                    assert retry.status_code == 202
+                    assert retry.json()["run_id"] != run_id
+                finally:
+                    await worker.close()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.pr_review
 def test_worker_shutdown_leaves_job_queued_for_retry(
     redis_dsn: str, monkeypatch: pytest.MonkeyPatch

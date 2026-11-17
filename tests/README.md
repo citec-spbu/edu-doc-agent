@@ -105,12 +105,21 @@ TEST_DATABASE_URL=postgresql+psycopg://edu:edu@127.0.0.1:5432/edu \
 В `test_queue.py::test_worker_shutdown_leaves_job_queued_for_retry` настоящий ARQ
 после остановки worker повторно выполняет тот же Run: проверяются queued в БД,
 успех нового worker и completed через GET. Для этого сценария нужны обе тестовые DSN.
+В `test_queue.py::test_arq_timeout_fails_run_and_allows_a_new_post` настоящий
+таймаут ARQ проверяется на попытках 1 и 2: результат job — `TimeoutError` без retry,
+канонический статус — `failed`, следующий POST принимается с новым run_id.
+Используется короткий `WorkerSettings.job_timeout`; внутренний лимит Runner не задаётся.
+В [test_runner_failures.py](unit/worker/test_runner_failures.py) проверяются исходное
+исключение бизнес-функции при сбое записи `failed`, ошибка записи `completed`
+и логирование сбоя обработки отмены. Unit-тест API закрепляет логирование
+неудачной компенсации с сохранением исходного HTTP-ответа на сбой enqueue.
 
 Для сбора покрытия backend указывайте каталоги исходников:
 
 ```bash
 uv run --no-sync pytest tests/integration/test_session_runs.py \
   tests/integration/test_queue.py::test_worker_shutdown_leaves_job_queued_for_retry \
+  tests/integration/test_queue.py::test_arq_timeout_fails_run_and_allows_a_new_post \
   tests/unit/worker tests/unit/dao tests/unit/api/test_sessions.py \
   --run-integration --cov=src/edu_doc_agent/dao --cov=src/edu_doc_agent/worker \
   --cov=src/edu_doc_agent/api --cov-branch --cov-report=term-missing

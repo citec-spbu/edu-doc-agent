@@ -199,6 +199,32 @@ def test_enqueue_deadline_default() -> None:
     assert api_router.ENQUEUE_DEADLINE_SECONDS == 2.0
 
 
+def test_failed_compensation_is_logged_without_hiding_enqueue_error(
+    client: TestClient,
+    redis_pool: AsyncMock,
+    dao: InMemorySessionRunDAO,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    redis_pool.enqueue_job.side_effect = RedisConnectionError("synthetic enqueue failure")
+    write_error = RuntimeError("synthetic compensation write failure")
+    monkeypatch.setattr(dao, "mark_failed_if_queued", AsyncMock(side_effect=write_error))
+    with caplog.at_level(logging.ERROR, logger=api_router.__name__):
+        response = client.post("/api/v1/sessions/compensation-failure/process")
+    assert response.status_code == 503
+    run = next(iter(dao.runs.values()))
+    assert run.status == "queued"
+    assert any(
+        record.exc_info is not None
+        and record.exc_info[1] is write_error
+        and run.session_id in record.getMessage()
+        and str(run.id) in record.getMessage()
+        for record in caplog.records
+    )
+    assert str(write_error) not in response.text
+    redis_pool.enqueue_job.assert_awaited_once()
+
+
 def test_external_cancellation_reaches_enqueue_without_error_response_or_retry(
     redis_pool: AsyncMock, caplog: pytest.LogCaptureFixture
 ) -> None:

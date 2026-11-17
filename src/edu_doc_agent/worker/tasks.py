@@ -31,4 +31,5 @@ async def process_session_task(ctx: dict[str, Any], session_id: str, run_id: str
         job_try=job_try,
         max_tries=max_tries,
         logic_callable=_stub_session_logic,
+        job_deadline=ctx.get("job_deadline"),
     )

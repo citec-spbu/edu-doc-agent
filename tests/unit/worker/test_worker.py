@@ -106,6 +106,7 @@ def test_arq_loads_the_registered_task_and_execution_limits(tasks: ModuleType) -
         assert worker.redis_settings == module.settings.arq_redis_settings
         assert worker.on_startup is module.startup
         assert worker.on_shutdown is module.shutdown
+        assert worker.on_job_start is module.job_start
 
     asyncio.run(scenario())
     assert package.WorkerSettings is module.WorkerSettings

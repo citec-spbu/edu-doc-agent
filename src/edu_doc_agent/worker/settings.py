@@ -6,6 +6,7 @@
 глобальные параметры выполнения.
 """
 
+import asyncio
 import logging
 from typing import Any
 
@@ -38,6 +39,11 @@ async def shutdown(ctx: dict[str, Any]) -> None:
     logger.info("Worker is shutting down...")
 
 
+async def job_start(ctx: dict[str, Any]) -> None:
+    """Запоминает срок job до запуска ARQ wait_for, не создавая отдельного таймера."""
+    ctx["job_deadline"] = asyncio.get_running_loop().time() + WorkerSettings.job_timeout
+
+
 class WorkerSettings:
     """
     Класс конфигурации, который ищет библиотека arq при запуске.
@@ -50,6 +56,7 @@ class WorkerSettings:
 
     on_startup = startup
     on_shutdown = shutdown
+    on_job_start = job_start
 
     # Глобальные архитектурные ограничения
     job_timeout = JOB_TIMEOUT
