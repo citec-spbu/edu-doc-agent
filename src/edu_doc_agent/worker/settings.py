@@ -15,6 +15,9 @@ from edu_doc_agent.config import get_settings
 from edu_doc_agent.dao import SessionRunDAO
 from edu_doc_agent.worker.tasks import process_session_task
 
+JOB_TIMEOUT = 600
+MAX_TRIES = 3
+
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
@@ -26,6 +29,7 @@ async def startup(ctx: dict[str, Any]) -> None:
         level=settings.log_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
     ctx["dao"] = SessionRunDAO()
+    ctx["max_tries"] = MAX_TRIES
     logger.info("Worker is starting up. Connected to Redis.")
 
 
@@ -48,5 +52,5 @@ class WorkerSettings:
     on_shutdown = shutdown
 
     # Глобальные архитектурные ограничения
-    job_timeout = 600  # Максимальное время выполнения одной задачи в секундах (10 минут)
-    max_tries = 3  # Максимальное количество ретраев при сбоях
+    job_timeout = JOB_TIMEOUT
+    max_tries = MAX_TRIES

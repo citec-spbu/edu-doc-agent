@@ -21,7 +21,6 @@ async def _stub_session_logic(session_id: str) -> None:
 async def process_session_task(ctx: dict[str, Any], session_id: str, run_id: str) -> dict[str, str]:
     """Тонкая точка входа ARQ: делегирует управление статусами в SessionRunner."""
 
-    # Достаем метаданные попыток из ARQ контекста
     job_try = ctx.get("job_try", 1)
     max_tries = ctx.get("max_tries", 3)
 
