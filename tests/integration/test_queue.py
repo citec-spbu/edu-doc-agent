@@ -1,4 +1,4 @@
-"""Настоящие Redis и ARQ; только отдельная очередь и известные тестовые ключи."""
+"""Настоящие PostgreSQL, Redis и ARQ с отдельными схемами и очередями."""
 
 import asyncio
 import importlib
@@ -31,12 +31,34 @@ from arq.worker import create_worker
 from redis.asyncio import Redis
 from redis.asyncio.client import Pipeline
 from redis.exceptions import ConnectionError as RedisConnectionError
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from edu_doc_agent import main
 from edu_doc_agent.api import router
+from edu_doc_agent.api.dependencies import get_session_run_dao
 from edu_doc_agent.config import Settings
+from edu_doc_agent.dao import SessionRunDAO
+from tests.integration.dao.support import Database
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.fixture(autouse=True)
+def queue_database(
+    migrated_database: Database, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Database]:
+    """API, worker и CLI используют одну собственную схему с настоящими миграциями."""
+    engine = create_async_engine(migrated_database.url, poolclass=NullPool)
+    dao = SessionRunDAO(async_sessionmaker(engine, expire_on_commit=False))
+    monkeypatch.setitem(main.app.dependency_overrides, get_session_run_dao, lambda: dao)
+    settings = importlib.import_module("edu_doc_agent.worker.settings")
+    monkeypatch.setattr(settings, "SessionRunDAO", lambda: dao)
+    try:
+        yield migrated_database
+    finally:
+        # NullPool не переносит подключения между asyncio.run разных тестов и TestClient.
+        asyncio.run(engine.dispose())
 
 
 def _redis_container_command(*arguments: str, missing_ok: bool = False) -> str:
@@ -162,6 +184,14 @@ def test_http_to_redis_to_worker(redis_dsn: str, monkeypatch: pytest.MonkeyPatch
                     "session_id": "integration-session",
                     "run_id": body["run_id"],
                 }
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=main.app), base_url="http://test"
+                ) as client:
+                    status = await client.get(
+                        f"/api/v1/sessions/integration-session/runs/{body['run_id']}"
+                    )
+                assert status.status_code == 200
+                assert status.json()["status"] == "queued"
                 worker = create_worker(
                     settings.WorkerSettings,
                     redis_pool=pool,
@@ -180,6 +210,14 @@ def test_http_to_redis_to_worker(redis_dsn: str, monkeypatch: pytest.MonkeyPatch
                         "run_id": body["run_id"],
                     }
                     sleep.assert_awaited_once_with(3)
+                    async with httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app=main.app), base_url="http://test"
+                    ) as client:
+                        status = await client.get(
+                            f"/api/v1/sessions/integration-session/runs/{body['run_id']}"
+                        )
+                    assert status.status_code == 200
+                    assert status.json()["status"] == "completed"
                 finally:
                     await worker.close()
 
@@ -187,7 +225,7 @@ def test_http_to_redis_to_worker(redis_dsn: str, monkeypatch: pytest.MonkeyPatch
 
 
 def test_local_api_and_arq_cli_process_a_session(
-    redis_dsn: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    redis_dsn: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, queue_database: Database
 ) -> None:
     """Реальные отдельные процессы Uvicorn/ARQ, localhost HTTP и Redis."""
 
@@ -210,7 +248,7 @@ def test_local_api_and_arq_cli_process_a_session(
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "REDIS_URL": redis_dsn,
                 "LOG_LEVEL": "INFO",
-                "DATABASE_URL": "postgresql+psycopg://edu:synthetic@localhost:5432/edu",
+                "DATABASE_URL": queue_database.url.render_as_string(hide_password=False),
             }
             processes = []
             api_log = tmp_path / "api.log"
@@ -603,6 +641,66 @@ def test_arq_records_terminal_failure(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("job_try", [1, 2])
+def test_arq_timeout_fails_run_and_allows_a_new_post(
+    redis_dsn: str, monkeypatch: pytest.MonkeyPatch, job_try: int
+) -> None:
+    """Окончательный TimeoutError настоящего ARQ освобождает активный слот в PostgreSQL."""
+
+    async def scenario() -> None:
+        settings = importlib.import_module("edu_doc_agent.worker.settings")
+        tasks = importlib.import_module("edu_doc_agent.worker.tasks")
+        started = asyncio.Event()
+
+        async def wait_for_timeout(delay: float) -> None:
+            started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(tasks, "asyncio", SimpleNamespace(sleep=wait_for_timeout))
+        # Меняется единственная настройка, из которой ARQ и hook старта берут бюджет.
+        # Внутренний execution_timeout Runner не используется.
+        monkeypatch.setattr(settings.WorkerSettings, "job_timeout", 0.2)
+        async with queue(redis_dsn, monkeypatch) as (pool, name, _):
+            main.app.state.redis_pool = pool
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=main.app), base_url="http://test"
+            ) as client:
+                url = "/api/v1/sessions/arq-timeout-session/process"
+                first = await client.post(url)
+                assert first.status_code == 202
+                run_id = first.json()["run_id"]
+                if job_try > 1:
+                    await pool.set(retry_key_prefix + run_id, job_try - 1)
+                worker = create_worker(
+                    settings.WorkerSettings,
+                    redis_pool=pool,
+                    queue_name=name,
+                    burst=True,
+                    max_burst_jobs=1,
+                    poll_delay=0.01,
+                    handle_signals=False,
+                )
+                try:
+                    await asyncio.wait_for(worker.async_run(), timeout=5)
+                    assert started.is_set()
+                    assert worker.jobs_failed == 1 and worker.jobs_retried == 0
+                    job = Job(run_id, pool, _queue_name=name)
+                    info = await job.result_info()
+                    assert info is not None and not info.success
+                    assert info.job_try == job_try and isinstance(info.result, TimeoutError)
+                    assert await job.status() == JobStatus.complete
+                    assert await pool.zcard(name) == 0
+                    status = await client.get(f"/api/v1/sessions/arq-timeout-session/runs/{run_id}")
+                    assert status.status_code == 200 and status.json()["status"] == "failed"
+                    retry = await client.post(url)
+                    assert retry.status_code == 202
+                    assert retry.json()["run_id"] != run_id
+                finally:
+                    await worker.close()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.pr_review
 def test_worker_shutdown_leaves_job_queued_for_retry(
     redis_dsn: str, monkeypatch: pytest.MonkeyPatch
@@ -647,6 +745,36 @@ def test_worker_shutdown_leaves_job_queued_for_retry(
                     assert worker.jobs_retried == 1
                     assert await job.status() == JobStatus.queued
                     assert await pool.zrange(name, 0, -1) == [run_id.encode()]
+                    status_url = f"/api/v1/sessions/{session_id}/runs/{run_id}"
+                    status = await client.get(status_url)
+                    assert status.status_code == 200 and status.json()["status"] == "queued"
+
+                    # Новый worker должен выполнить тот же run, а не пропустить
+                    # его из-за оставшегося в PostgreSQL статуса running.
+                    sleep = AsyncMock()
+                    monkeypatch.setattr(tasks, "asyncio", SimpleNamespace(sleep=sleep))
+                    retry_worker = create_worker(
+                        settings.WorkerSettings,
+                        redis_pool=pool,
+                        queue_name=name,
+                        burst=True,
+                        max_burst_jobs=1,
+                        poll_delay=0.01,
+                        handle_signals=False,
+                    )
+                    try:
+                        await asyncio.wait_for(retry_worker.async_run(), timeout=5)
+                        assert retry_worker.jobs_complete == 1
+                        result = await job.result(timeout=1)
+                        assert result == {
+                            "status": "completed",
+                            "session_id": session_id,
+                            "run_id": run_id,
+                        }
+                        assert (await client.get(status_url)).json()["status"] == "completed"
+                        sleep.assert_awaited_once_with(3)
+                    finally:
+                        await retry_worker.close()
                 finally:
                     running.cancel()
                     await asyncio.gather(running, return_exceptions=True)

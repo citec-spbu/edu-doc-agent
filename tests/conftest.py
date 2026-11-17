@@ -10,8 +10,10 @@ from fastapi.testclient import TestClient
 from starlette.datastructures import State
 
 from edu_doc_agent import config, main
+from edu_doc_agent.api.dependencies import get_session_run_dao
 from edu_doc_agent.config import Settings
 from edu_doc_agent.main import app
+from tests.fakes import InMemorySessionRunDAO
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -88,9 +90,15 @@ def redis_pool() -> AsyncMock:
 
 
 @pytest.fixture
-def client(redis_pool: AsyncMock) -> Iterator[TestClient]:
-    """HTTP-клиент к FastAPI-приложению для юнит-тестов API."""
-    app.state.redis_pool = redis_pool
+def dao(monkeypatch: pytest.MonkeyPatch) -> InMemorySessionRunDAO:
+    """Подменяет DAO и для общего client, и для самостоятельно созданных клиентов."""
+    instance = InMemorySessionRunDAO()
+    monkeypatch.setitem(app.dependency_overrides, get_session_run_dao, lambda: instance)
+    return instance
 
+
+@pytest.fixture
+def client(redis_pool: AsyncMock, dao: InMemorySessionRunDAO) -> Iterator[TestClient]:
+    app.state.redis_pool = redis_pool
     with TestClient(app) as test_client:
         yield test_client

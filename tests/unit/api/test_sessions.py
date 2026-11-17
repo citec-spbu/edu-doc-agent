@@ -15,6 +15,7 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from edu_doc_agent.api import router as api_router
 from edu_doc_agent.main import app
+from tests.fakes import InMemorySessionRunDAO
 
 
 @pytest.fixture
@@ -97,7 +98,10 @@ def test_unconfirmed_enqueue_does_not_claim_a_new_job(
 # PR #29 P2: https://github.com/citec-spbu/edu-doc-agent/pull/29#discussion_r4478029967
 @pytest.mark.pr_review
 def test_queue_errors_have_a_service_error_response(
-    redis_pool: AsyncMock, error: Exception, expected_status: int
+    redis_pool: AsyncMock,
+    dao: InMemorySessionRunDAO,
+    error: Exception,
+    expected_status: int,
 ) -> None:
     app.state.redis_pool = redis_pool
     redis_pool.enqueue_job.side_effect = error
@@ -110,6 +114,7 @@ def test_queue_errors_have_a_service_error_response(
     assert isinstance(body["detail"], str) and body["detail"]
     assert str(error) not in response.text
     redis_pool.enqueue_job.assert_awaited_once()
+    assert [run.status for run in dao.runs.values()] == ["failed"]
 
 
 @pytest.mark.parametrize(
@@ -145,7 +150,7 @@ def test_queue_error_logs_include_session_and_cause(
 # PR #29 P2: https://github.com/citec-spbu/edu-doc-agent/pull/29#discussion_r4478029967
 @pytest.mark.pr_review
 def test_silent_redis_has_a_deadline_without_blind_retry(
-    redis_pool: AsyncMock, fast_enqueue_timeout: float
+    redis_pool: AsyncMock, dao: InMemorySessionRunDAO, fast_enqueue_timeout: float
 ) -> None:
     async def scenario() -> None:
         started = asyncio.Event()
@@ -187,15 +192,44 @@ def test_silent_redis_has_a_deadline_without_blind_retry(
                     await request
 
     asyncio.run(scenario())
+    assert [run.status for run in dao.runs.values()] == ["failed"]
 
 
 def test_enqueue_deadline_default() -> None:
     assert api_router.ENQUEUE_DEADLINE_SECONDS == 2.0
 
 
+def test_failed_compensation_is_logged_without_hiding_enqueue_error(
+    client: TestClient,
+    redis_pool: AsyncMock,
+    dao: InMemorySessionRunDAO,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    redis_pool.enqueue_job.side_effect = RedisConnectionError("synthetic enqueue failure")
+    write_error = RuntimeError("synthetic compensation write failure")
+    monkeypatch.setattr(dao, "mark_failed_if_queued", AsyncMock(side_effect=write_error))
+    with caplog.at_level(logging.ERROR, logger=api_router.__name__):
+        response = client.post("/api/v1/sessions/compensation-failure/process")
+    assert response.status_code == 503
+    run = next(iter(dao.runs.values()))
+    assert run.status == "queued"
+    assert any(
+        record.exc_info is not None
+        and record.exc_info[1] is write_error
+        and run.session_id in record.getMessage()
+        and str(run.id) in record.getMessage()
+        for record in caplog.records
+    )
+    assert str(write_error) not in response.text
+    redis_pool.enqueue_job.assert_awaited_once()
+
+
 def test_external_cancellation_reaches_enqueue_without_error_response_or_retry(
     redis_pool: AsyncMock, caplog: pytest.LogCaptureFixture
 ) -> None:
+    dao = InMemorySessionRunDAO()
+
     async def scenario() -> None:
         started = asyncio.Event()
         cancelled = asyncio.Event()
@@ -208,7 +242,9 @@ def test_external_cancellation_reaches_enqueue_without_error_response_or_retry(
                 cancelled.set()
 
         redis_pool.enqueue_job.side_effect = pending_enqueue
-        request = asyncio.create_task(api_router.process_session("cancelled-session", redis_pool))
+        request = asyncio.create_task(
+            api_router.process_session("cancelled-session", redis_pool, dao)
+        )
         try:
             await asyncio.wait_for(started.wait(), timeout=1)
             request.cancel()
@@ -217,6 +253,8 @@ def test_external_cancellation_reaches_enqueue_without_error_response_or_retry(
             assert request.cancelled()
             assert cancelled.is_set()
             redis_pool.enqueue_job.assert_awaited_once()
+            # run не должен остаться висеть активным
+            assert [r.status for r in dao.runs.values()] == ["failed"]
         finally:
             request.cancel()
             with suppress(asyncio.CancelledError):
@@ -224,7 +262,7 @@ def test_external_cancellation_reaches_enqueue_without_error_response_or_retry(
 
     with caplog.at_level(logging.ERROR, logger=api_router.__name__):
         asyncio.run(scenario())
-    assert not [record for record in caplog.records if record.name == api_router.__name__]
+    assert not [r for r in caplog.records if r.name == api_router.__name__]
 
 
 def test_openapi_exposes_process_contract(client: TestClient) -> None:

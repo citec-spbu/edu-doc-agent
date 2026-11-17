@@ -27,8 +27,9 @@ API делает одну попытку постановки на запрос.
 
 В PostgreSQL модели Session/Run ограничивают набор статусов и допускают только
 один активный run (`queued`, `running`, `waiting_for_input`) на сессию.
-API/worker пока не используют эти модели: идемпотентность повторного POST
-и полный жизненный цикл с отдельной resume-job остаются следующими задачами.
+API создаёт Run до постановки в очередь, worker фиксирует переходы
+`queued → running → completed/failed`. Повторный POST при активном Run даёт `409`;
+сбой постановки переводит ещё не взятый worker запуск в `failed`.
 
 ## Настоящий PostgreSQL 17 и Alembic
 
@@ -71,23 +72,91 @@ Offline генерирует SQL с ожидаемой ревизией при �
 online действительно применяет миграции. В обоих режимах и при контролируемом
 online-сбое проверяется отсутствие исходного/кодированного пароля и полного DSN в выводе.
 
-## Настоящие Redis и ARQ
+## Настоящие PostgreSQL, Redis и ARQ
 
-Явно указать адрес отдельного тестового Redis:
+### Матрица жизненного цикла Session/Run (#36)
+
+В [test_session_runs.py](integration/test_session_runs.py) API и Runner работают
+с настоящим PostgreSQL в отдельной схеме после Alembic. Enqueue подменён:
+это позволяет управлять порядком подтверждения очереди и переходов worker.
+Нужен только `TEST_DATABASE_URL`, Redis для этого файла не требуется:
 
 ```bash
-TEST_REDIS_URL=redis://127.0.0.1:6379/15 \
+TEST_DATABASE_URL=postgresql+psycopg://edu:edu@127.0.0.1:5432/edu \
+  uv run --no-sync pytest tests/integration/test_session_runs.py --run-integration
+```
+
+| Сценарий | Проверка |
+| --- | --- |
+| Commit до enqueue | Независимое соединение видит Session и queued Run внутри enqueue |
+| Два POST для новой сессии | 202/409, одна Session, один активный Run, один enqueue |
+| Активные и терминальные статусы | Три активных статуса запрещают новый Run, три терминальных разрешают |
+| Посторонний IntegrityError | Настоящий конфликт PK не превращается в 409; транзакция откатывается |
+| Сбой enqueue | Timeout, RedisError, None, внутренняя ошибка и deadline; failed и успешный новый POST |
+| Компенсация раньше worker | Поздняя job пропускается без вызова бизнес-функции |
+| Worker раньше компенсации | running и completed сохраняются |
+| Две попытки одного Run | Один атомарный захват и один вызов бизнес-функции |
+| Параллельные разные Runs | Работа при пуле из одного соединения; ошибка одного не затрагивает другой |
+| Исключение бизнес-функции | Исходный объект исключения выходит после commit failed |
+| GET | Шесть статусов, идентификаторы и timestamps из БД, 404 для отсутствующего/чужого Run, без Redis |
+
+Отмена до/после записи статуса, повторная отмена, защита чужого Run и сохранение
+терминального исхода покрыты [unit-регрессиями Runner](unit/worker/test_runner_cancellation.py).
+В `test_queue.py::test_worker_shutdown_leaves_job_queued_for_retry` настоящий ARQ
+после остановки worker повторно выполняет тот же Run: проверяются queued в БД,
+успех нового worker и completed через GET. Для этого сценария нужны обе тестовые DSN.
+В `test_queue.py::test_arq_timeout_fails_run_and_allows_a_new_post` настоящий
+таймаут ARQ проверяется на попытках 1 и 2: результат job — `TimeoutError` без retry,
+канонический статус — `failed`, следующий POST принимается с новым run_id.
+Используется короткий `WorkerSettings.job_timeout`; внутренний лимит Runner не задаётся.
+В [test_runner_failures.py](unit/worker/test_runner_failures.py) проверяются исходное
+исключение бизнес-функции при сбое записи `failed`, ошибка записи `completed`
+и логирование сбоя обработки отмены. Unit-тест API закрепляет логирование
+неудачной компенсации с сохранением исходного HTTP-ответа на сбой enqueue.
+
+Для сбора покрытия backend указывайте каталоги исходников:
+
+```bash
+uv run --no-sync pytest tests/integration/test_session_runs.py \
+  tests/integration/test_queue.py::test_worker_shutdown_leaves_job_queued_for_retry \
+  tests/integration/test_queue.py::test_arq_timeout_fails_run_and_allows_a_new_post \
+  tests/unit/worker tests/unit/dao tests/unit/api/test_sessions.py \
+  --run-integration --cov=src/edu_doc_agent/dao --cov=src/edu_doc_agent/worker \
+  --cov=src/edu_doc_agent/api --cov-branch --cov-report=term-missing
+```
+
+Перед запуском задать обе тестовые DSN, как описано ниже. В локальном окружении
+с coverage 7.16.2 и SQLAlchemy 2.1.8 выбор вложенных модулей именами
+(`--cov=edu_doc_agent.dao.repositories` и аналогично для `worker.runner`/`api.router`)
+вызывает повторный импорт SQLAlchemy при поиске источников coverage. Python-код
+и Cython-расширение получают разные объекты enum `InternalTraversal`, из-за чего
+ORM INSERT падает с `TypeError: 'InternalTraversal' object is not callable`.
+Каталоги в `--cov` сохраняют branch coverage и исключают этот предварительный
+импорт. Используемый в CI `--cov=edu_doc_agent` также не требует импорта вложенных
+пакетов при поиске источников.
+
+### Запуск контура очереди
+
+Явно указать адреса отдельных тестовых PostgreSQL 17 и Redis:
+
+```bash
+TEST_DATABASE_URL=postgresql+psycopg://edu:edu@127.0.0.1:5432/edu \
+  TEST_REDIS_URL=redis://127.0.0.1:6379/15 \
   uv run --no-sync pytest tests/integration/test_queue.py --run-integration
 ```
 
-Без адреса тесты пропускаются; при указанном, но недоступном Redis — падают.
+Без адреса Redis тесты пропускаются; при указанном, но недоступном Redis — падают.
+Для БД требуется явный `TEST_DATABASE_URL`. Каждый тест получает собственную
+схему с миграциями Alembic; API и worker используют настоящую БД в этой схеме.
+Подключения не переиспользуются между event loop. После теста схема удаляется.
 Каждый сценарий использует уникальную очередь. Очистка удаляет только собственную
 очередь, heartbeat и ключи известных тестовых run ID; FLUSHDB/FLUSHALL не используются.
 Worker запускается в burst-режиме с конфигурацией приложения. Трёхсекундная
 пауза заглушки подменяется только в модуле задачи, без изменения polling ARQ.
 Отдельный smoke запускает настоящие процессы Uvicorn и ARQ CLI,
 делает localhost HTTP-запрос и дожидается результата реальной задачи. Его
-временные модули задают только уникальное имя очереди; production-код не меняется.
+временные модули задают уникальное имя очереди, а окружение передаёт DSN той же
+тестовой схемы; production-код не меняется.
 
 В том же файле есть два fault-сценария с собственным временным контейнером
 Redis: остановка и приостановка после успешного запроса. Оба проверяют `503`
@@ -98,7 +167,8 @@ Docker daemon и заранее доступного образа `redis:7-alpin
 Для запуска только этих двух сценариев внешний Redis не нужен:
 
 ```bash
-uv run --no-sync pytest tests/integration/test_queue.py --run-integration \
+TEST_DATABASE_URL=postgresql+psycopg://edu:edu@127.0.0.1:5432/edu \
+  uv run --no-sync pytest tests/integration/test_queue.py --run-integration \
   -k redis_recovers_after_outage
 ```
 
