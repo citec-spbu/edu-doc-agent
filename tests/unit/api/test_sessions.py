@@ -98,7 +98,10 @@ def test_unconfirmed_enqueue_does_not_claim_a_new_job(
 # PR #29 P2: https://github.com/citec-spbu/edu-doc-agent/pull/29#discussion_r4478029967
 @pytest.mark.pr_review
 def test_queue_errors_have_a_service_error_response(
-    redis_pool: AsyncMock, error: Exception, expected_status: int
+    redis_pool: AsyncMock,
+    dao: InMemorySessionRunDAO,
+    error: Exception,
+    expected_status: int,
 ) -> None:
     app.state.redis_pool = redis_pool
     redis_pool.enqueue_job.side_effect = error
@@ -111,6 +114,7 @@ def test_queue_errors_have_a_service_error_response(
     assert isinstance(body["detail"], str) and body["detail"]
     assert str(error) not in response.text
     redis_pool.enqueue_job.assert_awaited_once()
+    assert [run.status for run in dao.runs.values()] == ["failed"]
 
 
 @pytest.mark.parametrize(
@@ -146,7 +150,7 @@ def test_queue_error_logs_include_session_and_cause(
 # PR #29 P2: https://github.com/citec-spbu/edu-doc-agent/pull/29#discussion_r4478029967
 @pytest.mark.pr_review
 def test_silent_redis_has_a_deadline_without_blind_retry(
-    redis_pool: AsyncMock, fast_enqueue_timeout: float
+    redis_pool: AsyncMock, dao: InMemorySessionRunDAO, fast_enqueue_timeout: float
 ) -> None:
     async def scenario() -> None:
         started = asyncio.Event()
@@ -188,6 +192,7 @@ def test_silent_redis_has_a_deadline_without_blind_retry(
                     await request
 
     asyncio.run(scenario())
+    assert [run.status for run in dao.runs.values()] == ["failed"]
 
 
 def test_enqueue_deadline_default() -> None:

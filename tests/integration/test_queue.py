@@ -1,4 +1,4 @@
-"""Настоящие Redis и ARQ; только отдельная очередь и известные тестовые ключи."""
+"""Настоящие PostgreSQL, Redis и ARQ с отдельными схемами и очередями."""
 
 import asyncio
 import importlib
@@ -31,12 +31,34 @@ from arq.worker import create_worker
 from redis.asyncio import Redis
 from redis.asyncio.client import Pipeline
 from redis.exceptions import ConnectionError as RedisConnectionError
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from edu_doc_agent import main
 from edu_doc_agent.api import router
+from edu_doc_agent.api.dependencies import get_session_run_dao
 from edu_doc_agent.config import Settings
+from edu_doc_agent.dao import SessionRunDAO
+from tests.integration.dao.support import Database
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.fixture(autouse=True)
+def queue_database(
+    migrated_database: Database, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Database]:
+    """API, worker и CLI используют одну собственную схему с настоящими миграциями."""
+    engine = create_async_engine(migrated_database.url, poolclass=NullPool)
+    dao = SessionRunDAO(async_sessionmaker(engine, expire_on_commit=False))
+    monkeypatch.setitem(main.app.dependency_overrides, get_session_run_dao, lambda: dao)
+    settings = importlib.import_module("edu_doc_agent.worker.settings")
+    monkeypatch.setattr(settings, "SessionRunDAO", lambda: dao)
+    try:
+        yield migrated_database
+    finally:
+        # NullPool не переносит подключения между asyncio.run разных тестов и TestClient.
+        asyncio.run(engine.dispose())
 
 
 def _redis_container_command(*arguments: str, missing_ok: bool = False) -> str:
@@ -162,6 +184,14 @@ def test_http_to_redis_to_worker(redis_dsn: str, monkeypatch: pytest.MonkeyPatch
                     "session_id": "integration-session",
                     "run_id": body["run_id"],
                 }
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=main.app), base_url="http://test"
+                ) as client:
+                    status = await client.get(
+                        f"/api/v1/sessions/integration-session/runs/{body['run_id']}"
+                    )
+                assert status.status_code == 200
+                assert status.json()["status"] == "queued"
                 worker = create_worker(
                     settings.WorkerSettings,
                     redis_pool=pool,
@@ -180,6 +210,14 @@ def test_http_to_redis_to_worker(redis_dsn: str, monkeypatch: pytest.MonkeyPatch
                         "run_id": body["run_id"],
                     }
                     sleep.assert_awaited_once_with(3)
+                    async with httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app=main.app), base_url="http://test"
+                    ) as client:
+                        status = await client.get(
+                            f"/api/v1/sessions/integration-session/runs/{body['run_id']}"
+                        )
+                    assert status.status_code == 200
+                    assert status.json()["status"] == "completed"
                 finally:
                     await worker.close()
 
@@ -187,7 +225,7 @@ def test_http_to_redis_to_worker(redis_dsn: str, monkeypatch: pytest.MonkeyPatch
 
 
 def test_local_api_and_arq_cli_process_a_session(
-    redis_dsn: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    redis_dsn: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, queue_database: Database
 ) -> None:
     """Реальные отдельные процессы Uvicorn/ARQ, localhost HTTP и Redis."""
 
@@ -210,7 +248,7 @@ def test_local_api_and_arq_cli_process_a_session(
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "REDIS_URL": redis_dsn,
                 "LOG_LEVEL": "INFO",
-                "DATABASE_URL": "postgresql+psycopg://edu:synthetic@localhost:5432/edu",
+                "DATABASE_URL": queue_database.url.render_as_string(hide_password=False),
             }
             processes = []
             api_log = tmp_path / "api.log"

@@ -90,16 +90,15 @@ def redis_pool() -> AsyncMock:
 
 
 @pytest.fixture
-def dao() -> InMemorySessionRunDAO:
-    return InMemorySessionRunDAO()
+def dao(monkeypatch: pytest.MonkeyPatch) -> InMemorySessionRunDAO:
+    """Подменяет DAO и для общего client, и для самостоятельно созданных клиентов."""
+    instance = InMemorySessionRunDAO()
+    monkeypatch.setitem(app.dependency_overrides, get_session_run_dao, lambda: instance)
+    return instance
 
 
 @pytest.fixture
 def client(redis_pool: AsyncMock, dao: InMemorySessionRunDAO) -> Iterator[TestClient]:
     app.state.redis_pool = redis_pool
-    app.dependency_overrides[get_session_run_dao] = lambda: dao
-    try:
-        with TestClient(app) as test_client:
-            yield test_client
-    finally:
-        app.dependency_overrides.pop(get_session_run_dao, None)
+    with TestClient(app) as test_client:
+        yield test_client
