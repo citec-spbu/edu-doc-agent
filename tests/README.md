@@ -74,6 +74,60 @@ online-сбое проверяется отсутствие исходного/�
 
 ## Настоящие PostgreSQL, Redis и ARQ
 
+### Матрица жизненного цикла Session/Run (#36)
+
+В [test_session_runs.py](integration/test_session_runs.py) API и Runner работают
+с настоящим PostgreSQL в отдельной схеме после Alembic. Enqueue подменён:
+это позволяет управлять порядком подтверждения очереди и переходов worker.
+Нужен только `TEST_DATABASE_URL`, Redis для этого файла не требуется:
+
+```bash
+TEST_DATABASE_URL=postgresql+psycopg://edu:edu@127.0.0.1:5432/edu \
+  uv run --no-sync pytest tests/integration/test_session_runs.py --run-integration
+```
+
+| Сценарий | Проверка |
+| --- | --- |
+| Commit до enqueue | Независимое соединение видит Session и queued Run внутри enqueue |
+| Два POST для новой сессии | 202/409, одна Session, один активный Run, один enqueue |
+| Активные и терминальные статусы | Три активных статуса запрещают новый Run, три терминальных разрешают |
+| Посторонний IntegrityError | Настоящий конфликт PK не превращается в 409; транзакция откатывается |
+| Сбой enqueue | Timeout, RedisError, None, внутренняя ошибка и deadline; failed и успешный новый POST |
+| Компенсация раньше worker | Поздняя job пропускается без вызова бизнес-функции |
+| Worker раньше компенсации | running и completed сохраняются |
+| Две попытки одного Run | Один атомарный захват и один вызов бизнес-функции |
+| Параллельные разные Runs | Работа при пуле из одного соединения; ошибка одного не затрагивает другой |
+| Исключение бизнес-функции | Исходный объект исключения выходит после commit failed |
+| GET | Шесть статусов, идентификаторы и timestamps из БД, 404 для отсутствующего/чужого Run, без Redis |
+
+Отмена до/после записи статуса, повторная отмена, защита чужого Run и сохранение
+терминального исхода покрыты [unit-регрессиями Runner](unit/worker/test_runner_cancellation.py).
+В `test_queue.py::test_worker_shutdown_leaves_job_queued_for_retry` настоящий ARQ
+после остановки worker повторно выполняет тот же Run: проверяются queued в БД,
+успех нового worker и completed через GET. Для этого сценария нужны обе тестовые DSN.
+
+Для сбора покрытия backend указывайте каталоги исходников:
+
+```bash
+uv run --no-sync pytest tests/integration/test_session_runs.py \
+  tests/integration/test_queue.py::test_worker_shutdown_leaves_job_queued_for_retry \
+  tests/unit/worker tests/unit/dao tests/unit/api/test_sessions.py \
+  --run-integration --cov=src/edu_doc_agent/dao --cov=src/edu_doc_agent/worker \
+  --cov=src/edu_doc_agent/api --cov-branch --cov-report=term-missing
+```
+
+Перед запуском задать обе тестовые DSN, как описано ниже. В локальном окружении
+с coverage 7.16.2 и SQLAlchemy 2.1.8 выбор вложенных модулей именами
+(`--cov=edu_doc_agent.dao.repositories` и аналогично для `worker.runner`/`api.router`)
+вызывает повторный импорт SQLAlchemy при поиске источников coverage. Python-код
+и Cython-расширение получают разные объекты enum `InternalTraversal`, из-за чего
+ORM INSERT падает с `TypeError: 'InternalTraversal' object is not callable`.
+Каталоги в `--cov` сохраняют branch coverage и исключают этот предварительный
+импорт. Используемый в CI `--cov=edu_doc_agent` также не требует импорта вложенных
+пакетов при поиске источников.
+
+### Запуск контура очереди
+
 Явно указать адреса отдельных тестовых PostgreSQL 17 и Redis:
 
 ```bash

@@ -685,6 +685,36 @@ def test_worker_shutdown_leaves_job_queued_for_retry(
                     assert worker.jobs_retried == 1
                     assert await job.status() == JobStatus.queued
                     assert await pool.zrange(name, 0, -1) == [run_id.encode()]
+                    status_url = f"/api/v1/sessions/{session_id}/runs/{run_id}"
+                    status = await client.get(status_url)
+                    assert status.status_code == 200 and status.json()["status"] == "queued"
+
+                    # Новый worker должен выполнить тот же run, а не пропустить
+                    # его из-за оставшегося в PostgreSQL статуса running.
+                    sleep = AsyncMock()
+                    monkeypatch.setattr(tasks, "asyncio", SimpleNamespace(sleep=sleep))
+                    retry_worker = create_worker(
+                        settings.WorkerSettings,
+                        redis_pool=pool,
+                        queue_name=name,
+                        burst=True,
+                        max_burst_jobs=1,
+                        poll_delay=0.01,
+                        handle_signals=False,
+                    )
+                    try:
+                        await asyncio.wait_for(retry_worker.async_run(), timeout=5)
+                        assert retry_worker.jobs_complete == 1
+                        result = await job.result(timeout=1)
+                        assert result == {
+                            "status": "completed",
+                            "session_id": session_id,
+                            "run_id": run_id,
+                        }
+                        assert (await client.get(status_url)).json()["status"] == "completed"
+                        sleep.assert_awaited_once_with(3)
+                    finally:
+                        await retry_worker.close()
                 finally:
                     running.cancel()
                     await asyncio.gather(running, return_exceptions=True)
