@@ -4,6 +4,7 @@ from pathlib import Path
 
 from edu_doc_agent.parsing.docx_parser import DocxParser
 from edu_doc_agent.parsing.models import BaseParser, Block, BlockKind, CellSpan, ParsedDocument
+from edu_doc_agent.parsing.pdf_parser import NoTextLayerError, PdfParser
 from edu_doc_agent.parsing.xlsx_parser import XlsxParser
 
 __all__ = [
@@ -11,6 +12,7 @@ __all__ = [
     "Block",
     "BlockKind",
     "CellSpan",
+    "NoTextLayerError",
     "ParsedDocument",
     "UnsupportedFormatError",
     "parse_document",
@@ -22,7 +24,11 @@ class UnsupportedFormatError(ValueError):
     """Нет парсера для файла"""
 
 
-PARSERS: dict[str, BaseParser] = {".docx": DocxParser(), ".xlsx": XlsxParser()}
+PARSERS: dict[str, BaseParser] = {
+    ".docx": DocxParser(),
+    ".pdf": PdfParser(),
+    ".xlsx": XlsxParser(),
+}
 
 
 def supported_suffixes() -> tuple[str, ...]:
