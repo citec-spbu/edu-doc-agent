@@ -27,9 +27,7 @@ def _is_active_run_conflict(exc: IntegrityError) -> bool:
     orig = exc.orig
     diag = getattr(orig, "diag", None)
     constraint_name = getattr(diag, "constraint_name", None)
-    if constraint_name == ACTIVE_RUN_CONSTRAINT:
-        return True
-    return ACTIVE_RUN_CONSTRAINT in str(orig)
+    return constraint_name == ACTIVE_RUN_CONSTRAINT
 
 
 class SessionRunDAO:
