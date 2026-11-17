@@ -6,7 +6,6 @@ import asyncio
 import logging
 from typing import Any
 
-from edu_doc_agent.dao import SessionRunDAO
 from edu_doc_agent.worker.runner import SessionRunner
 
 logger = logging.getLogger(__name__)
@@ -20,15 +19,13 @@ async def _stub_session_logic(session_id: str) -> None:
 
 
 async def process_session_task(ctx: dict[str, Any], session_id: str, run_id: str) -> dict[str, str]:
-    dao = ctx.get("dao")
-    if not isinstance(dao, SessionRunDAO):
-        dao = SessionRunDAO()
+    """Тонкая точка входа ARQ: делегирует управление статусами в SessionRunner."""
 
     # Достаем метаданные попыток из ARQ контекста
     job_try = ctx.get("job_try", 1)
     max_tries = ctx.get("max_tries", 3)
 
-    runner = SessionRunner(dao=dao)
+    runner = SessionRunner(dao=ctx["dao"])
     return await runner.execute(
         session_id=session_id,
         run_id=run_id,

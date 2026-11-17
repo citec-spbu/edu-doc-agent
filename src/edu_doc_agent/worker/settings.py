@@ -25,7 +25,7 @@ async def startup(ctx: dict[str, Any]) -> None:
     logging.basicConfig(
         level=settings.log_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
-    ctx.setdefault("dao", SessionRunDAO())
+    ctx["dao"] = SessionRunDAO()
     logger.info("Worker is starting up. Connected to Redis.")
 
 

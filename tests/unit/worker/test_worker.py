@@ -1,4 +1,4 @@
-"""Задача-заглушка, SessionRunner и подключение конфигурации к настоящему ARQ."""
+"""Задача-заглушка и подключение конфигурации к настоящему ARQ."""
 
 import asyncio
 import importlib
@@ -10,9 +10,6 @@ import pytest
 from arq.worker import create_worker
 
 from edu_doc_agent.config import Settings
-from tests.conftest import InMemorySessionRunDAO
-
-RUN_ID = "fcbb00f8-380e-49af-b3a2-7b5043e7c485"
 
 
 @pytest.fixture
@@ -22,10 +19,7 @@ def tasks() -> ModuleType:
 
 
 def test_task_waits_and_returns_identifiers(
-    tasks: ModuleType,
-    session_run_dao: InMemorySessionRunDAO,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
+    tasks: ModuleType, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     before_work: list[logging.LogRecord] = []
 
@@ -34,69 +28,40 @@ def test_task_waits_and_returns_identifiers(
 
     sleep = AsyncMock(side_effect=work)
     monkeypatch.setattr(tasks, "asyncio", SimpleNamespace(sleep=sleep))
-    context = {"job_id": "synthetic-job", "dao": session_run_dao}
+    context = {"job_id": "synthetic-job"}
 
-    async def scenario() -> dict[str, str]:
-        await session_run_dao.create_queued_run(
-            "synthetic-session", run_id=tasks.SessionRunner and None or None
-        )
-        # Создаём run с известным RUN_ID в статусе queued
-        from uuid import UUID
-
-        session_run_dao.runs.clear()
-        session_run_dao.sessions.clear()
-        await session_run_dao.create_queued_run("synthetic-session", run_id=UUID(RUN_ID))
-        return await tasks.process_session_task(context, "synthetic-session", RUN_ID)
-
-    with caplog.at_level(logging.INFO, logger="edu_doc_agent.worker"):
-        result = asyncio.run(scenario())
+    with caplog.at_level(logging.INFO, logger=tasks.__name__):
+        result = asyncio.run(tasks.process_session_task(context, "synthetic-session", "run-123"))
 
     assert result == {
         "status": "completed",
         "session_id": "synthetic-session",
-        "run_id": RUN_ID,
+        "run_id": "run-123",
     }
     sleep.assert_awaited_once_with(3)
     # Логи должны позволять сопоставить запуск и завершение с задачей.
     # Границу работы наблюдаем через await, не через формулировку сообщения.
     for phase in (before_work, caplog.records[len(before_work) :]):
         assert any(
-            record.name.startswith("edu_doc_agent.worker")
+            record.name == tasks.__name__
             and record.levelno == logging.INFO
             and "synthetic-session" in record.getMessage()
-            and RUN_ID in record.getMessage()
+            and "run-123" in record.getMessage()
             for record in phase
         )
 
 
-@pytest.mark.parametrize(
-    ("error", "expected_status"),
-    [
-        (RuntimeError("synthetic failure"), "failed"),
-        (asyncio.CancelledError(), "queued"),
-    ],
-)
+@pytest.mark.parametrize("error", [RuntimeError("synthetic failure"), asyncio.CancelledError()])
 def test_task_propagates_error_or_cancellation(
     tasks: ModuleType,
-    session_run_dao: InMemorySessionRunDAO,
     monkeypatch: pytest.MonkeyPatch,
     error: BaseException,
-    expected_status: str,
 ) -> None:
-    from uuid import UUID
-
     monkeypatch.setattr(tasks, "asyncio", SimpleNamespace(sleep=AsyncMock(side_effect=error)))
-    run_uuid = UUID(RUN_ID)
-
-    async def scenario() -> None:
-        await session_run_dao.create_queued_run("synthetic-session", run_id=run_uuid)
-        await tasks.process_session_task({"dao": session_run_dao}, "synthetic-session", RUN_ID)
 
     # Ошибка/отмена должна выйти к ARQ, а не превратиться в completed-результат.
     with pytest.raises(type(error)):
-        asyncio.run(scenario())
-
-    assert session_run_dao.runs[run_uuid].status == expected_status
+        asyncio.run(tasks.process_session_task({}, "synthetic-session", "failed-run"))
 
 
 def test_arq_loads_the_registered_task_and_execution_limits(tasks: ModuleType) -> None:

@@ -78,14 +78,12 @@ async def _compensate_failed_enqueue(
 async def process_session(
     session_id: Annotated[str, Path(..., description="ID сессии пользователя")],
     redis_pool: Annotated[ArqRedis, Depends(get_arq_pool)],
-    dao: Annotated[SessionRunDAO | None, Depends(get_session_run_dao)] = None,
+    dao: Annotated[SessionRunDAO, Depends(get_session_run_dao)],
 ) -> ProcessResponse:
     """
     Запускает асинхронную проверку и обработку образовательной программы.
     Фиксирует Session и Run ('queued') в PostgreSQL до постановки в очередь Redis.
     """
-    if not isinstance(dao, SessionRunDAO):
-        dao = SessionRunDAO()
 
     run_id = uuid4()
     run_id_str = str(run_id)
@@ -158,14 +156,12 @@ async def process_session(
 async def get_run_status(
     session_id: Annotated[str, Path(..., description="ID сессии пользователя")],
     run_id: Annotated[UUID, Path(..., description="ID запуска (run_id)")],
-    dao: Annotated[SessionRunDAO | None, Depends(get_session_run_dao)] = None,
+    dao: Annotated[SessionRunDAO, Depends(get_session_run_dao)],
 ) -> RunStatusResponse:
     """
     Возвращает канонический статус запуска и временные метки из PostgreSQL.
     Не обращается к Redis.
     """
-    if not isinstance(dao, SessionRunDAO):
-        dao = SessionRunDAO()
 
     run = await dao.get_run(session_id=session_id, run_id=run_id)
     if run is None:
