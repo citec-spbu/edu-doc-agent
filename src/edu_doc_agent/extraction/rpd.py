@@ -95,6 +95,7 @@ def extract_rpd(
     if parsed is not None:
         for table, block in zip(tables, parsed.tables, strict=True):
             table.spans = block.spans
+            table.grid_widths = block.grid_widths
     outcome_tables = [t for t in tables if "планируемые результаты" in _header(t)]
     assessment_tables = [
         t for t in tables if "измерительные" in _header(t) and t not in outcome_tables

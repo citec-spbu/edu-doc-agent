@@ -18,6 +18,7 @@ from edu_doc_agent.parsing import parse_document
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = Path(os.environ.get("DATA_DIR") or REPO_ROOT / "data")
 DOCX_DIR = DATA_DIR / "РПД и РПП"
+REAL_DOCX_BY_MD: dict[Path, Path] = {}
 
 
 def _convert() -> list[Path]:
@@ -35,6 +36,7 @@ def _convert() -> list[Path]:
         target = out / (unicodedata.normalize("NFC", path.stem) + ".md")
         target.write_text(parse_document(path).to_markdown(), encoding="utf-8")
         result.append(target)
+        REAL_DOCX_BY_MD[target] = path
     return result
 
 

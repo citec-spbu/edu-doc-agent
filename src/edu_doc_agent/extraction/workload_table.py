@@ -132,6 +132,75 @@ def _find_header(table: MdTable) -> tuple[int, dict[int, tuple[str | None, str]]
     return None
 
 
+def _cell_intervals(table: MdTable, row: int) -> dict[int, tuple[int, int]]:
+    """Физические границы ячеек строки, включая пустые ячейки между значениями."""
+    edges = [0]
+    for width in table.grid_widths:
+        edges.append(edges[-1] + width)
+    intervals = {}
+    col = 0
+    while col < len(table.rows[row]):
+        span = next(
+            (s for s in table.spans or [] if s.row <= row < s.row + s.row_span and s.col == col),
+            None,
+        )
+        end = col + (span.col_span if span else 1)
+        intervals[col] = (edges[col], edges[end])
+        col = end
+    return intervals
+
+
+def _aligned_columns(
+    table: MdTable,
+    header: int,
+    row: int,
+    columns: dict[int, tuple[str | None, str]],
+    warnings: list[str],
+) -> dict[int, tuple[str | None, str]]:
+    """Монотонное сопоставление ячеек по перекрытию, без повторного использования.
+
+    Сначала максимизируем число пар, затем суммарное перекрытие. Пустые ячейки
+    участвуют: локальный максимум для одного числа может занять чужой столбец.
+    Равнозначные варианты не разрешаем по значениям часов или ожидаемой сумме.
+    """
+    if not table.grid_widths or table.spans is None:
+        return columns
+    if len(table.grid_widths) != len(table.rows[row]) or any(w <= 0 for w in table.grid_widths):
+        warnings.append(f"трудоёмкость, строка {table.row_lines[row]}: некорректная сетка tblGrid")
+        return {}
+    head_cells = _cell_intervals(table, header)
+    data_cells = _cell_intervals(table, row)
+    heads = [(col, head_cells[col]) for col in columns]
+    cells = [(col, bounds) for col, bounds in data_cells.items() if col != 0]
+
+    @cache
+    def match(i: int, j: int) -> tuple[tuple[int, int], tuple[tuple[int, int], ...], bool]:
+        if i == len(heads) or j == len(cells):
+            return (0, 0), (), False
+        candidates = [match(i + 1, j), match(i, j + 1)]
+        hcol, (hstart, hend) = heads[i]
+        dcol, (dstart, dend) = cells[j]
+        overlap = min(hend, dend) - max(hstart, dstart)
+        if overlap > 0:
+            (count, width), pairs, ambiguous = match(i + 1, j + 1)
+            candidates.append(((count + 1, width + overlap), ((hcol, dcol), *pairs), ambiguous))
+        score = max(c[0] for c in candidates)
+        best = [c for c in candidates if c[0] == score]
+        pairs = best[0][1]
+        return score, pairs, any(c[2] or c[1] != pairs for c in best)
+
+    _, pairs, ambiguous = match(0, 0)
+    where = f"трудоёмкость, строка {table.row_lines[row]}"
+    if ambiguous:
+        warnings.append(f"{where}: неоднозначное перекрытие ячеек с шапкой; часы не присвоены")
+        return {}
+    matched = {dcol for _, dcol in pairs}
+    for col, _ in cells:
+        if col not in matched and _number(table.rows[row][col]) is not None:
+            warnings.append(f"{where}: число в столбце {col + 1} не сопоставлено с шапкой")
+    return {dcol: columns[hcol] for hcol, dcol in pairs}
+
+
 def extract_workload_table(table: MdTable, file: str, result: RPDExtraction) -> bool:
     """Разбирает таблицу трудоёмкости; возвращает False, если это другая таблица."""
     header = _find_header(table)
@@ -158,17 +227,22 @@ def extract_workload_table(table: MdTable, file: str, result: RPDExtraction) -> 
             continue
         if any(_RANGE_RE.match(_text(c)) for c in row[1:]):
             continue
-        result.workload_table.append(
-            _build_row(
-                row,
-                columns,
-                is_total,
-                sem,
-                trajectory,
-                study_form,
-                SourceRef(file=file, section=table.section, line=table.row_lines[idx]),
-            )
+        aligned = _aligned_columns(table, header_idx, idx, columns, result.warnings)
+        extracted = _build_row(
+            row,
+            aligned,
+            is_total,
+            sem,
+            trajectory,
+            study_form,
+            SourceRef(file=file, section=table.section, line=table.row_lines[idx]),
         )
+        result.workload_table.append(extracted)
+        if extracted.credits is None:
+            result.warnings.append(
+                f"трудоёмкость, строка {table.row_lines[idx]}: не извлечены зачётные единицы; "
+                "проверьте сетку таблицы, для Markdown без геометрии используйте исходный DOCX"
+            )
     return True
 
 
