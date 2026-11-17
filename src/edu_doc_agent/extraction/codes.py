@@ -23,6 +23,7 @@ from edu_doc_agent.extraction.curriculum import CurriculumPlan
 from edu_doc_agent.extraction.llm_extract import normalize
 from edu_doc_agent.extraction.models import RPDExtraction
 from edu_doc_agent.extraction.patterns import code_key
+from edu_doc_agent.extraction.source import SourceRef
 
 _NUMBER_INFIX_RE = re.compile(r"^ПКП-\d+-(?=[А-ЯЁ])")
 _BARE_UNK_RE = re.compile(r"^УНК-")
@@ -70,6 +71,9 @@ class CodeEntry:
     canonical: str
     spellings: dict[str, list[str]] = field(default_factory=lambda: defaultdict(list))
     names: dict[str, list[str]] = field(default_factory=lambda: defaultdict(list))
+    references: dict[tuple[str, str | None], list[SourceRef]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
 
     @property
     def sources(self) -> set[str]:
@@ -82,7 +86,9 @@ class CodeIndex:
 
     entries: dict[str, CodeEntry] = field(default_factory=dict)
 
-    def add(self, source: str, code: str, name: str | None = None) -> None:
+    def add(
+        self, source: str, code: str, name: str | None = None, ref: SourceRef | None = None
+    ) -> None:
         key = canonical_code(code)
         if not key:
             return
@@ -91,6 +97,8 @@ class CodeIndex:
             entry.spellings[source].append(code)
         if name and name not in entry.names[source]:
             entry.names[source].append(name)
+        if ref is not None and ref not in entry.references[source, name]:
+            entry.references[source, name].append(ref)
 
     def codes_of(self, source: str) -> set[str]:
         return {k for k, e in self.entries.items() if source in e.sources}
@@ -164,13 +172,31 @@ def check_codes(index: CodeIndex, *, reference: str, subsets: Iterable[str]) -> 
     for source in subsets:
         unknown = index.unknown_in(source, reference)
         if unknown:
-            warnings.append(f"{source}: коды, которых нет в «{reference}»: {', '.join(unknown)}")
+            refs = [
+                ref
+                for code in unknown
+                for (src, _), values in index.entries[code].references.items()
+                if src == source
+                for ref in values
+            ]
+            warnings.append(
+                f"{source}: коды, которых нет в «{reference}»: {', '.join(unknown)}"
+                + _locations(refs)
+            )
     for d in index.name_differences(reference):
         warnings.append(
             f"{d.canonical}: название в «{d.source}» отличается от «{d.reference}» "
             f"(сходство {d.similarity:.2f}): «{_short(d.name)}» ≠ «{_short(d.reference_name)}»"
+            + _locations(index.entries[d.canonical].references[d.source, d.name])
         )
     return warnings
+
+
+def _locations(refs: list[SourceRef]) -> str:
+    locations = dict.fromkeys(
+        f"{r.file}, {r.section or 'раздел не указан'}, строка {r.line}" for r in refs
+    )
+    return " [" + "; ".join(locations) + "]" if locations else ""
 
 
 def check_competence_codes(
@@ -190,8 +216,10 @@ def check_competence_codes(
     if ckmv is not None:
         sources["ЦКМВ"] = [(c.code, c.name) for c in ckmv.competences]
         subsets.append("ЦКМВ")
-    rpd_items = [(c.code, c.name) for r in rpd for c in r.competences]
+    rpd_items = [c for r in rpd for c in r.competences]
+    index = build_index(sources)
     if rpd_items:
-        sources["РПД"] = rpd_items
+        for c in rpd_items:
+            index.add("РПД", c.code, c.name, c.source)
         subsets.append("РПД")
-    return check_codes(build_index(sources), reference="план", subsets=subsets)
+    return check_codes(index, reference="план", subsets=subsets)

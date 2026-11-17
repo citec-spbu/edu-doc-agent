@@ -78,7 +78,7 @@ def test_workload_table_semester_rows(path: Path) -> None:
         assert row.credits is not None, f"семестр {row.semester}: нет з.е."
         assert row.total_hours == row.credits * 36, f"семестр {row.semester}"
     assert sum(1 for w in r.warnings if w.startswith("трудоёмкость")) == (
-        4 if path.stem == "С5_076083_Глубокое обучение" else int(_is_known(path, TOTAL_TYPOS))
+        4 if path.stem == "С5_076083_Глубокое обучение" else 2 * int(_is_known(path, TOTAL_TYPOS))
     )
 
 

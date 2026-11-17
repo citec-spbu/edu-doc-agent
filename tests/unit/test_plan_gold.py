@@ -39,8 +39,6 @@ def _gold_plan() -> CurriculumPlan:
     plan = CurriculumPlan(file="gold", **GOLD["title"])
     plan.competences = [PlanCompetence(source=ref, **c) for c in GOLD["competences"]]
     for g in GOLD["entries"]:
-        contact_names = [f"c{i}" for i in range(len(g["contact"]))]
-        self_names = [f"s{i}" for i in range(len(g["self"]))]
         fields = {n: g[n] for n in ("block", "code", "name", "name_en", "credits", "semester")}
         fields |= {n: g[n] for n in ("year", "part", "group", "profile", "trajectory")}
         plan.entries.append(
@@ -48,8 +46,8 @@ def _gold_plan() -> CurriculumPlan:
                 competences=g["competences"],
                 control=g["control"],
                 active_hours=g["active"],
-                **{keys[0]: dict(zip(contact_names, g["contact"], strict=True))},
-                **{keys[1]: dict(zip(self_names, g["self"], strict=True))},
+                **{keys[0]: dict(g["contact"])},
+                **{keys[1]: dict(g["self"])},
                 source=ref,
                 **fields,
             )

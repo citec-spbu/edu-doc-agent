@@ -58,6 +58,7 @@ class MatrixPlanComparison:
     equal: int = 0
     different: list[RowDifference] = field(default_factory=list)
     unmatched: list[MatrixRow] = field(default_factory=list)
+    unmatched_reasons: dict[int, str] = field(default_factory=dict)
     columns_not_in_plan: list[str] = field(default_factory=list)
     plan_competences_not_in_columns: list[str] = field(default_factory=list)
 
@@ -76,7 +77,8 @@ class MatrixPlanComparison:
         for row in self.unmatched:
             out.append(
                 f"матрица, строка {row.source.line} («{row.discipline}», сем. {row.semester}, "
-                f"{row.profile}): нет соответствия в плане"
+                f"{row.profile}): "
+                + self.unmatched_reasons.get(row.source.line, "нет соответствия в плане")
             )
         for d in self.different:
             parts = []
@@ -122,17 +124,30 @@ def compare_matrix_with_plan(
             for e in plan.entries
             if e.semester == row.semester and _names_match(row.discipline, e.name)
         ]
-        same_profile = [e for e in candidates if _profile_matches(row.profile, e.profile)]
-        pool = same_profile or candidates
+        exact = [e for e in candidates if normalize(row.discipline) == normalize(e.name)]
+        candidates = exact or candidates
+        pool = [e for e in candidates if _profile_matches(row.profile, e.profile)]
+        if row.part:
+            pool = [e for e in pool if e.part and normalize(e.part).startswith(normalize(row.part))]
         if not pool:
             result.unmatched.append(row)
+            if candidates:
+                locations = "; ".join(
+                    f"{e.source.file}:{e.source.line} (профиль {e.profile}, часть {e.part})"
+                    for e in candidates
+                )
+                result.unmatched_reasons[row.source.line] = (
+                    f"несовместимые профиль/часть плана: {locations}"
+                )
             continue
-
-        def closeness(e: PlanEntry, mset: set[str] = mset) -> int:
-            pset = {canonical_code(c) for c in e.competences}
-            return len(mset & pset) - len(mset ^ pset)
-
-        best = max(pool, key=closeness)
+        if len(pool) > 1:
+            result.unmatched.append(row)
+            locations = ", ".join(f"{e.source.file}:{e.source.line}" for e in pool)
+            result.unmatched_reasons[row.source.line] = (
+                f"неоднозначное соответствие в плане ({locations})"
+            )
+            continue
+        best = pool[0]
         pset = {canonical_code(c) for c in best.competences}
         result.matched += 1
         if pset == mset:

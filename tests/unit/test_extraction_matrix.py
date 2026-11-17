@@ -10,6 +10,7 @@ import pytest
 from openpyxl import Workbook
 
 from edu_doc_agent.eval.matrix_gold import (
+    MATRIX_GOLD,
     MATRIX_GOLD_FULL,
     THRESHOLD,
     load_matrix_gold,
@@ -192,8 +193,12 @@ _FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 MANUAL = load_matrix_gold(_FIXTURES / "matrix_gold.json")
 FULL = load_matrix_gold(_FIXTURES / "matrix_gold_full.json")
 needs_data = pytest.mark.skipif(
-    real_matrix_xlsx() is None or not MATRIX_GOLD_FULL.exists(),
+    real_matrix_xlsx() is None,
     reason="нет data/Матрица компетенций.zip",
+)
+
+needs_gold = pytest.mark.skipif(
+    not MATRIX_GOLD_FULL.exists(), reason="нет локального эталона matrix_gold_full.json"
 )
 
 
@@ -220,13 +225,15 @@ def test_real_matrix_has_no_warnings() -> None:
 @needs_data
 @pytest.mark.parametrize("full", [False, True], ids=["manual", "full"])
 def test_real_matrix_accuracy(full: bool) -> None:
-    report = score_matrix(
-        _real(), load_matrix_gold(MATRIX_GOLD_FULL) if full else load_matrix_gold()
-    )
+    path = MATRIX_GOLD_FULL if full else MATRIX_GOLD
+    if not path.exists():
+        pytest.skip(f"нет локального эталона {path.name}")
+    report = score_matrix(_real(), load_matrix_gold(path))
     assert report.passed(), report.summary()
 
 
 @needs_data
+@needs_gold
 def test_real_matrix_cells_are_all_checked() -> None:
     report = score_matrix(_real(), load_matrix_gold(MATRIX_GOLD_FULL))
     assert report.total["cells"] == 118 * 49 and report.total["totals"] == 3 * 49
@@ -288,4 +295,6 @@ def test_real_matrix_against_real_plan_known_counts() -> None:
     plan = extract_plan(real_plan_markdown() or "", "plan.docx")
     cmp = compare_matrix_with_plan(_real(), plan)
     assert cmp.columns_not_in_plan == [] and cmp.plan_competences_not_in_columns == []
-    assert (cmp.matched, cmp.equal, len(cmp.different), len(cmp.unmatched)) == (111, 82, 29, 7)
+    assert (cmp.matched, cmp.equal, len(cmp.different), len(cmp.unmatched)) == (67, 45, 22, 51)
+    # Несовместимые профиль/часть и неоднозначные траектории не подбираются по компетенциям.
+    assert sum("неоднозначное" in reason for reason in cmp.unmatched_reasons.values()) == 5

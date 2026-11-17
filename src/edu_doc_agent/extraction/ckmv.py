@@ -154,8 +154,18 @@ def _extract_table(table: MdTable, file: str, doc: CkmvDocument) -> None:
                 code, name, level = parsed
                 indicator = CkmvIndicator(code=code, name=name, level=level, source=ref)
                 competence.indicators.append(indicator)
-        for part in (p for p in c3.split("\n") if p.strip()):
-            _add_outcome(part, indicator, ref, doc)
+        pending = ""
+        for part in (p.strip() for p in c3.split("\n") if p.strip()):
+            if _OUTCOME_RE.match(part):
+                if pending:
+                    _add_outcome(pending, indicator, ref, doc)
+                pending = part
+            elif pending:
+                pending += " " + part
+            else:
+                _add_outcome(part, indicator, ref, doc)
+        if pending:
+            _add_outcome(pending, indicator, ref, doc)
 
 
 def _add_outcome(

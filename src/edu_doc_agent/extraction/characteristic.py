@@ -25,7 +25,7 @@ from edu_doc_agent.extraction.patterns import COMPETENCE_CODE, code_key
 from edu_doc_agent.extraction.source import SourceRef, attach_quotes
 from edu_doc_agent.llm import LLMClient
 
-_COMPETENCE_LINE_RE = re.compile(rf"^({COMPETENCE_CODE})\s+(\S.*)$")
+_COMPETENCE_LINE_RE = re.compile(rf"^({COMPETENCE_CODE})[.:]?\s+(\S.*)$")
 _STANDARD_RE = re.compile(r"^Код\s+(\d{2}\.\d{3})\s+Профессиональный стандарт\s+«(.+?)»\s*(.*)$")
 _OKVED_RE = re.compile(r"^Код ОКВЭД\s+(\S+)\s+[-–]\s+(.*?)[;.]?$")
 _AREA_RE = re.compile(r"^(\d{2})\s+(\S.*?)[;.]?$")
@@ -190,7 +190,10 @@ def _extract_title(text: str, file: str, doc: ProgramCharacteristic) -> None:
     def value_after(prefix: str) -> tuple[int, str] | None:
         for idx, (_, ln) in enumerate(head):
             if ln.startswith(prefix) and idx + 1 < len(head):
-                return head[idx + 1]
+                value = head[idx + 1]
+                if re.match(r"^\d{2}\.\d{2}\.\d{2}\s+\S", value[1]):
+                    return value
+                doc.warnings.append(f"строка {value[0]}: некорректный код после «{ln}»")
         return None
 
     def split_code(value: str) -> tuple[str, str]:
@@ -321,6 +324,8 @@ def _extract_competences(sections: list[MdSection], file: str, doc: ProgramChara
                         source=_ref(s, n, file),
                     )
                 )
+            elif re.match(r"^(?:УК[А-Я]*|ОПК|ПК[А-Я]*|УНК)[\s\d-]", t):
+                doc.warnings.append(f"строка {n}: не разобрана компетенция «{t[:60]}»")
 
 
 def _extract_mapping(text: str, file: str, doc: ProgramCharacteristic) -> None:

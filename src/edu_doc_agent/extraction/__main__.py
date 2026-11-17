@@ -1,4 +1,4 @@
-"""Командная строка: `python -m edu_doc_agent.extraction файл.md [--llm]` печатает JSON."""
+"""Командная строка: `python -m edu_doc_agent.extraction файл.docx [--llm]` печатает JSON."""
 
 import argparse
 import sys
@@ -9,7 +9,9 @@ from edu_doc_agent.llm import OpenAICompatibleClient
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Извлечение сущностей из md-файла РПД/РПП")
+    parser = argparse.ArgumentParser(
+        description="Извлечение сущностей из DOCX или Markdown РПД/РПП"
+    )
     parser.add_argument("path", type=Path)
     parser.add_argument(
         "--llm",

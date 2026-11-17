@@ -127,7 +127,15 @@ def _split_name(cell: str) -> tuple[str | None, str, str | None]:
     lines = [_one_line(ln) for ln in text.split("\n") if ln.strip()]
     if not lines:
         return code, "", None
-    return code, lines[0], " ".join(lines[1:]) or None
+    boundary = next(
+        (
+            i
+            for i, line in enumerate(lines[1:], 1)
+            if re.search(r"[a-zA-Z]{2,}", line) and not re.search(r"[а-яА-ЯёЁ]", line)
+        ),
+        len(lines),
+    )
+    return code, " ".join(lines[:boundary]), " ".join(lines[boundary:]) or None
 
 
 def _ref(table: MdTable, idx: int, file: str) -> SourceRef:
@@ -293,7 +301,9 @@ def _extract_attestation(table: MdTable, file: str, plan: CurriculumPlan) -> Non
             continue
         _, name, name_en = _split_name(_cell(row, 2))
         codes = _codes(_cell(row, 3))
-        if name and codes:
+        if name:
+            if not codes:
+                plan.warnings.append(f"ГИА, строка {table.row_lines[idx]}: не указаны компетенции")
             plan.final_attestation.append(
                 FinalAttestation(
                     block=_one_line(_cell(row, 0)) or None,
@@ -352,7 +362,9 @@ def check_plan(plan: CurriculumPlan) -> None:
     known = {code_key(c.code) for c in plan.competences}
     for entry in plan.entries:
         where = f"{entry.code or entry.name} (строка {entry.source.line})"
-        if entry.credits and entry.total_hours:  # 0 з.е. — занятия вне зачётных единиц
+        if entry.credits:  # 0 з.е. — занятия вне зачётных единиц
+            if not entry.contact_hours and not entry.self_study_hours:
+                plan.warnings.append(f"план, {where}: не найдены часы при ненулевых з.е.")
             expected = entry.credits * HOURS_PER_CREDIT
             if abs(entry.total_hours - expected) > _EPS:
                 plan.warnings.append(

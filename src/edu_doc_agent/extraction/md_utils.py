@@ -3,6 +3,8 @@
 import re
 from dataclasses import dataclass
 
+from edu_doc_agent.parsing.models import CellSpan
+
 _DASHES = str.maketrans({c: "-" for c in "‐‑‒–—−"})
 _BR_RE = re.compile(r"<br\s*/?>", re.I)
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
@@ -27,6 +29,7 @@ class MdTable:
     rows: list[list[str]]
     row_lines: list[int]  # 1-based номер строки md для каждой строки rows
     section: str | None
+    spans: list[CellSpan] | None = None
 
 
 def clean_text(text: str) -> str:

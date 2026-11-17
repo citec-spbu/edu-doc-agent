@@ -596,6 +596,7 @@ def test_result_schema_fields_are_stable() -> None:
     """Потребители читают эти поля; изменение схемы должно быть осознанным."""
     schema = RPDExtraction.model_json_schema()
     assert set(schema["properties"]) == {
+        "sources",
         "file",
         "doc_kind",
         "title",

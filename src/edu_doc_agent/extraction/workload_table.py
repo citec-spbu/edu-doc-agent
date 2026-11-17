@@ -211,10 +211,10 @@ def _where(row: WorkloadRow) -> str:
     return f" [{', '.join(parts)}]" if parts else ""
 
 
-def _kind_sums(rows: list[WorkloadRow]) -> dict[str, float]:
+def _kind_sums(rows: list[WorkloadRow], field: str) -> dict[str, float]:
     sums: dict[str, float] = {}
     for r in rows:
-        for kind, hours in r.contact_hours.items():
+        for kind, hours in getattr(r, field).items():
             sums[kind] = sums.get(kind, 0) + hours
     return sums
 
@@ -244,11 +244,17 @@ def check_workload(result: RPDExtraction) -> None:
                     f"({row.credits:g})"
                 )
         if block:
-            sums = _kind_sums(block)
-            for kind, total in _kind_sums([row]).items():
-                if kind in sums and abs(sums[kind] - total) > _EPS:
-                    result.warnings.append(
-                        f"трудоёмкость{_where(row)}: {kind} по семестрам ({sums[kind]:g} ч) "
-                        f"не равны ИТОГО ({total:g} ч)"
-                    )
+            for field, label in (
+                ("contact_hours", "контактная работа"),
+                ("self_study_hours", "самостоятельная работа"),
+            ):
+                sums = _kind_sums(block, field)
+                totals = _kind_sums([row], field)
+                for kind in sums.keys() | totals.keys():
+                    total = totals.get(kind, 0)
+                    if abs(sums.get(kind, 0) - total) > _EPS:
+                        result.warnings.append(
+                            f"трудоёмкость{_where(row)}: {label}, {kind} по семестрам "
+                            f"({sums.get(kind, 0):g} ч) не равны ИТОГО ({total:g} ч)"
+                        )
         block = []

@@ -280,6 +280,7 @@ class StandardLink(_Model):
 
 class RPDExtraction(_Model):
     file: str
+    sources: dict[str, SourceRef] = Field(default_factory=dict)
     doc_kind: DocKind | None = None
     title: str | None = None
     title_en: str | None = None

@@ -87,6 +87,7 @@ class LLMGradingRule(GradingRuleItem):
 
 
 class LLMExtraction(_Schema):
+    completed_tasks: list[str] = Field(default_factory=list)
     file: str
     prerequisites: list[LLMPrerequisite] = Field(default_factory=list)
     active_forms: list[LLMActiveForm] = Field(default_factory=list)

@@ -13,6 +13,7 @@ from typing import BinaryIO
 from openpyxl import load_workbook
 from pydantic import Field
 
+from edu_doc_agent.extraction.md_utils import clean_text
 from edu_doc_agent.extraction.models import _Model
 from edu_doc_agent.extraction.patterns import COMPETENCE_RE, code_key
 from edu_doc_agent.extraction.source import SourceRef
@@ -75,7 +76,9 @@ def _number(value: object) -> float | None:
 def _find_header(rows: list[tuple]) -> int | None:
     for i, row in enumerate(rows):
         cells = [_text(c).lower() for c in row]
-        has_codes = sum(1 for c in row if isinstance(c, str) and COMPETENCE_RE.fullmatch(c.strip()))
+        has_codes = sum(
+            1 for c in row if isinstance(c, str) and COMPETENCE_RE.fullmatch(clean_text(c))
+        )
         if "дисциплина" in cells and has_codes:
             return i
     return None
@@ -101,11 +104,11 @@ def extract_matrix(source: Path | BinaryIO, file: str | None = None) -> Competen
     for col, cell in enumerate(header):
         if (key := _META_HEADERS.get(_text(cell).lower())) is not None:
             meta[key] = col
-        elif isinstance(cell, str) and COMPETENCE_RE.fullmatch(cell.strip()):
+        elif isinstance(cell, str) and COMPETENCE_RE.fullmatch(clean_text(cell)):
             kind = _text(types[col]) if col < len(types) else ""
             matrix.columns.append(
                 MatrixColumn(
-                    code=cell.strip(),
+                    code=clean_text(cell),
                     type=kind or None,
                     column=col + 1,
                     source=SourceRef(file=name, section=ws.title, line=header_idx + 1, quote=cell),
@@ -128,7 +131,9 @@ def extract_matrix(source: Path | BinaryIO, file: str | None = None) -> Competen
             continue
         discipline = _text(row[meta["discipline"]]) if meta["discipline"] < len(row) else ""
         if not discipline:
-            continue
+            if not any(_text(c) for c in row):
+                continue
+            matrix.warnings.append(f"строка {offset}: не указано название дисциплины")
         marks = []
         for col in matrix.columns:
             value = row[col.column - 1] if col.column - 1 < len(row) else None

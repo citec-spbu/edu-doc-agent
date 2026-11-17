@@ -43,7 +43,8 @@ def score_matrix(matrix: CompetenceMatrix, gold: dict | None = None) -> FieldRep
             r.missing.append(f"строка №{g['number']}")
             for f in ROW_FIELDS:
                 r.add(f"row.{f}", False)
-            r.add("cells", False)
+            for _ in gold.get("columns", []):
+                r.add("cells", False)
             continue
         for f in ROW_FIELDS:
             got = getattr(row, f)

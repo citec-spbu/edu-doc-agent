@@ -121,12 +121,15 @@ _HOUR_DICTS = ("contact_hours", "self_study_hours")
 
 def _got(entry: PlanEntry, field_name: str) -> object:
     value = getattr(entry, field_name)
-    return list(value.values()) if field_name in _HOUR_DICTS else value
+    return value
 
 
 def _gold_value(gold: dict, field_name: str) -> object:
     renamed = {"contact_hours": "contact", "self_study_hours": "self", "active_hours": "active"}
-    return gold[renamed.get(field_name, field_name)]
+    value = gold[renamed.get(field_name, field_name)]
+    if field_name in _HOUR_DICTS and not isinstance(value, dict):
+        raise ValueError("эталон часов должен хранить названия видов занятий, а не массив значений")
+    return value
 
 
 def score_plan(plan: CurriculumPlan, gold: dict | None = None) -> PlanReport:
@@ -158,7 +161,7 @@ def score_plan(plan: CurriculumPlan, gold: dict | None = None) -> PlanReport:
         for name, want in (("contact_hours", g["contact"]), ("self_study_hours", g["self"])):
             got = _got(entry, name)
             report.hour_cells += len(want)
-            report.hour_cells_ok += sum(a == b for a, b in zip(got, want, strict=False))
+            report.hour_cells_ok += sum(got.get(kind) == hours for kind, hours in want.items())
 
     by_code = {code_key(c.code): c for c in plan.competences}
     for g in gold["competences"]:

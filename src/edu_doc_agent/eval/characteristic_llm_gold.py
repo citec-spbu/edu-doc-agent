@@ -61,30 +61,68 @@ def _similar(a: str, b: str) -> bool:
     return bool(a and b) and (f" {a} " in f" {b} " or f" {b} " in f" {a} ")
 
 
-def _pairs(predicted: list[str], expected: list[str]) -> list[tuple[int, int]]:
-    """Максимальное паросочетание: порядок ответа не уменьшает число найденных сущностей."""
-    owners: dict[int, int] = {}
-    edges = {
-        p: sorted(
-            (g for g, want in enumerate(expected) if _similar(got, want)),
-            key=lambda g: (_key(got) != _key(expected[g]), g),
-        )
-        for p, got in enumerate(predicted)
-    }
+def _pairs(
+    predicted: list[str],
+    expected: list[str],
+    predicted_kinds: list[str | None] | None = None,
+    expected_kinds: list[str | None] | None = None,
+    *,
+    require_head: bool = True,
+) -> list[tuple[int, int]]:
+    """Максимальное паросочетание с минимальной ценой (остаточная сеть).
 
-    def match(p: int, seen: set[int]) -> bool:
-        for g in edges[p]:
-            if g in seen:
+    При равной полноте предпочитаем точное имя и правильный kind. Ошибочный kind
+    не запрещает пару: он по-прежнему снижает точность атрибутов.
+    """
+    n, m = len(predicted), len(expected)
+    source, sink = n + m, n + m + 1
+    graph: list[list[list[int]]] = [[] for _ in range(sink + 1)]
+
+    def edge(a: int, b: int, cost: int) -> list[int]:
+        forward = [b, len(graph[b]), 1, cost]
+        graph[a].append(forward)
+        graph[b].append([a, len(graph[a]) - 1, 0, -cost])
+        return forward
+
+    links = []
+    for p, got in enumerate(predicted):
+        edge(source, p, 0)
+        for g, want in enumerate(expected):
+            if not _similar(got, want):
                 continue
-            seen.add(g)
-            if g not in owners or match(owners[g], seen):
-                owners[g] = p
-                return True
-        return False
-
-    for p in range(len(predicted)):
-        match(p, set())
-    return [(p, g) for g, p in owners.items()]
+            if require_head and _key(want).split()[0] not in _key(got).split():
+                continue
+            wrong_kind = bool(
+                expected_kinds and predicted_kinds and expected_kinds[g] != predicted_kinds[p]
+            )
+            cost = int(_key(got) != _key(want)) * (min(n, m) + 1) + wrong_kind
+            links.append((p, g, edge(p, n + g, cost)))
+    for g in range(m):
+        edge(n + g, sink, 0)
+    while True:
+        distance = [float("inf")] * len(graph)
+        distance[source] = 0
+        previous = {}
+        for _ in range(len(graph) - 1):
+            changed = False
+            for a, edges in enumerate(graph):
+                for i, (b, _, capacity, cost) in enumerate(edges):
+                    if capacity and distance[a] + cost < distance[b]:
+                        distance[b] = distance[a] + cost
+                        previous[b] = (a, i)
+                        changed = True
+            if not changed:
+                break
+        if sink not in previous:
+            break
+        b = sink
+        while b != source:
+            a, i = previous[b]
+            e = graph[a][i]
+            e[2] -= 1
+            graph[b][e[1]][2] += 1
+            b = a
+    return [(p, g) for p, g, e in links if e[2] == 0]
 
 
 @dataclass
@@ -113,7 +151,13 @@ def score_characteristic_llm(doc: CharacteristicLLM, gold: dict) -> Characterist
     for name, expected in expected_items(gold).items():
         predicted = getattr(doc, name)
         key = "quote" if name == "principles" else "name"
-        pairs = _pairs([getattr(p, key) for p in predicted], [g[key] for g in expected])
+        pairs = _pairs(
+            [getattr(p, key) for p in predicted],
+            [g[key] for g in expected],
+            [p.kind for p in predicted],
+            [g.get("kind") for g in expected],
+            require_head=name != "principles",
+        )
         score = Score(tp=len(pairs), fp=len(predicted) - len(pairs), fn=len(expected) - len(pairs))
         for p, g in pairs:
             if "kind" in expected[g]:
