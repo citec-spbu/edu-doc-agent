@@ -10,3 +10,23 @@
 `characteristic_llm_prediction.json` и `characteristic_llm_report.txt` — локальные
 результаты ручного LLM-замера. Публиковать можно сводные метрики и ограничения
 оценки без исходных документов и ответов модели.
+
+# Нормативы для RAG (#32)
+
+`regulations/` — в git только `manifest.yaml` (какие документы входят в корпус) и
+`overrides.yaml` (ручные правки нарезки). Сами PDF кладутся рядом и в git не попадают:
+
+- `regulations/fgos/*.pdf` — ФГОС ВО 3++ (выгрузки с fgosvo.ru);
+- `regulations/spbu/*.pdf` — Образовательный стандарт СПбГУ (раздел «Образовательные
+  стандарты» на spbu.ru).
+
+Сборка корпуса (YAML-снимки по документам и `REPORT.md` в `data/corpus/`):
+
+```bash
+uv run python -m edu_doc_agent.retrieval.corpus.build data/regulations/manifest.yaml \
+    --overrides data/regulations/overrides.yaml --out data/corpus
+```
+
+В `REPORT.md` — число пунктов, компетенций и профстандартов по документам и замечания:
+пропуски в нумерации, УК/ОПК не подряд, строки таблиц без кода. Замечание чинится правкой
+в `overrides.yaml`, исходный PDF не трогаем.
