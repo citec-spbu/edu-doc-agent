@@ -150,7 +150,7 @@ def test_llm_total_that_differs_from_table_2_1_is_reported() -> None:
 
     result = extract_rpd(text, "x.md", llm=FakeLLMClient(respond=respond))
     assert result.llm.active_total_hours == 10
-    assert any("не совпадает с таблицей 2.1 (34)" in w for w in result.warnings)
+    assert any("не совпадает с таблицей 2.1 (34 ч;" in w for w in result.warnings)
 
 
 def test_sum_of_form_hours_is_checked_against_table_when_total_is_not_stated() -> None:
@@ -166,7 +166,7 @@ def test_sum_of_form_hours_is_checked_against_table_when_total_is_not_stated() -
     result = extract_rpd(MD, "x.md", llm=FakeLLMClient(respond=respond))
     assert result.llm.active_total_hours is None  # итог модель не называла и не считала
     assert any(
-        "сумма часов активных форм в 1.4 (10 ч)" in w and "(34)" in w for w in result.warnings
+        "сумма часов активных форм в 1.4 (10 ч)" in w and "(34 ч;" in w for w in result.warnings
     )
 
     active["items"][0]["hours"] = None  # часов нет — сумма неполная, сравнивать нечего

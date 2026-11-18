@@ -124,14 +124,16 @@ def quote_in_text(quote: str, text: str) -> bool:
     return bool(parts)
 
 
-def run_task(task: LLMTask, text: str, client: LLMClient) -> tuple[BaseModel | None, str | None]:
+def run_task(
+    task: LLMTask, text: str, client: LLMClient, *, system: str = prompts.SYSTEM
+) -> tuple[BaseModel | None, str | None]:
     """Один запрос с повторами. Возвращает (ответ, None) или (None, причина отказа)."""
     user = task.prompt.replace("{text}", text)
     schema = task.output.model_json_schema()
     error = ""
     for _ in range(MAX_RETRIES + 1):
         raw = client.complete_json(
-            system=prompts.SYSTEM,
+            system=system,
             user=user + prompts.REPAIR.format(error=error) if error else user,
             schema=schema,
         )
@@ -229,13 +231,20 @@ def _locate(quote: str, sections: list[MdSection], file: str, with_tables: bool)
 
 
 def _quote_line(quote: str, section: MdSection, body: str) -> int:
-    """Строка, на которой цитата начинается (по первым словам; не нашли — заголовок раздела)."""
+    """Полный первый фрагмент цитаты, включая переносы; карта позиции → строка."""
     parts = (normalize(p).strip(" .,;:") for p in _ELLIPSIS_RE.split(quote))
-    head = next((p for p in parts if p), "")[:30]
+    head = next((p for p in parts if p), "")
+    normalized, line_map = [], []
     for i, line in enumerate(body.split("\n")):
-        if head and head in normalize(line):
-            return section.line + 1 + i
-    return section.line
+        value = normalize(line)
+        if value:
+            if normalized:
+                normalized.append(" ")
+                line_map.append(section.line + 1 + i)
+            normalized.append(value)
+            line_map.extend([section.line + 1 + i] * len(value))
+    position = "".join(normalized).find(head) if head else -1
+    return line_map[position] if position >= 0 else section.line
 
 
 def extract_with_llm(
@@ -251,12 +260,13 @@ def extract_with_llm(
             continue
         try:
             output, problem = run_task(task, text, client)
-        except LLMError as exc:
-            result.warnings.append(f"{task.name}: сбой вызова LLM, задача пропущена ({exc})")
+        except LLMError:
+            result.warnings.append(f"{task.name}: сбой вызова LLM, задача пропущена")
             continue
         if output is None:
             result.warnings.append(f"{problem} [{picked[0].heading[:40]}]")
             continue
+        result.completed_tasks.append(task.name)
         _collect(task, postprocess(output), text, picked, file, result)
     return result
 

@@ -17,6 +17,7 @@
 """
 
 import re
+from collections import defaultdict
 from pathlib import Path
 
 from edu_doc_agent.extraction.freetext import extract_free_text
@@ -59,28 +60,42 @@ from edu_doc_agent.extraction.patterns import (
     code_key,
 )
 from edu_doc_agent.extraction.sections import extract_sections
+from edu_doc_agent.extraction.source import attach_quotes
 from edu_doc_agent.extraction.workload_table import check_workload, extract_workload_table
 from edu_doc_agent.llm import LLMClient
+from edu_doc_agent.parsing.models import ParsedDocument
 
 _TITLE_SCAN_LINES = 40
 _HEADING_MARK_RE = re.compile(r"^#+\s*")
 
 
 def extract_rpd_file(path: Path, llm: LLMClient | None = None) -> RPDExtraction:
+    if path.suffix.lower() == ".docx":
+        from edu_doc_agent.parsing import parse_document
+
+        return extract_rpd(parse_document(path), file=path.name, llm=llm)
     return extract_rpd(path.read_text(encoding="utf-8"), file=path.name, llm=llm)
 
 
-def extract_rpd(text: str, file: str, llm: LLMClient | None = None) -> RPDExtraction:
+def extract_rpd(
+    text: str | ParsedDocument, file: str, llm: LLMClient | None = None
+) -> RPDExtraction:
     """Правила и Yargy всегда; смысловые поля через LLM — только если передан клиент.
 
     Без `llm` работа полностью офлайн и детерминирована. С `llm` добавляется `result.llm`
     (пререквизиты, активные формы, правила оценивания с цитатами), а его предупреждения и
     расхождения с правилами попадают в `result.warnings`.
     """
+    parsed = text if isinstance(text, ParsedDocument) else None
+    text = parsed.to_markdown() if parsed else text
     result = RPDExtraction(file=file)
     _extract_title_block(text, result)
 
     tables = parse_tables(text)
+    if parsed is not None:
+        for table, block in zip(tables, parsed.tables, strict=True):
+            table.spans = block.spans
+            table.grid_widths = block.grid_widths
     outcome_tables = [t for t in tables if "планируемые результаты" in _header(t)]
     assessment_tables = [
         t for t in tables if "измерительные" in _header(t) and t not in outcome_tables
@@ -112,7 +127,16 @@ def extract_rpd(text: str, file: str, llm: LLMClient | None = None) -> RPDExtrac
         result.llm = extract_with_llm(text, file, llm)
         result.warnings.extend(f"LLM: {w}" for w in result.llm.warnings)
         _cross_check_llm(result)
+    attach_quotes(result, text)
     return result
+
+
+def _active_totals(result: RPDExtraction) -> dict[tuple, float]:
+    totals: dict[tuple, float] = defaultdict(float)
+    for row in result.workload_table:
+        if not row.is_total and row.active_hours is not None:
+            totals[row.trajectory, row.study_form] += row.active_hours
+    return dict(totals)
 
 
 def _check_active_forms(result: RPDExtraction) -> None:
@@ -120,15 +144,14 @@ def _check_active_forms(result: RPDExtraction) -> None:
     stated = next((f.hours for f in result.active_forms if f.is_total and f.hours), None)
     if stated is None and result.active_forms and all(f.hours for f in result.active_forms):
         stated = sum(f.hours or 0 for f in result.active_forms)
-    rows = [w for w in result.workload_table if not w.is_total and w.active_hours]
-    if stated is None or not rows:
+    if stated is None:
         return
-    table = sorted({w.active_hours or 0 for w in rows})
-    if stated not in table and abs(sum(table) - stated) > 1e-6:
-        result.warnings.append(
-            f"объём активных форм в 1.4 ({stated:g} ч) не совпадает с таблицей 2.1 "
-            f"({', '.join(f'{h:g}' for h in table)})"
-        )
+    for (trajectory, study_form), hours in _active_totals(result).items():
+        if abs(hours - stated) > 1e-6:
+            result.warnings.append(
+                f"объём активных форм в 1.4 ({stated:g} ч) не совпадает с таблицей 2.1 "
+                f"({hours:g} ч; {trajectory or 'общая траектория'}, {study_form or 'общая форма'})"
+            )
 
 
 def _prereq_keys(names: list[str]) -> set[str]:
@@ -149,16 +172,17 @@ def _cross_check_llm(result: RPDExtraction) -> None:
     if stated is None and forms and all(f.hours is not None for f in forms):
         stated = sum(f.hours or 0 for f in forms)
         label = "сумма часов активных форм в 1.4"
-    table = {w.active_hours for w in result.workload_table if not w.is_total and w.active_hours}
-    if stated is not None and table and stated not in table:
-        result.warnings.append(
-            f"LLM: {label} ({stated:g} ч) не совпадает с таблицей 2.1 "
-            f"({', '.join(f'{h:g}' for h in sorted(table))})"
-        )
+    if stated is not None:
+        for context, hours in _active_totals(result).items():
+            if abs(hours - stated) > 1e-6:
+                result.warnings.append(
+                    f"LLM: {label} ({stated:g} ч) не совпадает с таблицей 2.1 "
+                    f"({hours:g} ч; {context})"
+                )
     # пререквизиты: названия, которых нет у второй стороны, отправляем на ручную проверку
     rule_keys = _prereq_keys([p.name for p in result.prerequisites])
     llm_keys = _prereq_keys([p.name for p in result.llm.prerequisites])
-    if rule_keys and llm_keys and rule_keys != llm_keys:
+    if ("prerequisites" in result.llm.completed_tasks or llm_keys) and rule_keys != llm_keys:
         only_rules = sorted(rule_keys - llm_keys)
         only_llm = sorted(llm_keys - rule_keys)
         result.warnings.append(
@@ -173,19 +197,29 @@ def _cross_check_llm(result: RPDExtraction) -> None:
 
 def _extract_title_block(text: str, result: RPDExtraction) -> None:
     head = text.splitlines()[:_TITLE_SCAN_LINES]
-    plain = clean_text("\n".join(head))
-    if m := CREDITS_RE.search(plain):
-        result.credits = float(m.group(1).replace(",", "."))
-    if m := REG_NUMBER_RE.search(plain):
-        result.registration_number = m.group(1)
-
+    cleaned = [clean_text(line) for line in head]
+    plain = "\n".join(cleaned)
+    line_map = [i for i, line in enumerate(cleaned) for _ in range(len(line) + 1)]
+    for field, pattern in (("credits", CREDITS_RE), ("registration_number", REG_NUMBER_RE)):
+        if m := pattern.search(plain):
+            value = m.group(1)
+            setattr(result, field, float(value.replace(",", ".")) if field == "credits" else value)
+            start, end = line_map[m.start()], line_map[m.end() - 1]
+            result.sources[field] = SourceRef(
+                file=result.file,
+                section="Титул",
+                line=start + 1,
+                quote="\n".join(head[start : end + 1]),
+            )
     lines: list[str] = []
-    for raw in head:
+    line_numbers: list[int] = []
+    for lineno, raw in enumerate(head, 1):
         line = _HEADING_MARK_RE.sub("", clean_text(raw))  # в md титул идёт заголовками «###»
         if LANGUAGE_LINE_RE.match(line):
             break
         if line:
             lines.append(line)
+            line_numbers.append(lineno)
     idx = next((i for i, ln in enumerate(lines) if _squash(ln) == "РАБОЧАЯПРОГРАММА"), None)
     if idx is None or idx + 1 >= len(lines):
         return
@@ -196,10 +230,19 @@ def _extract_title_block(text: str, result: RPDExtraction) -> None:
         result.doc_kind = "practice"
     else:
         return
+    result.sources["doc_kind"] = SourceRef(
+        file=result.file, section="Титул", line=line_numbers[idx + 1]
+    )
     if len(rest) > 1:
         result.title = rest[1]
+        result.sources["title"] = SourceRef(
+            file=result.file, section="Титул", line=line_numbers[idx + 2]
+        )
     if len(rest) > 2:
         result.title_en = rest[2]
+        result.sources["title_en"] = SourceRef(
+            file=result.file, section="Титул", line=line_numbers[idx + 3]
+        )
 
 
 def _one_line(s: str) -> str:
@@ -227,6 +270,7 @@ def _extract_outcome_table(table: MdTable, file: str, result: RPDExtraction) -> 
     seen_indicators = {(i.code, i.competence_code) for i in result.indicators}
     current_code: str | None = None
     prev_out = ""
+    previous_anchor: tuple[int, int] | None = None
     group: list[LearningOutcome] = []  # результаты текущей (возможно, объединённой) ячейки
 
     header = _outcome_header(table)
@@ -246,7 +290,26 @@ def _extract_outcome_table(table: MdTable, file: str, result: RPDExtraction) -> 
         # парсером в каждой строке: результаты берём один раз, а повторные строки только
         # добавляют свою компетенцию к уже извлечённым
         out_key = _one_line(clean_text(out_cell))
-        repeated = bool(out_key) and out_key == prev_out
+        anchor = next(
+            (
+                (span.row, span.col)
+                for span in table.spans or []
+                if span.col <= out_col < span.col + span.col_span
+                and span.row <= idx < span.row + span.row_span
+            ),
+            (idx, out_col),
+        )
+        repeated = (
+            anchor == previous_anchor
+            if table.spans is not None
+            else bool(out_key) and out_key == prev_out
+        )
+        if repeated and table.spans is None:
+            result.warnings.append(
+                f"строка {table.row_lines[idx]}: повтор результатов; объединение ячеек "
+                "не подтверждено в Markdown, для точной связи нужны Block.spans"
+            )
+        previous_anchor = anchor
         if repeated:
             out_cell = ""
         prev_out = out_key or prev_out
@@ -254,34 +317,44 @@ def _extract_outcome_table(table: MdTable, file: str, result: RPDExtraction) -> 
             continue
         ref = _ref(table, idx, file)
 
-        if parsed := _parse_competence_cell(comp_cell):
-            current_code, name = parsed
-            known = competences.get(current_code)
+        cell_competences = _parse_competence_cells(comp_cell)
+        for code, name in cell_competences:
+            known = competences.get(code)
             if known is None:
-                competences[current_code] = Competence(code=current_code, name=name, source=ref)
+                competences[code] = Competence(code=code, name=name, source=ref)
             elif known.name is None and name:
                 known.name = name
+        if cell_competences:
+            current_code = cell_competences[0][0]
+        # в ячейке могут быть несколько компетенций: индикатор и результат относим к той, чей код
+        # входит в их собственный код («ПКП-ППК-ДА2.1» → «ПКП-ППК-ДА2»), иначе к первой
+        cell_codes = [code for code, _ in cell_competences]
 
         for code, text, level in _parse_indicators(ind_cell):
-            if (code, current_code) not in seen_indicators:
-                seen_indicators.add((code, current_code))
+            owner = _owner(code, cell_codes, current_code)
+            if (code, owner) not in seen_indicators:
+                seen_indicators.add((code, owner))
                 result.indicators.append(
-                    Indicator(
-                        code=code, competence_code=current_code, text=text, level=level, source=ref
-                    )
+                    Indicator(code=code, competence_code=owner, text=text, level=level, source=ref)
                 )
         if repeated:
             for outcome in group:
-                if current_code and current_code not in outcome.competence_codes:
-                    outcome.competence_codes.append(current_code)
+                if outcome.code:
+                    continue  # код результата однозначно задаёт владельца
+                for owner in cell_codes or ([current_code] if current_code else []):
+                    if owner not in outcome.competence_codes:
+                        outcome.competence_codes.append(owner)
         elif out_key:
             group = []
         for kind, code, text in _parse_outcomes(out_cell):
+            owner = _owner(_indicator_of(code), cell_codes, current_code)
             outcome = LearningOutcome(
                 kind=kind,
                 code=code,
                 indicator_code=_indicator_of(code),
-                competence_codes=[current_code] if current_code else [],
+                competence_codes=(
+                    cell_codes if code is None and cell_codes else [owner] if owner else []
+                ),
                 text=text,
                 source=ref,
             )
@@ -306,6 +379,31 @@ def _outcome_header(table: MdTable) -> tuple[int, int | None, int, int | None] |
         ind = next((j for j, c in enumerate(low) if "индикатор" in c), None)
         return i, comp, outs[0], ind
     return None
+
+
+def _parse_competence_cells(cell: str) -> list[tuple[str, str | None]]:
+    """Все компетенции ячейки: каждая строка с кодом в начале начинает новую, остальные строки
+    продолжают название предыдущей («ПКП-ППК-Р1. …<br>ПКП-ППК-ДА2. …» — две компетенции)."""
+    entries: list[list[str | None]] = []
+    for line in clean_text(cell).split("\n"):
+        if m := COMPETENCE_CELL_RE.match(line):
+            entries.append([m.group(1), _one_line(m.group(2) or "")])
+        elif entries and line.strip():
+            entries[-1][1] = _one_line(f"{entries[-1][1]} {line}")
+    if entries:
+        return [(code, name or None) for code, name in entries]  # type: ignore[misc]
+    single = _parse_competence_cell(cell)
+    return [single] if single else []
+
+
+def _owner(code: str | None, cell_codes: list[str], current: str | None) -> str | None:
+    """Компетенция ячейки, которой принадлежит индикатор/результат с кодом `code`."""
+    if code and len(cell_codes) > 1:
+        base = code_key(code).rsplit(".", 1)[0]
+        for candidate in cell_codes:
+            if code_key(candidate) == base:
+                return candidate
+    return current
 
 
 def _parse_competence_cell(cell: str) -> tuple[str, str | None] | None:

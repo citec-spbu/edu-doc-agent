@@ -1,4 +1,4 @@
-"""Сущности ADR-0002 на всём реальном корпусе РПД/РПП из data/ (docx → md текущим парсером).
+"""Сущности ADR-0002 на всём реальном корпусе РПД/РПП из data/ (DOCX с геометрией таблиц).
 
 Проверяем то, что должно выполняться для любого документа корпуса, а не точные значения.
 Если сущность не нашлась, тест проверяет, что её действительно нет в документе (нет столбца
@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from edu_doc_agent.extraction import RPDExtraction, extract_rpd_file
-from tests.real_data import REAL_MD
+from tests.real_data import REAL_DOCX_BY_MD, REAL_MD
 
 pytestmark = pytest.mark.skipif(not REAL_MD, reason="нет реальных docx РПД в data/")
 
@@ -20,7 +20,8 @@ _CACHE: dict[Path, RPDExtraction] = {}
 
 def _extract(path: Path) -> RPDExtraction:
     if path not in _CACHE:
-        _CACHE[path] = extract_rpd_file(path)
+        # Markdown используется для поиска разделов; извлечению нужна исходная сетка Word.
+        _CACHE[path] = extract_rpd_file(REAL_DOCX_BY_MD[path])
     return _CACHE[path]
 
 
@@ -44,10 +45,6 @@ TOTAL_TYPOS = {
     "С7-8_Стандарт_058776_Интернет вещей": "в ИТОГО нет 26 ч семинаров семестра 7",
     "С7_Стандарт_001882_Интеллектуальные системы": "в ИТОГО 28 ч самостоятельной вместо 64",
 }
-# Известное ограничение: в docx строки шапки и тела разрезаны по сетке по-разному
-# (ячейка тела перекрывает два столбца шапки), и привязка по номеру столбца неверна.
-# Нужны ширины столбцов из tblGrid в парсере и привязка по перекрытию.
-MISALIGNED_GRID = {"С3_001868_Математическая логика и теория алгоритмов"}
 
 
 def _is_known(path: Path, known: dict | set) -> bool:
@@ -69,8 +66,6 @@ def test_identification_is_complete(path: Path) -> None:
 @pytest.mark.parametrize("path", DISCIPLINES, ids=lambda p: p.stem)
 def test_workload_table_semester_rows(path: Path) -> None:
     """Таблица 2.1: у каждой дисциплины есть строки семестров, часы равны 36 × з.е."""
-    if _is_known(path, MISALIGNED_GRID):
-        pytest.xfail("шапка и тело таблицы 2.1 разрезаны по сетке по-разному")
     r = _extract(path)
     rows = [w for w in r.workload_table if not w.is_total]
     assert rows, "строки семестров таблицы 2.1"
@@ -78,14 +73,12 @@ def test_workload_table_semester_rows(path: Path) -> None:
         assert row.credits is not None, f"семестр {row.semester}: нет з.е."
         assert row.total_hours == row.credits * 36, f"семестр {row.semester}"
     assert sum(1 for w in r.warnings if w.startswith("трудоёмкость")) == (
-        4 if path.stem == "С5_076083_Глубокое обучение" else int(_is_known(path, TOTAL_TYPOS))
+        4 if path.stem == "С5_076083_Глубокое обучение" else 2 * int(_is_known(path, TOTAL_TYPOS))
     )
 
 
 @pytest.mark.parametrize("path", DISCIPLINES, ids=lambda p: p.stem)
 def test_semesters_of_control_forms_are_in_workload_table(path: Path) -> None:
-    if _is_known(path, MISALIGNED_GRID):
-        pytest.xfail("см. MISALIGNED_GRID")
     r = _extract(path)
     assert {f.semester for f in r.control_forms} <= {w.semester for w in r.workload_table}
 

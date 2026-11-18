@@ -28,6 +28,18 @@ def test_table_block_merges_by_key() -> None:
     ]
 
 
+def test_table_block_omitted_cells_are_not_merges() -> None:
+    table = table_block(
+        [
+            [(None, ""), ("B1:C2", "Значение"), ("B1:C2", "Значение"), (None, "")],
+            [(None, ""), ("B1:C2", "Значение"), ("B1:C2", "Значение"), (None, "")],
+        ]
+    )
+    assert table is not None
+    assert table.rows == [["", "Значение", "", ""], ["", "Значение", "", ""]]
+    assert table.spans == [CellSpan(row=0, col=1, row_span=2, col_span=2)]
+
+
 def test_table_block_empty() -> None:
     assert table_block([]) is None
     assert table_block([[("A1", ""), ("B1", "")]]) is None

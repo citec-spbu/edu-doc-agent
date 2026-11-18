@@ -25,7 +25,7 @@ from edu_doc_agent.llm import LLMClient
 
 _FIXTURES = Path(__file__).resolve().parents[3] / "tests" / "fixtures"
 DEFAULT_GOLD = _FIXTURES / "llm_gold.json"  # на ней настраивались промпты
-HOLDOUT = _FIXTURES / "llm_holdout.json"  # вторая порция: по ней уже правили промпты и правила
+REGRESSION = _FIXTURES / "llm_regression.json"  # бывший holdout: использован для настройки
 BLIND = _FIXTURES / "llm_blind.json"  # третья порция: размечена до запуска, не настраивается
 BLIND2 = (
     _FIXTURES / "llm_blind2.json"
@@ -85,8 +85,26 @@ def _words(stem: str) -> set[str]:
 _NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)?")
 
 
+def _polarity(text: str) -> tuple[list[str], int]:
+    """Консервативная защита от инверсии отрицания и границы сравнения."""
+    text = normalize(text)
+    comparisons = []
+    for pattern, operator in (
+        (r"не\s+(?:менее|меньше)|>=|≥", "ge"),
+        (r"не\s+(?:более|больше)|<=|≤", "le"),
+        (r"(?:менее|меньше)|<", "lt"),
+        (r"(?:более|больше)|>", "gt"),
+    ):
+        text, count = re.subn(pattern, " ", text)
+        comparisons.extend([operator] * count)
+    negative = len(re.findall(r"\b(?:не|нет|нельзя|невозможно|запрещено)\b", text))
+    return sorted(comparisons), negative
+
+
 def _same_meaning(a: str, b: str) -> bool:
     """Условие/следствие свободным текстом: те же числа и от половины общих слов (по основам)."""
+    if _polarity(a) != _polarity(b):
+        return False
     if set(_NUMBER_RE.findall(normalize(a))) != set(_NUMBER_RE.findall(normalize(b))):
         return False
     wa, wb = _words(_stem(a)), _words(_stem(b))
@@ -172,7 +190,15 @@ def score_case(task: str, predicted: dict, expected: dict) -> Score:
     unmatched = [k for k in pred if k not in {p for p, _ in pairs}]
     if task == "grading_rules":
         # правило, вырезанное из предложения эталона, — тот же факт в более мелком виде, не ложный
-        unmatched = [k for k in unmatched if not any(k[0] in g[0] for g in gold)]
+        unmatched = [
+            k
+            for k in unmatched
+            if not any(
+                k[0] in g[0]
+                and all(_same_meaning(pred[k][attr], gold[g][attr]) for attr in _ATTRS[task])
+                for g in gold
+            )
+        ]
     score = Score(
         tp=len({g for _, g in pairs}),
         fp=len(unmatched),

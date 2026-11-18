@@ -21,6 +21,7 @@ MAX_HEADING_LEN = 200
 # Ячейка сетки: (ключ, текст). Ключ одинаков у всех позиций одной объединённой ячейки,
 # текст — значение этой ячейки. Ключом может быть любой hashable-объект: элемент XML ячейки
 # (DOCX), координата объединения (XLSX), рамка ячейки (PDF).
+# None обозначает пропущенную позицию сетки и не участвует в объединениях.
 Cell = tuple[Hashable, str]
 
 
@@ -73,7 +74,7 @@ def table_block(grid: Sequence[Sequence[Cell]]) -> Block | None:
     lines = []
     for row in grid:
         line = [
-            (key, "" if c > 0 and key == row[c - 1][0] else text)
+            (key, "" if key is not None and c > 0 and key == row[c - 1][0] else text)
             for c, (key, text) in enumerate(row)
         ]
         if any(text for _, text in line):
@@ -90,7 +91,8 @@ def _spans(lines: list[list[Cell]]) -> list[CellSpan]:
     positions: dict[Hashable, list[tuple[int, int]]] = {}
     for r, line in enumerate(lines):
         for c, (key, _) in enumerate(line):
-            positions.setdefault(key, []).append((r, c))
+            if key is not None:
+                positions.setdefault(key, []).append((r, c))
     spans = []
     for cells in positions.values():
         rows, cols = {r for r, _ in cells}, {c for _, c in cells}

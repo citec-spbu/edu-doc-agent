@@ -21,6 +21,9 @@
   для каждой объединённой ячейки — якорь (`row`, `col` — индексы в `rows`) и размер
   (`row_span`, `col_span`). Так пустая ячейка из объединения отличима от пустого значения,
   а повтор из объединения — от настоящего дубля.
+- `Block.grid_widths` хранит ширины базовой сетки Word (`tblGrid`) в twips.
+  Вместе со `spans` они позволяют сопоставить ячейки при разных границах шапки и тела.
+  Геометрия доступна в блоках и `to_dict()`, но не в обычном Markdown.
 - Абзац — текст как есть; если он начинается с одного из символов `# * + - > | =`,
   перед ним ставится `\\`, чтобы Markdown не принял его за разметку.
 - Поля для заполнения (4 и более «_» подряд) → «…»; абзацы-линии целиком из `_ - – — . … = *`
@@ -61,6 +64,7 @@ class Block:
     number: str = ""  # нумерация
     rows: list[list[str]] = field(default_factory=list)  # таблица
     spans: list[CellSpan] = field(default_factory=list)  # таблица: объединенные ячейки
+    grid_widths: list[int] = field(default_factory=list)  # ширины tblGrid в twips (1/1440 дюйма)
 
     def to_markdown(self) -> str:
         if self.kind == BlockKind.HEADING:

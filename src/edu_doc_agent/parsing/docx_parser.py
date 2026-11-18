@@ -172,13 +172,18 @@ def _table(table: Table) -> Block | None:
     grid = []  # [(элемент ячейки, текст)] по строкам; ключ ячейки — её элемент XML
     for row in table.rows:
         cells = row.cells
-        grid.append(
-            [
-                (cell._tc, "" if i > 0 and cell._tc is cells[i - 1]._tc else _cell_text(cell))
-                for i, cell in enumerate(cells)
-            ]
-        )
-    return table_block(grid)
+        line = [
+            (cell._tc, "" if i > 0 and cell._tc is cells[i - 1]._tc else _cell_text(cell))
+            for i, cell in enumerate(cells)
+        ]
+        line = [(None, "")] * row.grid_cols_before + line + [(None, "")] * row.grid_cols_after
+        grid.append(line)
+    block = table_block(grid)
+    if block is not None:
+        block.grid_widths = [
+            col.w.twips if col.w is not None else 0 for col in table._tbl.tblGrid.gridCol_lst
+        ]
+    return block
 
 
 def _cell_text(cell) -> str:

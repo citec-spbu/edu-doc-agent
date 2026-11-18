@@ -10,6 +10,7 @@ import pytest
 from arq.worker import create_worker
 
 from edu_doc_agent.config import Settings
+from tests.fakes import InMemorySessionRunDAO
 
 
 @pytest.fixture
@@ -18,8 +19,16 @@ def tasks() -> ModuleType:
     return importlib.import_module("edu_doc_agent.worker.tasks")
 
 
+@pytest.fixture
+def runner_module() -> ModuleType:
+    return importlib.import_module("edu_doc_agent.worker.runner")
+
+
 def test_task_waits_and_returns_identifiers(
-    tasks: ModuleType, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tasks: ModuleType,
+    runner_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     before_work: list[logging.LogRecord] = []
 
@@ -28,40 +37,61 @@ def test_task_waits_and_returns_identifiers(
 
     sleep = AsyncMock(side_effect=work)
     monkeypatch.setattr(tasks, "asyncio", SimpleNamespace(sleep=sleep))
-    context = {"job_id": "synthetic-job"}
+    dao = InMemorySessionRunDAO()
 
-    with caplog.at_level(logging.INFO, logger=tasks.__name__):
-        result = asyncio.run(tasks.process_session_task(context, "synthetic-session", "run-123"))
+    async def scenario():
+        run = await dao.create_queued_run("synthetic-session")
+        result = await tasks.process_session_task(
+            {"dao": dao, "job_id": "synthetic-job"}, "synthetic-session", str(run.id)
+        )
+        return run, result
+
+    with caplog.at_level(logging.INFO, logger=runner_module.__name__):
+        run, result = asyncio.run(scenario())
 
     assert result == {
         "status": "completed",
         "session_id": "synthetic-session",
-        "run_id": "run-123",
+        "run_id": str(run.id),
     }
+    assert run.status == "completed"
     sleep.assert_awaited_once_with(3)
-    # Логи должны позволять сопоставить запуск и завершение с задачей.
-    # Границу работы наблюдаем через await, не через формулировку сообщения.
     for phase in (before_work, caplog.records[len(before_work) :]):
         assert any(
-            record.name == tasks.__name__
+            record.name == runner_module.__name__
             and record.levelno == logging.INFO
             and "synthetic-session" in record.getMessage()
-            and "run-123" in record.getMessage()
+            and str(run.id) in record.getMessage()
             for record in phase
         )
 
 
-@pytest.mark.parametrize("error", [RuntimeError("synthetic failure"), asyncio.CancelledError()])
+@pytest.mark.parametrize(
+    ("error", "expected_status"),
+    [
+        pytest.param(RuntimeError("synthetic failure"), "failed", id="error"),
+        pytest.param(asyncio.CancelledError(), "queued", id="cancellation"),
+    ],
+)
 def test_task_propagates_error_or_cancellation(
     tasks: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
     error: BaseException,
+    expected_status: str,
 ) -> None:
     monkeypatch.setattr(tasks, "asyncio", SimpleNamespace(sleep=AsyncMock(side_effect=error)))
+    dao = InMemorySessionRunDAO()
 
-    # Ошибка/отмена должна выйти к ARQ, а не превратиться в completed-результат.
-    with pytest.raises(type(error)):
-        asyncio.run(tasks.process_session_task({}, "synthetic-session", "failed-run"))
+    async def scenario():
+        run = await dao.create_queued_run("synthetic-session")
+        # Ошибка/отмена должна выйти к ARQ, а не превратиться в completed.
+        with pytest.raises(type(error)):
+            await tasks.process_session_task({"dao": dao}, "synthetic-session", str(run.id))
+        return run
+
+    run = asyncio.run(scenario())
+    # failed при ошибке; queued при отмене на первой попытке (ARQ сделает retry)
+    assert run.status == expected_status
 
 
 def test_arq_loads_the_registered_task_and_execution_limits(tasks: ModuleType) -> None:
@@ -76,6 +106,7 @@ def test_arq_loads_the_registered_task_and_execution_limits(tasks: ModuleType) -
         assert worker.redis_settings == module.settings.arq_redis_settings
         assert worker.on_startup is module.startup
         assert worker.on_shutdown is module.shutdown
+        assert worker.on_job_start is module.job_start
 
     asyncio.run(scenario())
     assert package.WorkerSettings is module.WorkerSettings

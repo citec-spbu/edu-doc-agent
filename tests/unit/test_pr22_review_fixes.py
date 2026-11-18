@@ -42,7 +42,8 @@ def test_llm_error_degrades_to_warning() -> None:
         raise LLMError("503 unavailable")
 
     result = extract_with_llm(PREREQ_MD, "x.md", FakeLLMClient(respond=fail))
-    assert any("503 unavailable" in w for w in result.warnings)
+    assert any("сбой вызова LLM" in w for w in result.warnings)
+    assert all("503 unavailable" not in w for w in result.warnings)
 
 
 def test_llm_source_line_points_to_quote() -> None:

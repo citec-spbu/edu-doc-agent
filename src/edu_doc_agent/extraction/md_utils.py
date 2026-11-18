@@ -1,7 +1,9 @@
 """Разбор Markdown: таблицы с привязкой к разделу и очистка текста ячеек."""
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from edu_doc_agent.parsing.models import CellSpan
 
 _DASHES = str.maketrans({c: "-" for c in "‐‑‒–—−"})
 _BR_RE = re.compile(r"<br\s*/?>", re.I)
@@ -27,6 +29,8 @@ class MdTable:
     rows: list[list[str]]
     row_lines: list[int]  # 1-based номер строки md для каждой строки rows
     section: str | None
+    spans: list[CellSpan] | None = None
+    grid_widths: list[int] = field(default_factory=list)
 
 
 def clean_text(text: str) -> str:
