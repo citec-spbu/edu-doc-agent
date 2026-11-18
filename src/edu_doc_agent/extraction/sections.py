@@ -143,10 +143,17 @@ def _one_line(s: str) -> str:
 
 def _extract_title_fields(lines: list[str], result: RPDExtraction) -> None:
     result.discipline_code = result.registration_number
+    if "registration_number" in result.sources:
+        result.sources["discipline_code"] = result.sources["registration_number"]
     head = [_one_line(clean_text(ln)).lstrip("# ").strip() for ln in lines[:_TITLE_SCAN_LINES]]
     for i, line in enumerate(head):
         if LANGUAGE_LINE_RE.match(line):
-            result.language = next((ln for ln in head[i + 1 :] if ln), None)
+            found = next(((j, ln) for j, ln in enumerate(head[i + 1 :], i + 2) if ln), None)
+            if found:
+                result.language = found[1]
+                result.sources["language"] = SourceRef(
+                    file=result.file, section="Титул", line=found[0]
+                )
             return
 
 
@@ -157,6 +164,9 @@ def _extract_goals(sections: list[MdSection], file: str, result: RPDExtraction) 
     section = _find(sections, "1.1")
     if section and (body := _body(section)):
         result.goals = "\n".join(ln for _, ln in body)
+        result.sources["goals"] = SourceRef(
+            file=file, section=section.heading, line=body[0][0], quote=result.goals
+        )
 
 
 _OF_THEM_RE = re.compile(r"из них\s+(\d+(?:[.,]\d+)?)\s*(?:час\w*|ч\b\.?)", re.I)

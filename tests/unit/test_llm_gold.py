@@ -7,7 +7,7 @@ import pytest
 from edu_doc_agent.eval.llm_gold import (
     BLIND,
     BLIND2,
-    HOLDOUT,
+    REGRESSION,
     THRESHOLDS,
     GoldCase,
     evaluate,
@@ -20,10 +20,10 @@ from edu_doc_agent.llm import FakeLLMClient, LLMCall
 from tests.real_data import find_md
 
 DEV_CASES = load_gold()
-HOLDOUT_CASES = load_gold(HOLDOUT)
+REGRESSION_CASES = load_gold(REGRESSION)
 BLIND_CASES = load_gold(BLIND)
 BLIND2_CASES = load_gold(BLIND2)
-CASES = DEV_CASES + HOLDOUT_CASES + BLIND_CASES + BLIND2_CASES
+CASES = DEV_CASES + REGRESSION_CASES + BLIND_CASES + BLIND2_CASES
 _ITEMS = {"prerequisites": "items", "active_forms": "items", "grading_rules": "rules"}
 
 
@@ -198,21 +198,21 @@ def test_metric_ignores_case_endings_and_trailing_dot_in_quotes() -> None:
 
 
 def test_sets_are_disjoint() -> None:
-    sets = [DEV_CASES, HOLDOUT_CASES, BLIND_CASES, BLIND2_CASES]
+    sets = [DEV_CASES, REGRESSION_CASES, BLIND_CASES, BLIND2_CASES]
     for i, a in enumerate(sets):
         for b in sets[i + 1 :]:
             assert not {c.id for c in a} & {c.id for c in b}
             assert not {c.text for c in a} & {c.text for c in b}
             assert not {c.source for c in a} & {c.source for c in b} or a is not sets[0]
-    assert len(HOLDOUT_CASES) >= 20 and len(BLIND_CASES) >= 20
+    assert len(REGRESSION_CASES) >= 20 and len(BLIND_CASES) >= 20
 
 
 @pytest.mark.llm
-def test_real_model_on_holdout() -> None:
-    """Честная оценка: на этих кейсах промпты не настраивались."""
+def test_real_model_on_regression() -> None:
+    """Регрессионная оценка: эти кейсы использовались для настройки."""
     from edu_doc_agent.llm import OpenAICompatibleClient
 
-    report = evaluate(OpenAICompatibleClient.from_settings(), HOLDOUT_CASES)
+    report = evaluate(OpenAICompatibleClient.from_settings(), REGRESSION_CASES)
     assert report.passed(), report.summary()
 
 

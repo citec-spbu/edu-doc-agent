@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "note": "Синтетическая матрица учебных морских модулей.",
+  "complete": true,
+  "columns": [
+    "УК-1",
+    "УК-2"
+  ],
+  "rows": [
+    {
+      "number": 1,
+      "semester": 1,
+      "profile": "база",
+      "part": "базовая",
+      "credits": 2,
+      "discipline": "Морской модуль 1",
+      "competences": [
+        "УК-1"
+      ]
+    },
+    {
+      "number": 2,
+      "semester": 2,
+      "profile": "база",
+      "part": "базовая",
+      "credits": 2,
+      "discipline": "Морской модуль 2",
+      "competences": [
+        "УК-1",
+        "УК-2"
+      ]
+    }
+  ],
+  "totals": {
+    "СУММ": {
+      "УК-1": 2,
+      "УК-2": 1
+    }
+  },
+  "totals_counts": {
+    "columns": 2,
+    "rows": 2,
+    "ones": 3
+  }
+}

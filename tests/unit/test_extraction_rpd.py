@@ -596,6 +596,7 @@ def test_result_schema_fields_are_stable() -> None:
     """Потребители читают эти поля; изменение схемы должно быть осознанным."""
     schema = RPDExtraction.model_json_schema()
     assert set(schema["properties"]) == {
+        "sources",
         "file",
         "doc_kind",
         "title",
@@ -682,6 +683,45 @@ def test_same_text_in_non_adjacent_rows_is_not_a_merge() -> None:
         (["УК-2"], "другое"),
         (["УК-3"], "основы"),
     ]
+
+
+def test_cell_with_two_competences_gives_two_competences_and_owners() -> None:
+    """Две компетенции в одной ячейке через <br>: названия не склеиваются, индикатор и результат
+    относятся к своей компетенции (регрессия на «Способен … код ПКП-ППК-ДА2. Способен …»)."""
+    md = (
+        HEAD
+        + "| ПКП-ППК-Р1. Способен разрабатывать код<br>ПКП-ППК-ДА2. Способен обрабатывать данные | "
+        "ПКП-ППК-Р1.4. З-1. Знает синтаксис.<br>ПКП-ППК-ДА2.1. З-2. Знает нормализацию. | "
+        "ПКП-ППК-Р1.4. Разрабатывает код (Базовый)<br>ПКП-ППК-ДА2.1. Очищает данные (Базовый) |\n"
+    )
+    r = extract_rpd(md, "x.md")
+    assert [(c.code, c.name) for c in r.competences] == [
+        ("ПКП-ППК-Р1", "Способен разрабатывать код"),
+        ("ПКП-ППК-ДА2", "Способен обрабатывать данные"),
+    ]
+    assert [(i.code, i.competence_code) for i in r.indicators] == [
+        ("ПКП-ППК-Р1.4", "ПКП-ППК-Р1"),
+        ("ПКП-ППК-ДА2.1", "ПКП-ППК-ДА2"),
+    ]
+    assert [(o.indicator_code, o.competence_codes) for o in r.learning_outcomes] == [
+        ("ПКП-ППК-Р1.4", ["ПКП-ППК-Р1"]),
+        ("ПКП-ППК-ДА2.1", ["ПКП-ППК-ДА2"]),
+    ]
+
+
+def test_competence_name_wrapped_over_lines_stays_one_competence() -> None:
+    md = HEAD + "| УК-1 Способен искать<br>и анализировать | знает:<br>основы | УК-1.1 Один |\n"
+    r = extract_rpd(md, "x.md")
+    assert [(c.code, c.name) for c in r.competences] == [
+        ("УК-1", "Способен искать и анализировать")
+    ]
+
+
+@pytest.mark.skipif(not REAL_MD, reason="нет data/")
+def test_no_competence_name_contains_another_competence_code_in_real_corpus() -> None:
+    for path in REAL_MD:
+        for comp in extract_rpd_file(path).competences:
+            assert not (comp.name and COMPETENCE_RE.search(comp.name)), (path.stem, comp.code)
 
 
 # --- обратная совместимость: старое поле competence_code ------------------------------------------

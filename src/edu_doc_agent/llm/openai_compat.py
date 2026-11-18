@@ -71,13 +71,19 @@ class OpenAICompatibleClient:
             try:
                 resp = self._http.post("chat/completions", json=payload)
             except httpx.TransportError as exc:
-                last = f"{type(exc).__name__}: {exc}"
+                last = type(exc).__name__
             else:
                 if resp.status_code == 200:
-                    return resp.json()["choices"][0]["message"]["content"] or ""
+                    try:
+                        content = resp.json()["choices"][0]["message"]["content"]
+                        if not isinstance(content, str):
+                            raise TypeError
+                    except (ValueError, KeyError, IndexError, TypeError):
+                        raise LLMError("некорректная структура ответа LLM") from None
+                    return content
                 last = f"HTTP {resp.status_code}"
                 if resp.status_code not in _RETRY_STATUSES:
-                    raise LLMError(f"{last}: {resp.text[:300]}")
+                    raise LLMError(last)
                 if (retry_after := resp.headers.get("retry-after")) and retry_after.replace(
                     ".", "", 1
                 ).isdigit():

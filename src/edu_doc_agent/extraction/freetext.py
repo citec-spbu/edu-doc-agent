@@ -116,9 +116,11 @@ _STOP = or_(
         }
     ),
 )
-_PLAIN_ITEM = not_(_STOP).repeatable(max=6).interpretation(Names.names)
+# «в одной и более» — единый оборот, а не граница списка.
+_NAME_TOKEN = or_(rule(eq("одной"), eq("и"), in_caseless({"более", "больше"})), rule(not_(_STOP)))
+_PLAIN_ITEM = _NAME_TOKEN.repeatable().interpretation(Names.names)
 _QUOTED_ITEM = rule(
-    LQUOTE, not_(or_(LQUOTE, RQUOTE)).repeatable(max=12).interpretation(Names.names), RQUOTE
+    LQUOTE, not_(or_(LQUOTE, RQUOTE)).repeatable().interpretation(Names.names), RQUOTE
 )
 _PLAIN_LIST = rule(_PLAIN_ITEM, rule(SEPARATOR, _PLAIN_ITEM).repeatable().optional())
 _DISCIPLINE_WORD = or_(normalized("дисциплина"), normalized("курс"))
@@ -127,13 +129,13 @@ _KNOWLEDGE_WORD = or_(
 )
 # «знания по дисциплинам: …» — это список дисциплин, а не область знаний
 _AREA_ITEM = rule(
-    not_(or_(_STOP, _DISCIPLINE_WORD)), not_(_STOP).repeatable(max=5).optional()
+    not_(or_(_STOP, _DISCIPLINE_WORD)), _NAME_TOKEN.repeatable().optional()
 ).interpretation(Names.names)
 _AREA_LIST = rule(_AREA_ITEM, rule(SEPARATOR, _PLAIN_ITEM).repeatable().optional())
 # без предлога «по»: «Знание основ комбинаторного анализа»; «по» и «в» тут значат другое правило
 _BARE_AREA_ITEM = rule(
     not_(or_(_STOP, _DISCIPLINE_WORD, eq("по"), eq("в"), eq("на"))),
-    not_(_STOP).repeatable(max=5).optional(),
+    _NAME_TOKEN.repeatable().optional(),
 ).interpretation(Names.names)
 _BARE_AREA_LIST = rule(_BARE_AREA_ITEM, rule(SEPARATOR, _PLAIN_ITEM).repeatable().optional())
 _IN_AREA = or_(

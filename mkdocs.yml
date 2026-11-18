@@ -44,4 +44,5 @@ nav:
   - Архитектура: architecture.md
   - Архитектура бекенда: backend-architecture.md
   - Как мы работаем: contributing.md
+  - Извлечение документов ОП: extraction-program-documents.md
   - Решения (ADR): adr/index.md

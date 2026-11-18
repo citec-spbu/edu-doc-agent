@@ -197,13 +197,15 @@ def _table(table: Table) -> Block | None:
             (cell._tc, "" if i > 0 and cell._tc is cells[i - 1]._tc else _cell_text(cell))
             for i, cell in enumerate(cells)
         ]
+        line = [(None, "")] * row.grid_cols_before + line + [(None, "")] * row.grid_cols_after
         if any(text for _, text in line):
             grid.append(line)
     if not grid:
         return None
     width = max(len(line) for line in grid)
     rows = [[text for _, text in line] + [""] * (width - len(line)) for line in grid]
-    return Block(BlockKind.TABLE, rows=rows, spans=_spans(grid))
+    widths = [col.w.twips if col.w is not None else 0 for col in table._tbl.tblGrid.gridCol_lst]
+    return Block(BlockKind.TABLE, rows=rows, spans=_spans(grid), grid_widths=widths)
 
 
 def _spans(grid: list) -> list[CellSpan]:
@@ -211,6 +213,8 @@ def _spans(grid: list) -> list[CellSpan]:
     positions: dict[int, list[tuple[int, int]]] = {}
     for r, line in enumerate(grid):
         for c, (tc, _) in enumerate(line):
+            if tc is None:
+                continue
             positions.setdefault(id(tc), []).append((r, c))
     spans = []
     for cells in positions.values():
