@@ -4,10 +4,10 @@ from datetime import date, datetime
 from pathlib import Path
 
 import pytest
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 from edu_doc_agent.parsing import BlockKind, CellSpan, parse_document, supported_suffixes
-from edu_doc_agent.parsing.xlsx_parser import _value_text
+from edu_doc_agent.parsing.xlsx_parser import _grid, _value_text
 
 
 @pytest.fixture
@@ -82,3 +82,34 @@ def test_value_text() -> None:
 
 def test_xlsx_is_supported() -> None:
     assert ".xlsx" in supported_suffixes()
+
+
+def test_formatting_far_from_data_does_not_grow_grid(tmp_path: Path) -> None:
+    """Формат в CV1000 сдвигает max_row/max_column, но сетка строится только по данным."""
+    wb = Workbook()
+    ws = wb.active
+    ws["A1"], ws["A2"] = "Дисциплина", "Алгебра"
+    ws["CV1000"].number_format = "0.00"
+    ws["XFD1048576"].number_format = "0.00"  # последний адрес листа: полный обход не закончится
+    ws.merge_cells("C5:Z900")  # пустое объединение — тоже оформление
+    path = tmp_path / "sparse.xlsx"
+    wb.save(path)
+
+    loaded = load_workbook(path)
+    sheet = loaded.active
+    stored = len(sheet._cells)
+    assert _grid(sheet) == [[((1, 1), "Дисциплина")], [((2, 1), "Алгебра")]]
+    assert len(sheet._cells) == stored  # обход не создал ячеек
+
+    table = parse_document(path).blocks[1]
+    assert table.rows == [["Дисциплина"], ["Алгебра"]]
+
+
+def test_sparse_values_keep_only_filled_rows_and_columns(tmp_path: Path) -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws["A1"], ws["CV1"] = "Код", "Итого"
+    ws["A1000"], ws["CV1000"] = "УК-1", 5
+    path = tmp_path / "far.xlsx"
+    wb.save(path)
+    assert parse_document(path).blocks[1].rows == [["Код", "Итого"], ["УК-1", "5"]]

@@ -1,6 +1,5 @@
 """XLSX -> блоки: каждый видимый лист — заголовок (имя листа) и таблица"""
 
-from collections.abc import Hashable
 from datetime import date, datetime, time
 from pathlib import Path
 
@@ -31,14 +30,22 @@ class XlsxParser(BaseParser):
 
 
 def _grid(ws: Worksheet) -> list[list[Cell]]:
-    """Сетка видимых ячеек листа; столбцы без единого значения отброшены.
+    """Сетка видимых ячеек листа: только строки и столбцы, где есть значения.
 
     Ключ ячейки — её координата, у объединённой — координата всего диапазона, а значение
     объединения записано во все его позиции (`table_block` сам оставит его по контракту).
+
+    Сетка строится по сохранённым в файле ячейкам, а не по прямоугольнику до
+    `max_row`/`max_column`: эти границы учитывают и ячейки с одним оформлением, и маленький
+    файл с форматом в CV1000 давал бы сетку на 100 000 позиций.
     """
-    merged: dict[tuple[int, int], tuple[Hashable, str]] = {}
+    # ws._cells — только ячейки из файла; ws.iter_rows() создал бы весь прямоугольник
+    values = {pos: text for pos, cell in ws._cells.items() if (text := _value_text(cell.value))}
+    merged: dict[tuple[int, int], Cell] = {}
     for rng in ws.merged_cells.ranges:
-        text = _value_text(ws.cell(rng.min_row, rng.min_col).value)
+        text = values.get((rng.min_row, rng.min_col), "")
+        if not text:
+            continue  # пустое объединение — то же оформление, сетку не расширяет
         for row, col in rng.cells:
             merged[(row, col)] = (rng.coord, text)
 
@@ -48,16 +55,15 @@ def _grid(ws: Worksheet) -> list[list[Cell]]:
         if dim.hidden and dim.min is not None
         for i in range(dim.min, (dim.max or dim.min) + 1)
     }
-    cols = [c for c in range(1, ws.max_column + 1) if c not in hidden_cols]
-    grid = []
-    for r, row in enumerate(ws.iter_rows(min_row=1, max_row=ws.max_row), start=1):
-        if ws.row_dimensions[r].hidden:
-            continue
-        values = {cell.column: cell.value for cell in row}
-        grid.append([merged.get((r, c)) or ((r, c), _value_text(values.get(c))) for c in cols])
+    positions = values.keys() | merged.keys()
+    rows = sorted({r for r, _ in positions if not _row_hidden(ws, r)})
+    cols = sorted({c for _, c in positions if c not in hidden_cols})
+    return [[merged.get((r, c)) or ((r, c), values.get((r, c), "")) for c in cols] for r in rows]
 
-    filled = [any(line[i][1] for line in grid) for i in range(len(cols))]
-    return [[cell for cell, keep in zip(line, filled, strict=True) if keep] for line in grid]
+
+def _row_hidden(ws: Worksheet, row: int) -> bool:
+    dim = ws.row_dimensions.get(row)  # .get — без создания записи для каждой строки
+    return dim is not None and dim.hidden
 
 
 def _value_text(value: object) -> str:
