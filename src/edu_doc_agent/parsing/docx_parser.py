@@ -10,19 +10,19 @@ from docx.oxml.ns import qn
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 
-from edu_doc_agent.parsing.models import BaseParser, Block, BlockKind, CellSpan, ParsedDocument
+from edu_doc_agent.parsing.common import (
+    MAX_HEADING_LEN,
+    clean_text,
+    is_rule,
+    paragraph_block,
+    table_block,
+)
+from edu_doc_agent.parsing.models import BaseParser, Block, BlockKind, ParsedDocument
 
 _TEXT_XPATH = (
     ".//w:t[not(ancestor::*[local-name()='Fallback'])] | .//m:t | .//w:r/w:tab | .//w:r/w:br"
 )
 _HEADING_STYLE = re.compile(r"^(?:heading|заголовок)\s*(\d)$", re.IGNORECASE)
-_SECTION = re.compile(r"^раздел\s+\d", re.IGNORECASE)  # раздел
-_NUMBERED = re.compile(r"^(\d+(?:\.\d+)+)\.?\s")  # нумерация
-_BULLET = re.compile(r"^[•·▪◦‣−–—-]\s+")  # маркер
-_BLANK = re.compile(r"_{4,}")  # поле для заполнения '______' -> '...'
-_RULE = re.compile(r"[\s_.…\-–—=*]{4,}")  # абзац целиком из таких символов - линия-разделитель
-_SPACES = re.compile(r"[ \t\u00a0]+")  # пробелы, табы, неразрывные пробелы
-_MAX_HEADING_LEN = 200
 
 
 class DocxParser(BaseParser):
@@ -59,30 +59,23 @@ def _iter_body(doc: DocxDocument, element) -> Iterator[Paragraph | Table]:
 def _paragraph(p: Paragraph, numbering: "_Numbering") -> Block | None:
     number, list_level, is_section = numbering.next(p)
     raw = _text(p._p)
-    if _RULE.fullmatch(raw.strip()):  # '--------', '________', '........' без текста
+    if is_rule(raw):  # '--------', '________', '........' без текста
         return None
-    text = _clean(raw)
+    text = clean_text(raw)
     if not text:
         return None
     style = p.style.name if p.style is not None else ""
     is_bold = _is_bold(p)
-    is_title = not text.endswith((".", ";", ","))
-    is_short = len(text) <= _MAX_HEADING_LEN and not text.endswith((";", ","))
 
     if match := _HEADING_STYLE.match(style):
         return Block(BlockKind.HEADING, text, level=int(match.group(1)), number=number)
-    if list_level is not None:
+    if list_level is not None:  # автонумерация Word
+        is_title = not text.endswith((".", ";", ","))
+        is_short = len(text) <= MAX_HEADING_LEN and not text.endswith((";", ","))
         if number and ((is_section and is_title) or (is_bold and is_short)):
             return Block(BlockKind.HEADING, text, level=list_level + 1, number=number)
         return Block(BlockKind.LIST_ITEM, text, level=list_level, number=number)
-    typed_section = _SECTION.match(text) or _NUMBERED.match(text)
-    if is_bold and (is_short or (typed_section and is_title)):
-        return Block(BlockKind.HEADING, text, level=_heading_level(text))
-    if match := _BULLET.match(text):
-        return Block(BlockKind.LIST_ITEM, text[match.end() :])
-    if style.startswith("List"):
-        return Block(BlockKind.LIST_ITEM, text)
-    return Block(BlockKind.PARAGRAPH, text)
+    return paragraph_block(text, bold=is_bold, list_style=style.startswith("List"))
 
 
 def _text(element) -> str:
@@ -96,23 +89,9 @@ def _text(element) -> str:
     return "".join(parts)
 
 
-def _clean(text: str, keep_newlines: bool = False) -> str:
-    text = _BLANK.sub("…", text.replace("\xad", ""))
-    lines = [_SPACES.sub(" ", line).strip() for line in text.splitlines()]
-    return ("\n" if keep_newlines else " ").join(line for line in lines if line)
-
-
 def _is_bold(p: Paragraph) -> bool:
     runs = [r for r in p.runs if r.text.strip()]
     return bool(runs) and all(r.bold for r in runs)
-
-
-def _heading_level(text: str) -> int:
-    if _SECTION.match(text):
-        return 1
-    if match := _NUMBERED.match(text):
-        return match.group(1).count(".") + 1
-    return 3
 
 
 class _Numbering:
@@ -190,7 +169,7 @@ def _format_number(n: int, fmt: str) -> str:
 
 
 def _table(table: Table) -> Block | None:
-    grid = []  # [(элемент ячейки, текст)] по строкам; пустые строки пропускаем
+    grid = []  # [(элемент ячейки, текст)] по строкам; ключ ячейки — её элемент XML
     for row in table.rows:
         cells = row.cells
         line = [
@@ -198,31 +177,14 @@ def _table(table: Table) -> Block | None:
             for i, cell in enumerate(cells)
         ]
         line = [(None, "")] * row.grid_cols_before + line + [(None, "")] * row.grid_cols_after
-        if any(text for _, text in line):
-            grid.append(line)
-    if not grid:
-        return None
-    width = max(len(line) for line in grid)
-    rows = [[text for _, text in line] + [""] * (width - len(line)) for line in grid]
-    widths = [col.w.twips if col.w is not None else 0 for col in table._tbl.tblGrid.gridCol_lst]
-    return Block(BlockKind.TABLE, rows=rows, spans=_spans(grid), grid_widths=widths)
-
-
-def _spans(grid: list) -> list[CellSpan]:
-    """Объединенные ячейки: позиции сетки, которые занимает один и тот же элемент ячейки"""
-    positions: dict[int, list[tuple[int, int]]] = {}
-    for r, line in enumerate(grid):
-        for c, (tc, _) in enumerate(line):
-            if tc is None:
-                continue
-            positions.setdefault(id(tc), []).append((r, c))
-    spans = []
-    for cells in positions.values():
-        rows, cols = {r for r, _ in cells}, {c for _, c in cells}
-        if len(cells) > 1:
-            spans.append(CellSpan(min(rows), min(cols), len(rows), len(cols)))
-    return sorted(spans, key=lambda s: (s.row, s.col))
+        grid.append(line)
+    block = table_block(grid)
+    if block is not None:
+        block.grid_widths = [
+            col.w.twips if col.w is not None else 0 for col in table._tbl.tblGrid.gridCol_lst
+        ]
+    return block
 
 
 def _cell_text(cell) -> str:
-    return _clean("\n".join(_text(p._p) for p in cell.paragraphs), keep_newlines=True)
+    return clean_text("\n".join(_text(p._p) for p in cell.paragraphs), keep_newlines=True)
