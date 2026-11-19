@@ -27,6 +27,7 @@ markdown_extensions:
   - tables
   - attr_list
   - pymdownx.details
+  - zensical.extensions.glightbox
   - toc:
       permalink: true
       slugify: !!python/object/apply:pymdownx.slugs.slugify
