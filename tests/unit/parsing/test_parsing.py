@@ -235,7 +235,7 @@ def test_list_indent_is_never_deeper_than_parent() -> None:
 
 def test_unsupported_format(tmp_path: Path) -> None:
     with pytest.raises(UnsupportedFormatError):
-        parse_document(tmp_path / "scan.pdf")
+        parse_document(tmp_path / "old_word.doc")
 
 
 def test_documents_to_markdown_files(rpd: Path, characteristic: Path, tmp_path: Path) -> None:
