@@ -27,6 +27,17 @@ uv run python -m edu_doc_agent.retrieval.corpus.build data/regulations/manifest.
     --overrides data/regulations/overrides.yaml --out data/corpus
 ```
 
+Загрузка в базу (PostgreSQL с pgvector и Ollama с моделью `bge-m3` должны быть запущены,
+миграции применены: `uv run alembic upgrade head`):
+
+```bash
+uv run python -m edu_doc_agent.retrieval.corpus.load data/regulations/manifest.yaml \
+    --overrides data/regulations/overrides.yaml
+```
+
+Повторная загрузка неизменённого корпуса ничего не пишет; эмбеддинги пересчитываются только
+для изменившихся фрагментов. `--prune` удаляет из базы документы, которых нет в манифесте.
+
 В `REPORT.md` — число пунктов, компетенций и профстандартов по документам и замечания:
 пропуски в нумерации, УК/ОПК не подряд, строки таблиц без кода. Замечание чинится правкой
 в `overrides.yaml`, исходный PDF не трогаем.

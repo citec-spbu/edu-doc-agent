@@ -103,6 +103,8 @@ class OllamaEmbedder:
                     except ValueError:
                         raise LLMError("ответ Ollama — не JSON") from None
                 last = f"HTTP {resp.status_code}: {_error_text(resp)}"
+                if resp.status_code == 404:
+                    last += f" (скачайте модель: ollama pull {self.model})"
                 if resp.status_code not in _RETRY_STATUSES:
                     # 400 — в том числе вход длиннее контекста при truncate: false; 404 — модель
                     # не скачана (`ollama pull bge-m3`). Повтор не поможет.

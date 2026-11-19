@@ -308,6 +308,7 @@ dependencies = [
     { name = "httpx" },
     { name = "openpyxl" },
     { name = "pdfplumber" },
+    { name = "pgvector" },
     { name = "psycopg", extra = ["binary", "pool"] },
     { name = "pydantic-settings" },
     { name = "python-docx" },
@@ -340,6 +341,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "openpyxl", specifier = ">=3.1.5" },
     { name = "pdfplumber", specifier = ">=0.11.10" },
+    { name = "pgvector", specifier = ">=0.4.1" },
     { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.3.9" },
     { name = "pydantic-settings", specifier = ">=2.15.0" },
     { name = "python-docx", specifier = ">=1.2.0" },
@@ -805,6 +807,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/05/56/6f450312ba05a27d7713b73857c1a25100dbda04fbc1331b13fb227a607d/pdfplumber-0.11.10.tar.gz", hash = "sha256:b95b2d28c66efb0a794a83b88c6c6aea5987532a445d20a1cbcfa657022e6e57", size = 102892, upload-time = "2026-06-15T03:31:31.035Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a2/9a/07d658e1e7fad860f1c541ab941348125dbdab773be3a0afaf32361866c7/pdfplumber-0.11.10-py3-none-any.whl", hash = "sha256:7741ea81bf165b474b153e6789d10d18e06b6ddcf3ec84289c3ef2fed6802580", size = 60047, upload-time = "2026-06-15T03:31:29.702Z" },
+]
+
+[[package]]
+name = "pgvector"
+version = "0.5.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f8/23/96aa38899fbf8e103766db608d6e42acac269a96e08f3003fe9da3396fed/pgvector-0.5.1.tar.gz", hash = "sha256:94998a54b801b1075d623b8fa677fcb8210a7977b88f8e2203ab115c155af2e4", size = 35714, upload-time = "2026-10-09T01:50:22.779Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a2/8d/a9c2a531da0ebb54b4a7174450e8534a39db112a141ae3a437de28420111/pgvector-0.5.1-py3-none-any.whl", hash = "sha256:ec5bcd5ffaefe6ecb2dcc9564ca921d284564b969183bc837a144604773af8ea", size = 31056, upload-time = "2026-10-09T01:50:21.614Z" },
 ]
 
 [[package]]
