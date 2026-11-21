@@ -1,0 +1,114 @@
+# Качество извлечения XLSX-документов
+
+Дата замера: 21 ноября 2026 года.
+
+Полные записи сравниваются один-к-одному; дубли дают FP. Метрики относятся к двум локальным файлам одной программы. Вызовов LLM нет.
+
+## Сущности, связи и полные записи
+
+| Документ / группа | TP | FP | FN | Precision | Recall | F1 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| plan_xlsx / entity.competence | 49 | 0 | 0 | 1.000 | 1.000 | 1.000 |
+| plan_xlsx / entity.discipline | 222 | 0 | 0 | 1.000 | 1.000 | 1.000 |
+| plan_xlsx / entity.final_attestation | 1 | 0 | 0 | 1.000 | 1.000 | 1.000 |
+| plan_xlsx / record.discipline_complete | 222 | 0 | 0 | 1.000 | 1.000 | 1.000 |
+| plan_xlsx / relation.attestation_competence | 10 | 0 | 0 | 1.000 | 1.000 | 1.000 |
+| plan_xlsx / relation.discipline_competence | 769 | 0 | 0 | 1.000 | 1.000 | 1.000 |
+| plan_xlsx / relation.discipline_group | 99 | 0 | 0 | 1.000 | 1.000 | 1.000 |
+| plan_xlsx / relation.discipline_part | 222 | 0 | 0 | 1.000 | 1.000 | 1.000 |
+| plan_xlsx / relation.discipline_profile | 58 | 0 | 0 | 1.000 | 1.000 | 1.000 |
+| plan_xlsx / relation.discipline_semester | 222 | 0 | 0 | 1.000 | 1.000 | 1.000 |
+| plan_xlsx / relation.discipline_trajectory | 24 | 0 | 0 | 1.000 | 1.000 | 1.000 |
+| matrix_xlsx / entity.competence | 49 | 0 | 0 | 1.000 | 1.000 | 1.000 |
+| matrix_xlsx / entity.discipline | 118 | 0 | 0 | 1.000 | 1.000 | 1.000 |
+| matrix_xlsx / relation.discipline_competence | 660 | 0 | 0 | 1.000 | 1.000 | 1.000 |
+
+## Поля
+
+| Документ / поле | Верно | Всего | Accuracy |
+| --- | ---: | ---: | ---: |
+| plan_xlsx / active_hours | 222 | 222 | 1.0000 |
+| plan_xlsx / block | 222 | 222 | 1.0000 |
+| plan_xlsx / code | 222 | 222 | 1.0000 |
+| plan_xlsx / competence_name | 49 | 49 | 1.0000 |
+| plan_xlsx / competences | 222 | 222 | 1.0000 |
+| plan_xlsx / contact_hours | 222 | 222 | 1.0000 |
+| plan_xlsx / control | 222 | 222 | 1.0000 |
+| plan_xlsx / credits | 222 | 222 | 1.0000 |
+| plan_xlsx / gia.block | 1 | 1 | 1.0000 |
+| plan_xlsx / gia.competences | 1 | 1 | 1.0000 |
+| plan_xlsx / gia.credits | 1 | 1 | 1.0000 |
+| plan_xlsx / gia.found | 1 | 1 | 1.0000 |
+| plan_xlsx / gia.name_en | 1 | 1 | 1.0000 |
+| plan_xlsx / group | 222 | 222 | 1.0000 |
+| plan_xlsx / name | 222 | 222 | 1.0000 |
+| plan_xlsx / name_en | 222 | 222 | 1.0000 |
+| plan_xlsx / part | 222 | 222 | 1.0000 |
+| plan_xlsx / profile | 222 | 222 | 1.0000 |
+| plan_xlsx / self_study_hours | 222 | 222 | 1.0000 |
+| plan_xlsx / semester | 222 | 222 | 1.0000 |
+| plan_xlsx / title.direction | 1 | 1 | 1.0000 |
+| plan_xlsx / title.duration | 1 | 1 | 1.0000 |
+| plan_xlsx / title.languages | 1 | 1 | 1.0000 |
+| plan_xlsx / title.level | 1 | 1 | 1.0000 |
+| plan_xlsx / title.program | 1 | 1 | 1.0000 |
+| plan_xlsx / title.registration_number | 1 | 1 | 1.0000 |
+| plan_xlsx / title.study_form | 1 | 1 | 1.0000 |
+| plan_xlsx / trajectory | 222 | 222 | 1.0000 |
+| plan_xlsx / year | 222 | 222 | 1.0000 |
+| **plan_xlsx / micro** | **3613** | **3613** | **1.0000** |
+| matrix_xlsx / cells | 5782 | 5782 | 1.0000 |
+| matrix_xlsx / columns | 1 | 1 | 1.0000 |
+| matrix_xlsx / row.competences | 118 | 118 | 1.0000 |
+| matrix_xlsx / row.credits | 118 | 118 | 1.0000 |
+| matrix_xlsx / row.discipline | 118 | 118 | 1.0000 |
+| matrix_xlsx / row.part | 118 | 118 | 1.0000 |
+| matrix_xlsx / row.profile | 118 | 118 | 1.0000 |
+| matrix_xlsx / row.semester | 118 | 118 | 1.0000 |
+| matrix_xlsx / totals | 147 | 147 | 1.0000 |
+| **matrix_xlsx / micro** | **6638** | **6638** | **1.0000** |
+
+## До и после исправления
+
+Эталон и исходник не менялись. Слово «Семестр» в названии группы выбора ошибочно сбрасывало часть и группу у 75 записей. Классификация именованных контекстов теперь предшествует распознаванию семестра.
+
+| Показатель XLSX-плана | До | После |
+| --- | ---: | ---: |
+| part | 147/222 (0.6622) | 222/222 (1.0000) |
+| group | 147/222 (0.6622) | 222/222 (1.0000) |
+| F1 record.discipline_complete | 0.6622 | 1.0000 |
+| F1 relation.discipline_part | 0.7967 | 1.0000 |
+| F1 relation.discipline_group | 0.3902 | 1.0000 |
+
+## Воспроизводимость и диагностика
+
+- **plan_xlsx:** источник SHA-256 `c564673063c1a866be20d1c6b8a9eac4743dca5db764073abcf31b51d20dcec0`; эталон `b4a6c4238405854e3d0036edf76f73eb171eae934c9db3fd92e75369125d9571`.
+  Парсинг и извлечение: медиана 1.051 с, диапазон 1.012–1.190 с (5 повторов); детерминизм: True.
+  Формул: 88; без кэша: 0; ошибок: 0; предупреждений извлекателя: 0.
+  Именованные ячейки часов: 3108/3108; строки/листы источников: 222/222; записей без кода в исходнике: 20.
+- **matrix_xlsx:** источник SHA-256 `b8294462d717d1aa22b83dd373334d20f7d3a663ac9fda39857297caff210ca4`; эталон `0052790b7827d2b6ec09edb1fe9d1f0923b913f799a49be31f481e4d8040fc7c`.
+  Парсинг и извлечение: медиана 0.147 с, диапазон 0.120–0.186 с (5 повторов); детерминизм: True.
+  Формул: 147; без кэша: 0; ошибок: 0; предупреждений извлекателя: 0.
+
+## Методика и ограничения
+
+- Эталон XLSX-плана зафиксирован до первого сравнения. Он собран отдельным reference reader через ZIP/XML, без openpyxl, парсера и экстрактора. Области листа и правила контекста заданы по исходнику; хеш запрещает применять эту разметку к другой версии файла.
+- Использован существующий полный локальный эталон матрицы. Его происхождение описано в eval/matrix_gold.py: независимое чтение XML.
+- Независимой полной проверки человеком и теста на новой программе нет. Это локальная сверка с программно подготовленным эталоном и регрессия на документах разработки, а не оценка обобщения.
+- Entity-level дисциплина сравнивает код и название; контекст отдельно входит в отношения и record.discipline_complete (все 16 полей PlanEntry). Перестановка часов по видам должна снижать полевую метрику и полноту записи.
+- Для источников сравниваются исходная строка, лист, код и нормализованное название. Типографские варианты тире не считаются ошибкой координат.
+- Для разреженной матрицы отдельно учитываются положительные связи: высокая доля верных нулевых ячеек не заменяет relation-F1.
+- Формулы не пересчитывались: проверяются сохранённые значения. Ошибки и отсутствие кэша проверяются также синтетическими регрессиями.
+- DOCX и XLSX плана разных версий не сравниваются как один эталон. Междокументное сопоставление и span-level NER здесь не оцениваются.
+- Полные исходники, эталоны, ответы и ошибки остаются в data/evaluation. JSON сохраняет базовый Git-коммит и SHA-256 каждого файла кода рабочего дерева.
+
+## Повторение замера
+
+```bash
+uv run python -m edu_doc_agent.eval.xlsx_documents --prepare-plan-reference
+uv run python -m edu_doc_agent.eval.xlsx_documents \
+  --output data/evaluation/xlsx_quality_after.json \
+  --report docs/extraction-xlsx-evaluation.md
+```
+
+Первый запуск не вызывает извлекатель и не перезаписывает отличающийся эталон. Нужны оба локальных архива и matrix_gold_full.json. Для таблицы до/после добавляется `--baseline data/evaluation/xlsx_quality_before.json`. Базовый JSON сохранён до исправления; команда проверяет неизменность хешей обоих исходников и эталонов. Порог каждой группы и поля — 0.95, детерминизм обязателен. Непрохождение даёт код 1, отсутствие данных — код 2.

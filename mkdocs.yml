@@ -45,4 +45,5 @@ nav:
   - Архитектура бекенда: backend-architecture.md
   - Как мы работаем: contributing.md
   - Извлечение документов ОП: extraction-program-documents.md
+  - Замер качества XLSX: extraction-xlsx-evaluation.md
   - Решения (ADR): adr/index.md

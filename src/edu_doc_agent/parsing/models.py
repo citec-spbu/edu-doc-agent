@@ -32,6 +32,9 @@
 XLSX: каждый видимый лист — заголовок 1-го уровня (имя листа) и таблица по правилам выше.
 Скрытые листы, строки и столбцы, а также столбцы без единого значения пропускаются.
 Значения: формулы — результат из кэша Excel, числа без «.0», даты — `ДД.ММ.ГГГГ`.
+`Block.source_rows` и `source_columns` связывают индексы таблицы с исходными координатами
+листа (с 1), включая пропуски скрытых и пустых областей. `ParsedDocument.warnings`
+диагностирует формулы без кэшированного значения и с ошибкой; формулы не вычисляются.
 """
 
 from abc import ABC, abstractmethod
@@ -69,6 +72,8 @@ class Block:
     rows: list[list[str]] = field(default_factory=list)  # таблица
     spans: list[CellSpan] = field(default_factory=list)  # таблица: объединенные ячейки
     grid_widths: list[int] = field(default_factory=list)  # ширины tblGrid в twips (1/1440 дюйма)
+    source_rows: list[int] = field(default_factory=list)  # XLSX: исходные строки листа, с 1
+    source_columns: list[int] = field(default_factory=list)  # XLSX: исходные столбцы, с 1
 
     def to_markdown(self) -> str:
         if self.kind == BlockKind.HEADING:
@@ -95,6 +100,7 @@ def _md_row(cells: list[str]) -> str:
 class ParsedDocument:
     source: str
     blocks: list[Block] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def tables(self) -> list[Block]:
