@@ -1,6 +1,7 @@
 """Тесты парсера PDF на синтетическом документе (вёрстка как у выгрузок нормативов)
 
-Фикстура `standard_normal_01.pdf` собирается скриптом tests/fixtures/make_standard_pdf.py.
+Фикстура `standard_normal_01.pdf` собирается скриптом tests/fixtures/make_standard_pdf.py,
+пограничные случаи (`standard_*-*_01.pdf`) — tests/fixtures/make_pdf_edge_cases.py.
 """
 
 from pathlib import Path
@@ -8,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from edu_doc_agent.parsing import (
+    Block,
     BlockKind,
     CellSpan,
     NoTextLayerError,
@@ -18,6 +20,11 @@ from edu_doc_agent.parsing.pdf_parser import _is_bold, _join
 
 FIXTURES = Path(__file__).parents[2] / "fixtures"
 STANDARD = FIXTURES / "standard_normal_01.pdf"
+
+
+def _tables(name: str) -> list[Block]:
+    blocks = parse_document(FIXTURES / name).blocks
+    return [b for b in blocks if b.kind == BlockKind.TABLE]
 
 
 def test_paragraphs_headings_and_cleanup() -> None:
@@ -73,6 +80,35 @@ def test_table_across_pages() -> None:
     assert table.spans == [CellSpan(row=0, col=0, col_span=2), CellSpan(row=4, col=0, col_span=2)]
 
 
+def test_separate_tables_on_adjacent_pages_stay_separate() -> None:
+    """Первая таблица кончается в верхней части страницы — следующая не её продолжение."""
+    first, second = _tables("standard_two-tables_01.pdf")
+    assert first.rows == [["Дисциплина", "Часы"], ["Алгебра", "144"]]
+    assert second.rows == [["Компетенция", "Индикатор"], ["УК-1", "УК-1.1"]]
+
+
+def test_continued_table_cells_do_not_merge_across_pages() -> None:
+    """Ячейки продолжения на тех же координатах, что и на первой странице, — не объединение."""
+    (table,) = _tables("standard_long-table_01.pdf")
+    assert table.rows == [["Код", "Значение"]] + [[f"A{n}", f"Value {n}"] for n in range(1, 41)]
+    assert table.spans == []
+
+
+def test_narrow_cells_keep_space_between_whole_words() -> None:
+    (table,) = _tables("standard_narrow-cells_01.pdf")
+    assert table.rows[1:] == [
+        ["в очно-заочной форме обучения", "5 лет"],  # «очно-заочной» — целое слово
+        ["Информационно-коммуникационные технологии", "4 года"],  # слово шире ячейки
+    ]
+
+
+def test_footnotes_after_vector_rule_are_dropped() -> None:
+    texts = [b.text for b in parse_document(FIXTURES / "standard_vector-footnote_01.pdf").blocks]
+    assert texts[0] == "1.1. Первый пункт со ссылкой на первую сноску1."
+    assert "2.1. Второй пункт и сноска2." in texts
+    assert not any("Сноска номер" in t for t in texts)  # черта — линия, на обеих страницах
+
+
 def test_scan_without_text_layer(tmp_path: Path) -> None:
     scan = tmp_path / "scan.pdf"
     scan.write_bytes(
@@ -101,6 +137,8 @@ def test_join_lines() -> None:
         "Информационно-коммуникационные"
     )
     assert _join(["Информационно-коммуник", "ационные"]) == "Информационно-коммуник ационные"
+    # разрыв слова — только когда вся строка одно слово
+    assert _join(["в очно-заочной", "форме"], narrow=True) == "в очно-заочной форме"
 
 
 def test_pdf_is_supported() -> None:

@@ -5,16 +5,22 @@
 
 - колонтитулы — строки у верхнего и нижнего края, повторяющиеся на большинстве страниц
   (цифры не учитываются: «Страница 2 из 14»), и одиночные номера страниц — убираются;
-- сноски убираются: строки мельче основного шрифта после черты «_____» и абзацы-сноски
-  в конце документа «*(1) …» (ГАРАНТ), «<1> …» (КонсультантПлюс);
+- сноски убираются: строки мельче основного шрифта после черты (текстовой «_____» или
+  нарисованной короткой линией у левого поля) и абзацы-сноски в конце документа «*(1) …»
+  (ГАРАНТ), «<1> …» (КонсультантПлюс);
 - новый абзац начинается с отступа первой строки, после увеличенного интервала, при смене
   шрифта (размер, жирность) или после короткой строки, закончившейся «.», «:» или «;»;
   абзац продолжается через границу страниц;
-- таблицы с рамками — `pdfplumber.find_tables`; объединённые ячейки определяются по рамкам,
-  продолжение таблицы на следующей странице (то же число столбцов) приклеивается к ней.
+- таблицы с рамками — `pdfplumber.find_tables`; объединённые ячейки определяются по рамкам
+  в пределах страницы. Таблица на следующей странице приклеивается как продолжение, только
+  если она первая на странице и начинается сверху, предыдущая упирается в низ своей
+  страницы, а границы столбцов совпадают; повторённая шапка отбрасывается;
+- в ячейках слово, разорванное без дефиса («Информационно-коммуник» + «ационные»), склеивается,
+  только если вся строка — одно слово.
 
-Ограничения: таблицы без рамок не распознаются (придут абзацами); скан без текстового слоя
-не читается — `NoTextLayerError` (нужен OCR).
+Ограничения: таблицы без рамок не распознаются (придут абзацами); две самостоятельные таблицы
+с одинаковыми столбцами, из которых первая кончается внизу страницы, а вторая открывает
+следующую, склеятся; скан без текстового слоя не читается — `NoTextLayerError` (нужен OCR).
 """
 
 import ast
@@ -49,6 +55,11 @@ _ITEM_START = re.compile(r"^(?:[А-ЯЁA-Z]{1,6}-\d|\d+[.)]\s)")
 _CUT_WORD = re.compile(r"-[а-яё]{1,8}$")
 _MIN_SIZE = 4.0  # pt: текст мельче — служебный/невидимый (метки на обложке)
 _SNAP = 2.0  # pt: координаты рамок таблицы ближе этого считаются одной линией
+_COLUMN_TOLERANCE = 3.0  # pt: столбцы продолжения таблицы совпадают с точностью до этого
+# таблица продолжается на следующей странице, только если упирается в низ страницы,
+# а продолжение начинается сверху (доли высоты страницы)
+_TABLE_ENDS_BELOW = 0.7
+_TABLE_STARTS_ABOVE = 0.3
 
 
 class NoTextLayerError(ValueError):
@@ -72,7 +83,8 @@ class _Table:
     page: int
     top: float
     bottom: float
-    columns: int
+    height: float  # высота страницы
+    xs: list[float]  # границы столбцов
     grid: list[list[Cell]] = field(default_factory=list)
 
 
@@ -117,8 +129,35 @@ def _read_page(page: Page, index: int) -> tuple[list[_Line], list[_Table]]:
                 page=index,
             )
         )
+    lines += _footnote_rules(page, index, boxes)
+    lines.sort(key=lambda ln: ln.top)
     tables = [_table(page, t, index) for t in found]
     return lines, [t for t in tables if t is not None]
+
+
+def _footnote_rules(page: Page, index: int, boxes: list[tuple]) -> list[_Line]:
+    """Черта перед сносками, нарисованная графикой, -> строка «_____» (как текстовая черта).
+
+    Черта — короткая горизонтальная линия у левого поля в нижней половине страницы, вне таблиц.
+    """
+    width, height = float(page.width), float(page.height)
+    thin_rects = [r for r in page.rects if r["bottom"] - r["top"] <= 1.5]
+    rules = []
+    for obj in [*page.lines, *thin_rects]:
+        if abs(obj["bottom"] - obj["top"]) > 1.5:
+            continue  # не горизонтальная
+        length = obj["x1"] - obj["x0"]
+        cx, cy = (obj["x0"] + obj["x1"]) / 2, (obj["top"] + obj["bottom"]) / 2
+        if (
+            30 <= length <= 0.6 * width
+            and obj["x0"] < 0.4 * width
+            and cy > 0.5 * height
+            and not any(x0 <= cx <= x1 and top <= cy <= bottom for x0, top, x1, bottom in boxes)
+        ):
+            rules.append(
+                _Line("_____", obj["x0"], obj["x1"], obj["top"], obj["bottom"], 0.0, False, index)
+            )
+    return rules
 
 
 def _is_bold(fontname: str) -> bool:
@@ -150,10 +189,12 @@ def _table(page: Page, found, index: int) -> _Table | None:
         for left, right in zip(xs, xs[1:], strict=False):
             cx = (left + right) / 2
             cell = next((c for c in cells if c[0] <= cx <= c[2] and c[1] <= cy <= c[3]), None)
-            row.append((cell, texts[cell]) if cell else ((index, top, left), ""))
+            # координаты — в пределах страницы: ключ с номером страницы, чтобы одинаково
+            # расположенные ячейки на двух страницах склеенной таблицы не стали «объединением»
+            row.append(((index, *cell), texts[cell]) if cell else ((index, top, left), ""))
         grid.append(row)
     _, top, _, bottom = found.bbox
-    return _Table(page=index, top=top, bottom=bottom, columns=len(xs) - 1, grid=grid)
+    return _Table(page=index, top=top, bottom=bottom, height=float(page.height), xs=xs, grid=grid)
 
 
 def _snap(values: list[float]) -> list[float]:
@@ -181,7 +222,10 @@ def _drop_running_lines(pages: list[list[_Line]], heights: list[float]) -> list[
     def key(line: _Line) -> str:
         return re.sub(r"\d+", "#", line.text)
 
-    seen = Counter(k for lines in pages for k in {key(ln) for ln in lines if in_edge(ln)})
+    def countable(line: _Line) -> bool:  # черта сносок повторяется на страницах, но нужна
+        return in_edge(line) and not _FOOTNOTE_RULE.fullmatch(line.text)
+
+    seen = Counter(k for lines in pages for k in {key(ln) for ln in lines if countable(ln)})
     threshold = max(2, (len(pages) + 1) // 2)
     running = {k for k, n in seen.items() if n >= threshold} if len(pages) > 1 else set()
     # строка колонтитула, повторённая в теле (обложка), тоже служебная
@@ -189,7 +233,8 @@ def _drop_running_lines(pages: list[list[_Line]], heights: list[float]) -> list[
         [
             ln
             for ln in lines
-            if key(ln) not in running and not (in_edge(ln) and _PAGE_NUMBER.fullmatch(ln.text))
+            if _FOOTNOTE_RULE.fullmatch(ln.text)
+            or (key(ln) not in running and not (in_edge(ln) and _PAGE_NUMBER.fullmatch(ln.text)))
         ]
         for lines in pages
     ]
@@ -301,12 +346,20 @@ def _blocks(pages: list[list[_Line]], tables: list[list[_Table]]) -> list[Block]
 
 
 def _continues(previous: _Table | None, table: _Table, position: int, page: int) -> bool:
-    """Таблица — продолжение предыдущей: первая на следующей странице, те же столбцы."""
+    """Таблица — продолжение предыдущей: первая на следующей странице, предыдущая упирается
+    в низ своей страницы, эта начинается сверху, границы столбцов те же.
+
+    Две самостоятельные таблицы подряд (вторая со своей шапкой) этим условиям не отвечают,
+    если первая кончается выше низа страницы или столбцы у них разные.
+    """
     return (
         previous is not None
         and previous.page == page - 1
         and position == 0
-        and previous.columns == table.columns
+        and previous.bottom > _TABLE_ENDS_BELOW * previous.height
+        and table.top < _TABLE_STARTS_ABOVE * table.height
+        and len(previous.xs) == len(table.xs)
+        and all(abs(a - b) <= _COLUMN_TOLERANCE for a, b in zip(previous.xs, table.xs, strict=True))
     )
 
 
@@ -327,7 +380,7 @@ def _append_continuation(table: _Table, part: _Table) -> None:
         ]
         rows = rows[1:]
     table.grid.extend(rows)
-    table.page, table.bottom = part.page, part.bottom
+    table.page, table.bottom, table.height = part.page, part.bottom, part.height
 
 
 def _is_row_tail(last: list[Cell], first: list[Cell]) -> bool:
@@ -369,17 +422,22 @@ def _paragraph(lines: list[_Line], layout: _Layout) -> Block | None:
 
 def _join(parts: list[str], narrow: bool = False) -> str:
     """Склейка строк абзаца: перенос «научно-» + «исследовательский» — без пробела, дефис
-    остаётся (в нормативных текстах это почти всегда составное слово). В узких ячейках
-    (`narrow`) слово бывает разорвано без дефиса: «Информационно-коммуник» + «ационные»."""
-    out = ""
+    остаётся (в нормативных текстах это почти всегда составное слово).
+
+    В узких ячейках (`narrow`) слово бывает разорвано без дефиса: «Информационно-коммуник» +
+    «ационные». Так рвётся только слово шире ячейки, поэтому разрыв признаём, лишь когда вся
+    строка — одно слово; «в очно-заочной» + «форме обучения» склеиваются через пробел.
+    """
+    out, last = "", ""
     for part in parts:
         part = part.strip()
         if not part:
             continue
         glue = out.endswith("-") and len(out) > 1 and out[-2].isalpha()
-        glue = glue or (narrow and bool(_CUT_WORD.search(out)))
+        glue = glue or (narrow and " " not in last and bool(_CUT_WORD.search(last)))
         if glue and part[:1].islower():
             out += part
         else:
             out = f"{out} {part}" if out else part
+        last = part
     return out
