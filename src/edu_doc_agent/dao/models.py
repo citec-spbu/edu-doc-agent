@@ -143,13 +143,17 @@ class RegulationDocument(Base):
             "doc_type IN ('fgos', 'spbu_standard', 'prof_standard')",
             name="ck_regulation_documents_doc_type",
         ),
+        CheckConstraint(
+            "level IS NULL OR level IN ('бакалавриат', 'магистратура', 'специалитет')",
+            name="ck_regulation_documents_level",
+        ),
     )
 
     doc_id: Mapped[str] = mapped_column(String, primary_key=True)  # «fgos-02.03.02»
     edition: Mapped[str] = mapped_column(String, primary_key=True)  # «808 ред. от 08.02.2021»
     doc_type: Mapped[str] = mapped_column(String)
     title: Mapped[str] = mapped_column(String)
-    order: Mapped[str | None] = mapped_column(String, nullable=True)  # утверждающий акт
+    approval_act: Mapped[str | None] = mapped_column(String, nullable=True)  # утверждающий акт
     direction_code: Mapped[str | None] = mapped_column(String, nullable=True)
     level: Mapped[str | None] = mapped_column(String, nullable=True)
     source_file: Mapped[str] = mapped_column(String)
@@ -171,6 +175,10 @@ class RegulationFragment(Base):
             name="fk_regulation_fragments_document",
         ),
         CheckConstraint(
+            "doc_type IN ('fgos', 'spbu_standard', 'prof_standard')",
+            name="ck_regulation_fragments_doc_type",
+        ),
+        CheckConstraint(
             "kind IN ('clause', 'competency', 'prof_standard_ref')",
             name="ck_regulation_fragments_kind",
         ),
@@ -183,17 +191,21 @@ class RegulationFragment(Base):
 
     id: Mapped[str] = mapped_column(String, primary_key=True)  # «fgos-02.03.02:3.2:УК-1»
     edition: Mapped[str] = mapped_column(String, primary_key=True)
-    part: Mapped[int] = mapped_column(Integer, primary_key=True)
+    part: Mapped[int] = mapped_column(Integer, primary_key=True, default=0, server_default="0")
     doc_type: Mapped[str] = mapped_column(String)
     doc_id: Mapped[str] = mapped_column(String)
     kind: Mapped[str] = mapped_column(String)
     number: Mapped[str] = mapped_column(String)
     path: Mapped[str] = mapped_column(String)
     text: Mapped[str] = mapped_column(String)
-    codes: Mapped[list[str]] = mapped_column(ARRAY(String))
+    codes: Mapped[list[str]] = mapped_column(
+        ARRAY(String), default=list, server_default=text("'{}'::varchar[]")
+    )
     parent: Mapped[str | None] = mapped_column(String, nullable=True)
-    group: Mapped[str | None] = mapped_column(String, nullable=True)
-    changed_by: Mapped[list[dict]] = mapped_column(JSONB)
+    category: Mapped[str | None] = mapped_column(String, nullable=True)  # категория / группа
+    changed_by: Mapped[list[dict]] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb")
+    )
     embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIM))
     # генерирует PostgreSQL; при вставке не передаётся
     tsv: Mapped[str | None] = mapped_column(

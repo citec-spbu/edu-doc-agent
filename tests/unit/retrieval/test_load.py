@@ -13,7 +13,7 @@ INFO = DocumentInfo(
     doc_type="spbu_standard",
     title="ОС СПбГУ",
     edition="11144/1 от 24.08.2026",
-    order="Приказ № 11144/1",
+    approval_act="Приказ № 11144/1",
     source_file="os.pdf",
 )
 FRAGMENT = Fragment(
@@ -45,7 +45,7 @@ def test_rows_match_table_columns() -> None:
         "edition": "11144/1 от 24.08.2026",
         "doc_type": "spbu_standard",
         "title": "ОС СПбГУ",
-        "order": "Приказ № 11144/1",
+        "approval_act": "Приказ № 11144/1",
         "direction_code": None,
         "level": None,
         "source_file": "os.pdf",

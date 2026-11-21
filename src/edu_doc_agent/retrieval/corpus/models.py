@@ -1,7 +1,7 @@
 """Фрагменты корпуса нормативов (ADR-0005: фрагмент = пункт норматива).
 
 Поля `id, doc_type, doc_id, edition, path, part, text, codes` — схема таблицы из ADR-0005;
-`kind`, `number`, `parent`, `group`, `changed_by` — уточнения для компетенций из таблиц
+`kind`, `number`, `parent`, `category`, `changed_by` — уточнения для компетенций из таблиц
 и отметок об изменениях (вносятся в ADR отдельным изменением).
 """
 
@@ -34,7 +34,7 @@ class Fragment(BaseModel):
         default_factory=list
     )  # канонические, как в данных программы (corpus/codes.py)
     parent: str | None = None  # id пункта, к которому относится компетенция
-    group: str | None = None  # категория компетенции или группа профстандартов
+    category: str | None = None  # категория компетенции или группа профстандартов
     changed_by: list[ChangeNote] = Field(default_factory=list)
 
 
@@ -45,7 +45,7 @@ class DocumentInfo(BaseModel):
     doc_type: DocType
     title: str
     edition: str  # «808 ред. от 27.02.2023»
-    order: str | None = None  # реквизиты утверждающего акта
+    approval_act: str | None = None  # реквизиты утверждающего акта
     direction_code: str | None = None
     direction_name: str | None = None
     level: str | None = None  # бакалавриат / магистратура / специалитет
@@ -56,7 +56,7 @@ class Overrides(BaseModel):
     """Ручные правки документа, накладываются после нарезки (исходник не трогаем).
 
     Нужны там, где автоматика бессильна: ошибки OCR в скане, таблица без рамок.
-    `replace`: id -> исправленный текст или словарь полей (`text`, `group`, `path`).
+    `replace`: id -> исправленный текст или словарь полей (`text`, `category`, `path`).
     """
 
     replace: dict[str, str | dict[str, str]] = Field(default_factory=dict)

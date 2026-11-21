@@ -102,14 +102,14 @@ def test_competency_table_rows_become_fragments() -> None:
     uk3 = frags["fgos-02.03.02:3.2:УК-3"]
     assert uk3.kind == "competency"
     assert uk3.parent == "fgos-02.03.02:3.2"
-    assert uk3.group == "Командная работа и лидерство"
+    assert uk3.category == "Командная работа и лидерство"
     assert uk3.codes == ["УК-3"]
     assert uk3.path == "III. Требования к результатам освоения › 3.2 › УК-3"
-    assert frags["fgos-02.03.02:3.2:УК-1"].group == "Системное и критическое мышление"
+    assert frags["fgos-02.03.02:3.2:УК-1"].category == "Системное и критическое мышление"
     intro = frags["fgos-02.03.02:3.2"]
     assert intro.text.endswith("универсальные компетенции:")  # таблица не дублируется в пункте
     assert frags["fgos-02.03.02:3.3:ОПК-2"].text == "ОПК-2. Способен разрабатывать алгоритмы."
-    assert frags["fgos-02.03.02:3.3:ОПК-1"].group is None
+    assert frags["fgos-02.03.02:3.3:ОПК-1"].category is None
     ids = [f.id for f in doc.fragments]
     assert ids.index("fgos-02.03.02:3.2") < ids.index("fgos-02.03.02:3.2:УК-1")
     assert doc.warnings == []
@@ -175,12 +175,12 @@ def test_appendix_prof_standards() -> None:
     assert ps.kind == "prof_standard_ref"
     assert ps.text == 'Профессиональный стандарт "Программист"'
     assert ps.codes == ["06.001"]
-    assert ps.group == "06 Связь, информационные и коммуникационные технологии"
+    assert ps.category == "06 Связь, информационные и коммуникационные технологии"
     assert ps.path == (
         "Приложение › Перечень профессиональных стандартов, соответствующих "
         "профессиональной деятельности выпускников › 06.001"
     )
-    assert frags["fgos-02.03.02:app:40.011"].group == "40 Сквозные виды деятельности"
+    assert frags["fgos-02.03.02:app:40.011"].category == "40 Сквозные виды деятельности"
     assert frags["fgos-02.03.02:1.1"].text == "1.1. Текст пункта."
 
 
@@ -219,7 +219,7 @@ def test_overrides_replace_add_drop() -> None:
     overrides = Overrides(
         replace={
             "fgos-02.03.02:3.1": "3.1. Программа устанавливает компетенции:",
-            "fgos-02.03.02:3.1:УК-3": {"group": "Командная работа", "kind": "clause"},
+            "fgos-02.03.02:3.1:УК-3": {"category": "Командная работа", "kind": "clause"},
         },
         add=[
             {
@@ -245,7 +245,7 @@ def test_overrides_replace_add_drop() -> None:
     assert frags["fgos-02.03.02:3.1"].text == "3.1. Программа устанавливает компетенции:"
     assert frags["fgos-02.03.02:3.1:УК-2"].codes == ["УК-2"]
     assert frags["fgos-02.03.02:3.1:УК-2"].edition == FGOS_INFO.edition
-    assert frags["fgos-02.03.02:3.1:УК-3"].group == "Командная работа"
+    assert frags["fgos-02.03.02:3.1:УК-3"].category == "Командная работа"
     assert frags["fgos-02.03.02:3.1:УК-3"].kind == "competency"  # kind менять нельзя
     assert "overrides: фрагмента fgos-02.03.02:9.9 нет" in doc.warnings
     assert "overrides: у fgos-02.03.02:3.1:УК-3 нельзя менять kind" in doc.warnings
@@ -304,7 +304,7 @@ def test_detect_info_fgos(head: str, edition: str) -> None:
     assert info.doc_id == "fgos-02.03.02"
     assert info.level == "бакалавриат"
     assert info.direction_name == "Фундаментальная информатика и информационные технологии"
-    assert info.order == "Приказ Минобрнауки России от 23.08.2017 N 808"
+    assert info.approval_act == "Приказ Минобрнауки России от 23.08.2017 N 808"
     assert info.edition == edition
 
 

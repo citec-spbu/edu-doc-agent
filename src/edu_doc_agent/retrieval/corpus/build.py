@@ -33,7 +33,15 @@ from edu_doc_agent.parsing import parse_document
 from edu_doc_agent.retrieval.corpus.chunker import chunk_document, detect_info
 from edu_doc_agent.retrieval.corpus.models import CorpusDocument, Overrides
 
-_META_KEYS = ("doc_id", "title", "edition", "order", "direction_code", "direction_name", "level")
+_META_KEYS = (
+    "doc_id",
+    "title",
+    "edition",
+    "approval_act",
+    "direction_code",
+    "direction_name",
+    "level",
+)
 
 
 def build(manifest: Path, overrides: Path | None = None) -> tuple[list[CorpusDocument], list[str]]:

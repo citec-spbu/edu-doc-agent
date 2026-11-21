@@ -161,7 +161,7 @@ def _code_key(code: str) -> tuple[str, int]:
     return prefix, int(number) if number.isdigit() else 0
 
 
-_REPLACEABLE = {"text", "group", "path"}
+_REPLACEABLE = {"text", "category", "path"}
 
 
 # Тело документа
@@ -253,7 +253,7 @@ class _State:
             self.warnings.append(f"текст вне пункта пропущен: {text[:60]}")
             return
         if match := _COMPETENCY.match(text):
-            self._competency(match.group(1), text, group=None)
+            self._competency(match.group(1), text, category=None)
             return
         self.clause.lines.append(text)
 
@@ -284,12 +284,12 @@ class _State:
                         )
                     continue
                 code = _COMPETENCY.match(row[cell]).group(1)
-                group = row[0] if cell > 0 and row[0] else None
-                self._competency(code, row[cell], group)
+                category = row[0] if cell > 0 and row[0] else None
+                self._competency(code, row[cell], category)
             return
         self.clause.lines.extend(_row_text(row) for row in block.rows if any(row))
 
-    def _competency(self, raw_code: str, text: str, group: str | None) -> None:
+    def _competency(self, raw_code: str, text: str, category: str | None) -> None:
         assert self.clause is not None
         code = normalize_code(raw_code)
         parent = self._clause_id(self.clause.number)
@@ -305,7 +305,7 @@ class _State:
                 text=text,
                 codes=[code],
                 parent=parent,
-                group=group,
+                category=category,
                 changed_by=self.clause.changes,
             )
         )
@@ -344,7 +344,7 @@ class _State:
                     path=f"Приложение › {title} › {code}",
                     text=text,
                     codes=[code],
-                    group=self.prof_group,
+                    category=self.prof_group,
                 )
             )
 
@@ -504,7 +504,7 @@ def detect_info(
             }
         if m := _ORDER.search(head):
             date, number = _date(m.group(1)), m.group(2)
-            found["order"] = f"Приказ Минобрнауки России от {date} N {number}"
+            found["approval_act"] = f"Приказ Минобрнауки России от {date} N {number}"
             edition = f"{number} от {date}"
             if e := _EDITION_CONSULTANT.search(head):
                 edition = f"{number} ред. от {e.group(1)}"
