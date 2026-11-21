@@ -15,6 +15,7 @@ from edu_doc_agent.extraction.md_utils import MdTable, clean_text, parse_tables
 from edu_doc_agent.extraction.models import _Model
 from edu_doc_agent.extraction.patterns import COMPETENCE_RE, code_key
 from edu_doc_agent.extraction.source import SourceRef, attach_quotes
+from edu_doc_agent.parsing import ParsedDocument, parse_document
 
 HOURS_PER_CREDIT = 36
 _EPS = 1e-9
@@ -139,7 +140,12 @@ def _split_name(cell: str) -> tuple[str | None, str, str | None]:
 
 
 def _ref(table: MdTable, idx: int, file: str) -> SourceRef:
-    return SourceRef(file=file, section=table.section, line=table.row_lines[idx])
+    return SourceRef(
+        file=file,
+        section=table.section,
+        line=table.row_lines[idx],
+        quote=table.row_quotes[idx] if table.row_quotes else None,
+    )
 
 
 def _is_context_row(row: list[str]) -> bool:
@@ -180,9 +186,15 @@ def _find_plan_header(table: MdTable) -> tuple[int, dict[int, tuple[str, str]]] 
                 if col < len(above) and above[col]:
                     current = above[col]
                 groups[col] = current
-            return i, {
-                col: (groups[col], _one_line(low[col])) for col in range(len(row)) if low[col]
-            }
+            columns = {}
+            for col in range(len(row)):
+                upper = above[col] if col < len(above) else ""
+                name = low[col] or upper
+                if upper.startswith(("трудоёмкость", "трудоемкость", "наименование")):
+                    name = upper
+                if name:
+                    columns[col] = (groups[col], _one_line(name))
+            return i, columns
     return None
 
 
@@ -234,8 +246,6 @@ def _extract_entries(table: MdTable, file: str, plan: CurriculumPlan) -> bool:
             low = first.lower()
             if m := _YEAR_RE.match(first):
                 year = int(m.group(1))
-            elif m := _SEMESTER_RE.search(first):
-                semester, part, group, profile, trajectory = int(m.group(1)), None, None, None, None
             elif "часть" in low or low.startswith("факультатив"):
                 part, group, profile, trajectory = first, None, None, None
             elif low.startswith("блок(и) дисциплин"):
@@ -246,6 +256,10 @@ def _extract_entries(table: MdTable, file: str, plan: CurriculumPlan) -> bool:
                 profile, trajectory = first, None
             elif low.startswith("траектория"):
                 trajectory = first
+            elif m := _SEMESTER_RE.search(first):
+                # Название группы/профиля может само содержать «Семестр N».
+                # Сначала определяем именованный контекст, затем смену семестра.
+                semester, part, group, profile, trajectory = int(m.group(1)), None, None, None, None
             continue
         code, name, name_en = _split_name(_cell(row, cols["name"]))
         block = _one_line(_cell(row, cols.get("block"))) or None
@@ -385,8 +399,15 @@ def check_plan(plan: CurriculumPlan) -> None:
 # --- точка входа ----------------------------------------------------------------------------
 
 
-def extract_plan(text: str, file: str = "") -> CurriculumPlan:
-    """Учебный план из Markdown (`parse_document(...).to_markdown()`)."""
+def extract_plan(text: str | ParsedDocument, file: str = "") -> CurriculumPlan:
+    """Учебный план из Markdown или ParsedDocument; XLSX сохраняет геометрию и координаты."""
+    if isinstance(text, ParsedDocument):
+        if Path(text.source).suffix.lower() == ".xlsx":
+            from edu_doc_agent.extraction.curriculum_xlsx import extract_xlsx_plan
+
+            return extract_xlsx_plan(text, file or Path(text.source).name)
+        file = file or Path(text.source).name
+        text = text.to_markdown()
     plan = CurriculumPlan(file=file)
     tables = parse_tables(text)
     _extract_title(text, tables, plan)
@@ -409,4 +430,7 @@ def extract_plan(text: str, file: str = "") -> CurriculumPlan:
 
 
 def extract_plan_file(path: Path) -> CurriculumPlan:
+    path = Path(path)
+    if path.suffix.lower() in {".xlsx", ".docx"}:
+        return extract_plan(parse_document(path), file=path.name)
     return extract_plan(path.read_text(encoding="utf-8"), file=path.name)
