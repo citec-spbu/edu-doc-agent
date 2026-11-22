@@ -59,6 +59,48 @@ def test_repeated_save_replaces_contents_for_the_same_key(storage: LocalFileStor
     asyncio.run(scenario())
 
 
+def test_cancelled_save_finishes_before_retry(
+    storage: LocalFileStorage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        args = {"session_id": "synthetic", "doc_id": DOCUMENT_ID, "filename": "report.docx"}
+        key = await storage.save(**args, content=b"original")
+        loop = asyncio.get_running_loop()
+        entered = asyncio.Event()
+        release = threading.Event()
+        original_replace = os.replace
+
+        def paused_replace(
+            source: str, destination: str, *, src_dir_fd: int, dst_dir_fd: int
+        ) -> None:
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(timeout=5), "Не получен сигнал завершить публикацию"
+            original_replace(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+        with monkeypatch.context() as patch:
+            patch.setattr("edu_doc_agent.dao.storage.os.replace", paused_replace)
+            task = asyncio.create_task(storage.save(**args, content=b"cancelled attempt"))
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=5)
+                task.cancel()
+                await asyncio.sleep(0)
+                assert not task.done(), "Отмена не должна обгонять запись"
+                task.cancel()
+                await asyncio.sleep(0)
+                assert not task.done(), "Повторная отмена не должна обгонять запись"
+            finally:
+                release.set()
+
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=5)
+
+        assert await storage.read(key) == b"cancelled attempt"
+        assert await storage.save(**args, content=b"successful retry") == key
+        assert await storage.read(key) == b"successful retry"
+
+    asyncio.run(scenario())
+
+
 def test_open_reader_keeps_complete_old_version_during_replacement(
     storage: LocalFileStorage, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -216,6 +258,56 @@ def test_failed_publication_keeps_original_and_removes_temporary_file(
                 await storage.save(**args, content=b"updated")
 
         assert await storage.read(key) == b"original"
+        assert list(target.parent.iterdir()) == [target]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("target_kind", ["fifo", "directory"])
+def test_save_refuses_to_replace_non_regular_target(
+    storage: LocalFileStorage, target_kind: str
+) -> None:
+    async def scenario() -> None:
+        args = {"session_id": "synthetic", "doc_id": DOCUMENT_ID, "filename": "report.docx"}
+        key = await storage.save(**args, content=b"original")
+        assert await storage.delete(key)
+        target = storage.base_dir / key
+        if target_kind == "fifo":
+            os.mkfifo(target, mode=0o600)
+        else:
+            target.mkdir()
+        original_entry = target.lstat()
+
+        with pytest.raises(InvalidStoragePathError):
+            await storage.save(**args, content=b"replacement")
+
+        assert os.path.samestat(target.lstat(), original_entry)
+        assert list(target.parent.iterdir()) == [target]
+
+    asyncio.run(scenario())
+
+
+def test_save_translates_directory_appearing_at_publication(
+    storage: LocalFileStorage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        args = {"session_id": "synthetic", "doc_id": DOCUMENT_ID, "filename": "report.docx"}
+        key = await storage.save(**args, content=b"original")
+        assert await storage.delete(key)
+        target = storage.base_dir / key
+        original_replace = os.replace
+
+        def replace_after_mkdir(
+            source: str, destination: str, *, src_dir_fd: int, dst_dir_fd: int
+        ) -> None:
+            os.mkdir(destination, dir_fd=dst_dir_fd)
+            original_replace(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+        monkeypatch.setattr("edu_doc_agent.dao.storage.os.replace", replace_after_mkdir)
+        with pytest.raises(InvalidStoragePathError):
+            await storage.save(**args, content=b"replacement")
+
+        assert target.is_dir()
         assert list(target.parent.iterdir()) == [target]
 
     asyncio.run(scenario())

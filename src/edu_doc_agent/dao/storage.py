@@ -10,8 +10,9 @@ import errno
 import os
 import re
 import stat
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager, suppress
+from contextvars import copy_context
 from hashlib import sha256
 from pathlib import Path
 from typing import Protocol
@@ -46,7 +47,10 @@ class FileStorage(Protocol):
         filename: str,
         content: bytes,
     ) -> str:
-        """Сохраняет файл и возвращает его относительный ключ (`storage_key`)."""
+        """Сохраняет файл и возвращает его относительный ключ (`storage_key`).
+
+        Заменяет только обычный файл и дожидается окончания записи при отмене.
+        """
         ...
 
     async def read(self, storage_key: str) -> bytes:
@@ -143,6 +147,12 @@ def _entry_mode(path: Path | str, dir_fd: int | None) -> int:
     return mode
 
 
+def _require_regular_or_missing(name: str, dir_fd: int) -> None:
+    with suppress(FileNotFoundError):
+        if not stat.S_ISREG(_entry_mode(name, dir_fd)):
+            raise InvalidStoragePathError(f"Ожидался обычный файл: {name!r}")
+
+
 def _open_without_following(path: Path | str, flags: int, dir_fd: int | None) -> int:
     try:
         return os.open(path, flags | os.O_NOFOLLOW, dir_fd=dir_fd)
@@ -160,6 +170,28 @@ def _open_directory(path: Path | str, dir_fd: int | None = None) -> int:
         with suppress(FileNotFoundError, NotADirectoryError):
             _entry_mode(path, dir_fd)
         raise
+
+
+async def _finish_file_change[T](change: Callable[[], T]) -> T:
+    """Дожидается файловой операции перед передачей отмены, включая повторную."""
+    context = copy_context()
+    operation = asyncio.get_running_loop().run_in_executor(None, context.run, change)
+    cancellation = None
+    while True:
+        try:
+            result = await asyncio.shield(operation)
+        except asyncio.CancelledError as exc:
+            if operation.cancelled():
+                raise
+            cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+        else:
+            if cancellation is not None:
+                raise cancellation
+            return result
 
 
 class LocalFileStorage:
@@ -227,8 +259,7 @@ class LocalFileStorage:
 
         def _write_atomic() -> None:
             with self._open_parent(parts, create=True) as parent:
-                with suppress(FileNotFoundError):
-                    _entry_mode(name, parent)
+                _require_regular_or_missing(name, parent)
                 temporary_name = f".tmp_{uuid4().hex}"
                 fd = os.open(
                     temporary_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=parent
@@ -236,15 +267,20 @@ class LocalFileStorage:
                 try:
                     with os.fdopen(fd, "wb", closefd=False) as stream:
                         stream.write(content)
+                    _require_regular_or_missing(name, parent)
                     os.replace(temporary_name, name, src_dir_fd=parent, dst_dir_fd=parent)
-                except Exception:
+                except Exception as exc:
                     with suppress(FileNotFoundError):
                         os.unlink(temporary_name, dir_fd=parent)
+                    if isinstance(exc, IsADirectoryError):
+                        raise InvalidStoragePathError(
+                            f"Ожидался обычный файл: {storage_key!r}"
+                        ) from exc
                     raise
                 finally:
                     os.close(fd)
 
-        await asyncio.to_thread(_write_atomic)
+        await _finish_file_change(_write_atomic)
         return storage_key
 
     async def read(self, storage_key: str) -> bytes:
@@ -305,21 +341,4 @@ class LocalFileStorage:
                 ) from exc
             return True
 
-        operation = asyncio.get_running_loop().run_in_executor(None, _unlink)
-        cancellation = None
-        # После CancelledError вызывающий код может заново сохранить файл по этому ключу.
-        while True:
-            try:
-                deleted = await asyncio.shield(operation)
-            except asyncio.CancelledError as exc:
-                if operation.cancelled():
-                    raise
-                cancellation = exc
-            except Exception as exc:
-                if cancellation is not None:
-                    raise cancellation from exc
-                raise
-            else:
-                if cancellation is not None:
-                    raise cancellation
-                return deleted
+        return await _finish_file_change(_unlink)
