@@ -116,7 +116,7 @@ def test_worker_lifecycle_hooks_configure_logging(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tasks: ModuleType
 ) -> None:
     module = importlib.import_module("edu_doc_agent.worker.settings")
-    monkeypatch.setattr(module, "settings", Settings(_env_file=None, log_level="DEBUG"))
+    monkeypatch.setattr(module, "get_settings", lambda: Settings(_env_file=None, log_level="DEBUG"))
     basic_config = Mock()
     monkeypatch.setattr(module.logging, "basicConfig", basic_config)
     context = {"redis": "synthetic-pool"}
