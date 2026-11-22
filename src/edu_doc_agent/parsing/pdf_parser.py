@@ -51,8 +51,10 @@ _FOOTNOTE_RULE = re.compile(r"_{5,}")
 _FOOTNOTE_MARK = re.compile(r"^(?:\*\(\d+\)|<\d+>)\s")
 # начало новой строки таблицы: «ОПК-4.», «12.»
 _ITEM_START = re.compile(r"^(?:[А-ЯЁA-Z]{1,6}-\d|\d+[.)]\s)")
-# слово, разорванное без дефиса в узкой ячейке: «Информационно-коммуник» + «ационные»
-_CUT_WORD = re.compile(r"-[а-яё]{1,8}$")
+# строка ячейки — одно составное слово, второй корень которого оборван:
+# «Информационно-коммуника» + «ционные»
+_CUT_WORD = re.compile(r"^\S+-[а-яё]+$")
+_CUT_SLACK = 1.5  # в символах: строка с оборванным словом занимает ячейку почти целиком
 _MIN_SIZE = 4.0  # pt: текст мельче — служебный/невидимый (метки на обложке)
 _SNAP = 2.0  # pt: координаты рамок таблицы ближе этого считаются одной линией
 _COLUMN_TOLERANCE = 3.0  # pt: столбцы продолжения таблицы совпадают с точностью до этого
@@ -86,6 +88,8 @@ class _Table:
     height: float  # высота страницы
     xs: list[float]  # границы столбцов
     grid: list[list[Cell]] = field(default_factory=list)
+    # ячейки, чья последняя строка — оборванное слово (продолжится на следующей странице)
+    cut_ends: set = field(default_factory=set)
 
 
 class PdfParser(BaseParser):
@@ -181,7 +185,11 @@ def _table(page: Page, found, index: int) -> _Table | None:
         return None
     xs = _snap(sorted({c[0] for c in cells} | {c[2] for c in cells}))
     ys = _snap(sorted({c[1] for c in cells} | {c[3] for c in cells}))
-    texts = {c: _cell_text(page, c) for c in cells}
+    texts, cut_ends = {}, set()
+    for c in cells:
+        texts[c], cut = _cell_text(page, c)
+        if cut:
+            cut_ends.add((index, *c))
     grid = []
     for top, bottom in zip(ys, ys[1:], strict=False):
         cy = (top + bottom) / 2
@@ -194,7 +202,15 @@ def _table(page: Page, found, index: int) -> _Table | None:
             row.append(((index, *cell), texts[cell]) if cell else ((index, top, left), ""))
         grid.append(row)
     _, top, _, bottom = found.bbox
-    return _Table(page=index, top=top, bottom=bottom, height=float(page.height), xs=xs, grid=grid)
+    return _Table(
+        page=index,
+        top=top,
+        bottom=bottom,
+        height=float(page.height),
+        xs=xs,
+        grid=grid,
+        cut_ends=cut_ends,
+    )
 
 
 def _snap(values: list[float]) -> list[float]:
@@ -205,10 +221,30 @@ def _snap(values: list[float]) -> list[float]:
     return out
 
 
-def _cell_text(page: Page, bbox: tuple) -> str:
-    """Текст ячейки: строки, перенесённые вёрсткой, склеиваются в одну (как в абзаце)."""
+def _cell_text(page: Page, bbox: tuple) -> tuple[str, bool]:
+    """Текст ячейки: строки, перенесённые вёрсткой, склеиваются в одну (как в абзаце).
+
+    Возвращает и признак, что последняя строка — оборванное слово (см. `_is_cut`).
+    """
     lines = page.crop(bbox).extract_text_lines(strip=True)
-    return clean_text(_join([ln["text"] for ln in lines], narrow=True))
+    cuts = [_is_cut(ln, bbox) for ln in lines]
+    text = clean_text(_join([ln["text"] for ln in lines], cuts))
+    return text, bool(cuts and cuts[-1])
+
+
+def _is_cut(line: dict, bbox: tuple) -> bool:
+    """Строка — составное слово, оборванное без дефиса, потому что не влезло в ячейку.
+
+    Так рвётся только слово шире ячейки: строка из одного такого слова занимает её почти
+    целиком (отступ справа не больше отступа слева плюс полтора символа). Обычный перенос
+    «очно-заочной» + «форме обучения» оставляет справа место и склеивается через пробел.
+    """
+    text = line["text"]
+    if not _CUT_WORD.fullmatch(text):
+        return False
+    char = (line["x1"] - line["x0"]) / len(text)
+    slack = (bbox[2] - line["x1"]) - (line["x0"] - bbox[0])
+    return slack <= _CUT_SLACK * char
 
 
 # Колонтитулы и номера страниц
@@ -375,20 +411,25 @@ def _append_continuation(table: _Table, part: _Table) -> None:
         rows = rows[1:]
     if rows and _is_row_tail(table.grid[-1], rows[0]):
         table.grid[-1] = [
-            (key, _join([text, more], narrow=True) if more else text)
+            (key, _join([text, more], [key in table.cut_ends, False]) if more else text)
             for (key, text), (_, more) in zip(table.grid[-1], rows[0], strict=True)
         ]
         rows = rows[1:]
     table.grid.extend(rows)
+    table.cut_ends |= part.cut_ends
     table.page, table.bottom, table.height = part.page, part.bottom, part.height
 
 
 def _is_row_tail(last: list[Cell], first: list[Cell]) -> bool:
+    """Первая строка продолжения — хвост последней строки таблицы, разорванной страницей:
+    пустой первый столбец или все непустые ячейки начинаются со строчной буквы (новая строка
+    таблицы начинается с заглавной или с номера: «Информационно-…», «ОПК-4.», «12.»)."""
     texts = [t for _, t in first]
     filled = [(i, t) for i, t in enumerate(texts) if t]
+    continues = not texts[0] or all(t[:1].islower() for _, t in filled)
     return (
         bool(filled)
-        and not texts[0]
+        and continues
         and all(last[i][1] for i, _ in filled)
         and not _ITEM_START.match(filled[0][1])
     )
@@ -420,24 +461,22 @@ def _paragraph(lines: list[_Line], layout: _Layout) -> Block | None:
     return paragraph_block(text, bold=bold)
 
 
-def _join(parts: list[str], narrow: bool = False) -> str:
+def _join(parts: list[str], cuts: list[bool] | None = None) -> str:
     """Склейка строк абзаца: перенос «научно-» + «исследовательский» — без пробела, дефис
     остаётся (в нормативных текстах это почти всегда составное слово).
 
-    В узких ячейках (`narrow`) слово бывает разорвано без дефиса: «Информационно-коммуник» +
-    «ационные». Так рвётся только слово шире ячейки, поэтому разрыв признаём, лишь когда вся
-    строка — одно слово; «в очно-заочной» + «форме обучения» склеиваются через пробел.
+    `cuts[i]` — строка `i` кончается словом, оборванным без дефиса (в ячейке таблицы, см.
+    `_is_cut`): «Информационно-коммуника» + «ционные» склеиваются без пробела.
     """
-    out, last = "", ""
-    for part in parts:
+    out, cut = "", False
+    for i, part in enumerate(parts):
         part = part.strip()
         if not part:
             continue
-        glue = out.endswith("-") and len(out) > 1 and out[-2].isalpha()
-        glue = glue or (narrow and " " not in last and bool(_CUT_WORD.search(last)))
+        glue = cut or (out.endswith("-") and len(out) > 1 and out[-2].isalpha())
         if glue and part[:1].islower():
             out += part
         else:
             out = f"{out} {part}" if out else part
-        last = part
+        cut = bool(cuts and i < len(cuts) and cuts[i])
     return out

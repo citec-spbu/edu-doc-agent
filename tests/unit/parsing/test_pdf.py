@@ -16,7 +16,7 @@ from edu_doc_agent.parsing import (
     parse_document,
     supported_suffixes,
 )
-from edu_doc_agent.parsing.pdf_parser import _is_bold, _join
+from edu_doc_agent.parsing.pdf_parser import _is_bold, _is_cut, _join
 
 FIXTURES = Path(__file__).parents[2] / "fixtures"
 STANDARD = FIXTURES / "standard_normal_01.pdf"
@@ -133,12 +133,24 @@ def test_join_lines() -> None:
     assert _join(["организационно-", "педагогических условий"]) == (
         "организационно-педагогических условий"
     )
-    assert _join(["Информационно-коммуник", "ационные"], narrow=True) == (
+    # оборванное слово отмечает геометрия ячейки (_is_cut), без отметки — пробел
+    assert _join(["Информационно-коммуник", "ационные"], [True, False]) == (
         "Информационно-коммуникационные"
     )
     assert _join(["Информационно-коммуник", "ационные"]) == "Информационно-коммуник ационные"
-    # разрыв слова — только когда вся строка одно слово
-    assert _join(["в очно-заочной", "форме"], narrow=True) == "в очно-заочной форме"
+    assert _join(["в очно-заочной", "форме"], [False, False]) == "в очно-заочной форме"
+
+
+def test_cut_word_needs_full_cell_width() -> None:
+    cell = (50.0, 0.0, 190.0, 20.0)  # ширина 140, отступ слева 4
+
+    def line(text: str, width: float) -> dict:
+        return {"text": text, "x0": 54.0, "x1": 54.0 + width}
+
+    assert _is_cut(line("Информационно-коммуника", 130.0), cell)  # справа 6 pt
+    assert not _is_cut(line("Информационно-коммуника", 100.0), cell)  # место осталось
+    assert not _is_cut(line("профессионального", 132.0), cell)  # не составное слово
+    assert not _is_cut(line("в очно-заочной", 130.0), cell)  # не одно слово
 
 
 def test_pdf_is_supported() -> None:
