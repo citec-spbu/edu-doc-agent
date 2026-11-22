@@ -63,6 +63,9 @@ class Settings(BaseSettings):
     # В git документы не попадают (см. data/README.md).
     data_dir: Path | None = None
 
+    # --- Хранилище файлов ---
+    storage_dir: Path = Path("storage")
+
     # --- LLM ---
     llm_provider: str | None = None
     llm_api_key: str | None = None
@@ -80,6 +83,13 @@ class Settings(BaseSettings):
         # Приводим её к None, чтобы не падать при старте.
         if value == "":
             return None
+        return value
+
+    @field_validator("storage_dir", mode="before")
+    @classmethod
+    def _default_storage_dir_if_empty(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return Path("storage")
         return value
 
 

@@ -13,11 +13,23 @@ Data Access Layer (DAO).
 
 from edu_doc_agent.dao.models import Base, Run, Session
 from edu_doc_agent.dao.repositories import ActiveRunConflictError, SessionRunDAO
+from edu_doc_agent.dao.storage import (
+    FileStorage,
+    FileStorageError,
+    InvalidStoragePathError,
+    LocalFileStorage,
+    StorageFileNotFoundError,
+)
 
 __all__ = [
     "ActiveRunConflictError",
     "Base",
+    "FileStorage",
+    "FileStorageError",
+    "InvalidStoragePathError",
+    "LocalFileStorage",
     "Run",
     "Session",
     "SessionRunDAO",
+    "StorageFileNotFoundError",
 ]

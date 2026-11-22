@@ -3,7 +3,9 @@
 import asyncio
 import logging
 from contextlib import suppress
+from pathlib import Path
 from unittest.mock import AsyncMock
+from urllib.parse import quote
 from uuid import UUID
 
 import httpx
@@ -14,6 +16,7 @@ from redis.exceptions import RedisError, ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from edu_doc_agent.api import router as api_router
+from edu_doc_agent.dao import LocalFileStorage
 from edu_doc_agent.main import app
 from tests.fakes import InMemorySessionRunDAO
 
@@ -45,6 +48,32 @@ def test_process_enqueues_job_with_response_identifiers(
         run_id=body["run_id"],
         _job_id=body["run_id"],
     )
+
+
+def test_session_id_with_backslash_is_preserved_by_api_and_storage(
+    client: TestClient, dao: InMemorySessionRunDAO, tmp_path: Path
+) -> None:
+    session_id = r"faculty\group"
+    encoded_id = quote(session_id, safe="")
+    response = client.post(f"/api/v1/sessions/{encoded_id}/process")
+
+    assert response.status_code == 202
+    assert response.json()["session_id"] == session_id
+    assert dao.sessions[session_id].id == session_id
+
+    async def scenario() -> None:
+        storage = LocalFileStorage(tmp_path / "storage")
+        key = await storage.save(
+            session_id=dao.sessions[session_id].id,
+            doc_id="report",
+            filename="report.docx",
+            content=b"report",
+        )
+        assert len(Path(key).parts) == 3
+        assert session_id not in key
+        assert await storage.read(key) == b"report"
+
+    asyncio.run(scenario())
 
 
 def test_different_sessions_create_distinct_runs(client: TestClient, redis_pool: AsyncMock) -> None:

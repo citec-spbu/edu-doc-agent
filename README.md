@@ -103,6 +103,11 @@ export POSTGRES_PASSWORD='synthetic@pass%40${NAME}'
 В этом режиме API и worker используют `redis://redis:6379/0`, заданный в
 [compose.yaml](compose.yaml); публиковать Redis на localhost не требуется.
 
+Локальные API и worker берут корневой каталог файлового хранилища из
+`STORAGE_DIR`. По умолчанию это `./storage` относительно рабочего каталога.
+В Compose оба контейнера используют `STORAGE_DIR=/app/storage` и общий bind
+mount `./storage:/app/storage`.
+
 ## Команды
 См. `make help`. Основное: `make test`, `make lint`, `make fmt`, `make up-db`, `make run-api`, `make run-ui`, `make up`.
 
