@@ -3,7 +3,19 @@
 from collections.abc import Sequence
 from typing import Any
 
-from sqlalchemy import delete, insert, select, update
+from sqlalchemy import (
+    Select,
+    Text,
+    case,
+    cast,
+    delete,
+    func,
+    insert,
+    literal_column,
+    select,
+    tuple_,
+    update,
+)
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from edu_doc_agent.dao.database import async_session_maker
@@ -29,6 +41,10 @@ DOCUMENT_FIELDS = ("doc_type", "title", "approval_act", "direction_code", "level
 
 _DOCUMENTS = RegulationDocument.__table__
 _FRAGMENTS = RegulationFragment.__table__
+_RUSSIAN = literal_column("'russian'::regconfig")
+
+# ключ пункта в выдаче поиска: (id, edition); части одного пункта дают один ключ
+ClauseKey = tuple[str, str]
 
 
 class RegulationDAO:
@@ -95,3 +111,115 @@ class RegulationDAO:
                 .returning(RegulationDocument.doc_id)
             )
             return sorted(set(removed.scalars()))
+
+    # --- поиск (ADR-0005, решение 3) ---------------------------------------------------------
+
+    async def list_documents(self) -> list[dict[str, Any]]:
+        """Загруженные документы: doc_id, редакция, тип, название, код направления, уровень."""
+        async with self._session_factory() as db:
+            rows = (await db.execute(select(_DOCUMENTS).order_by(_DOCUMENTS.c.doc_id))).mappings()
+            return [dict(r) for r in rows]
+
+    async def get_parts(self, keys: Sequence[ClauseKey]) -> list[dict[str, Any]]:
+        """Все части фрагментов с указанными (id, edition), по порядку частей."""
+        if not keys:
+            return []
+        columns = [_FRAGMENTS.c[name] for name in FRAGMENT_FIELDS]
+        query = (
+            select(*columns)
+            .where(tuple_(_FRAGMENTS.c.id, _FRAGMENTS.c.edition).in_(list(keys)))
+            .order_by(_FRAGMENTS.c.id, _FRAGMENTS.c.edition, _FRAGMENTS.c.part)
+        )
+        async with self._session_factory() as db:
+            return [dict(r) for r in (await db.execute(query)).mappings()]
+
+    async def find_by_codes(
+        self,
+        codes: Sequence[str],
+        *,
+        doc_ids: Sequence[str] | None = None,
+        doc_types: Sequence[str] | None = None,
+        limit: int = 50,
+    ) -> list[ClauseKey]:
+        """Фрагменты с любым из кодов; сначала сами компетенции и профстандарты, потом пункты,
+        где код упоминается."""
+        f = _FRAGMENTS.c
+        query = (
+            select(f.id, f.edition)
+            .where(f.codes.overlap(list(codes)))
+            .order_by(case((f.kind == "clause", 1), else_=0), f.doc_id, f.id, f.part)
+            .limit(limit)
+        )
+        return await self._keys(_filtered(query, doc_ids, doc_types))
+
+    async def find_by_numbers(
+        self,
+        numbers: Sequence[str],
+        *,
+        doc_ids: Sequence[str] | None = None,
+        doc_types: Sequence[str] | None = None,
+        limit: int = 50,
+    ) -> list[ClauseKey]:
+        """Пункты с указанными номерами («2.3»)."""
+        f = _FRAGMENTS.c
+        query = (
+            select(f.id, f.edition)
+            .where(f.number.in_(list(numbers)), f.kind == "clause")
+            .order_by(f.doc_id, f.id, f.part)
+            .limit(limit)
+        )
+        return await self._keys(_filtered(query, doc_ids, doc_types))
+
+    async def full_text(
+        self,
+        text: str,
+        *,
+        doc_ids: Sequence[str] | None = None,
+        doc_types: Sequence[str] | None = None,
+        limit: int = 50,
+    ) -> list[ClauseKey]:
+        """Полнотекстовый поиск по tsv: слова запроса через ИЛИ, порядок — ts_rank_cd.
+
+        ИЛИ, а не И: вопрос на естественном языке редко содержит все слова пункта.
+        """
+        f = _FRAGMENTS.c
+        plain = cast(func.plainto_tsquery(_RUSSIAN, text), Text)
+        tsquery = func.to_tsquery(_RUSSIAN, func.replace(plain, " & ", " | "))
+        query = (
+            select(f.id, f.edition)
+            .where(f.tsv.op("@@")(tsquery))
+            .order_by(func.ts_rank_cd(f.tsv, tsquery).desc(), f.id, f.part)
+            .limit(limit)
+        )
+        return await self._keys(_filtered(query, doc_ids, doc_types))
+
+    async def nearest(
+        self,
+        embedding: Sequence[float],
+        *,
+        doc_ids: Sequence[str] | None = None,
+        doc_types: Sequence[str] | None = None,
+        limit: int = 50,
+    ) -> list[ClauseKey]:
+        """Ближайшие по косинусному расстоянию (точный перебор, ANN-индекса нет)."""
+        f = _FRAGMENTS.c
+        query = (
+            select(f.id, f.edition)
+            .order_by(f.embedding.cosine_distance(list(embedding)), f.id, f.part)
+            .limit(limit)
+        )
+        return await self._keys(_filtered(query, doc_ids, doc_types))
+
+    async def _keys(self, query: Select) -> list[ClauseKey]:
+        async with self._session_factory() as db:
+            return [(row.id, row.edition) for row in await db.execute(query)]
+
+
+def _filtered(
+    query: Select, doc_ids: Sequence[str] | None, doc_types: Sequence[str] | None
+) -> Select:
+    if doc_ids is not None:
+        query = query.where(_FRAGMENTS.c.doc_id.in_(list(doc_ids)))
+    if doc_types is not None:
+        query = query.where(_FRAGMENTS.c.doc_type.in_(list(doc_types)))
+    return query

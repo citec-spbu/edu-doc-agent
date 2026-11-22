@@ -1,13 +1,10 @@
 """Таблицы нормативов и загрузчик корпуса на PostgreSQL 17 + pgvector (ADR-0005)."""
 
 import asyncio
-from collections.abc import Iterator
 
 import pytest
 from sqlalchemy import Engine, func, select, text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from sqlalchemy.pool import NullPool
 
 from edu_doc_agent.dao.models import RegulationDocument, RegulationFragment
 from edu_doc_agent.dao.regulations import RegulationDAO
@@ -22,15 +19,6 @@ from edu_doc_agent.retrieval.corpus.models import (
 from tests.integration.dao.support import Database
 
 pytestmark = pytest.mark.integration
-
-
-@pytest.fixture
-def dao(migrated_database: Database) -> Iterator[RegulationDAO]:
-    engine = create_async_engine(migrated_database.url, poolclass=NullPool)
-    try:
-        yield RegulationDAO(async_sessionmaker(engine, expire_on_commit=False))
-    finally:
-        asyncio.run(engine.dispose())
 
 
 def load(dao: RegulationDAO, documents, embedder, **kwargs):
