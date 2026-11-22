@@ -63,6 +63,9 @@ class Settings(BaseSettings):
     # В git документы не попадают (см. data/README.md).
     data_dir: Path | None = None
 
+    # --- Хранилище файлов ---
+    storage_dir: Path = Path("storage")
+
     # --- LLM ---
     llm_provider: str | None = None
     llm_api_key: str | None = None
