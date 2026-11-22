@@ -110,11 +110,13 @@ def _loadable(documents: Iterable[CorpusDocument]) -> tuple[list[CorpusDocument]
 
 
 async def _run(args: argparse.Namespace) -> int:
+    from sqlalchemy.exc import OperationalError
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
     from sqlalchemy.pool import NullPool
 
     from edu_doc_agent.config import get_settings
     from edu_doc_agent.llm.embeddings import OllamaEmbedder
+    from edu_doc_agent.llm.openai_compat import LLMError
 
     documents, failures = build(args.manifest, args.overrides)
     documents, errors = _loadable(documents)
@@ -125,12 +127,28 @@ async def _run(args: argparse.Namespace) -> int:
         print("--prune не выполняется: часть документов не собрана", file=sys.stderr)
 
     # своё подключение без пула, как в alembic/env.py: CLI живёт недолго
-    engine = create_async_engine(get_settings().database_connection_url, poolclass=NullPool)
+    settings = get_settings()
+    engine = create_async_engine(settings.database_connection_url, poolclass=NullPool)
+    embedder = OllamaEmbedder.from_settings(settings)
     try:
         dao = RegulationDAO(async_sessionmaker(engine, expire_on_commit=False))
-        result = await load_documents(
-            dao, documents, OllamaEmbedder.from_settings(), prune=args.prune and not errors
+        result = await load_documents(dao, documents, embedder, prune=args.prune and not errors)
+    except LLMError as error:
+        print(
+            f"ОШИБКА эмбеддингов: {error}\n"
+            "Запущена ли Ollama с моделью? docker compose --profile local-llm up -d ollama; "
+            f"адрес — EMBEDDING_BASE_URL (сейчас {settings.embedding_base_url or 'по умолчанию'})",
+            file=sys.stderr,
         )
+        return 2
+    except OperationalError as error:
+        print(
+            f"ОШИБКА базы: {error.orig}\n"
+            "Запущен ли PostgreSQL и применены ли миграции? docker compose up -d db; "
+            "uv run alembic upgrade head",
+            file=sys.stderr,
+        )
+        return 2
     finally:
         await engine.dispose()
     print(f"Загружено: {', '.join(result.loaded) or '—'} (эмбеддингов: {result.embedded})")
