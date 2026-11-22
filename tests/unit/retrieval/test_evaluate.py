@@ -27,9 +27,9 @@ def test_metrics_and_report() -> None:
     q = Question("вопрос", "02.03.02", ["x"])
     outcomes = [Outcome(q, 1, ["x"]), Outcome(q, 3, ["a", "b", "x"]), Outcome(q, None, ["a"])]
     assert metrics(outcomes) == {"первым": 1 / 3, "в первых 5": 2 / 3}
-    text = report({"вектор": outcomes, "гибрид, вес текста 0.5": outcomes})
+    text = report({"вектор": outcomes, "гибрид, вес текста 0.25": outcomes})
     assert "| вектор | 33% (1) | 67% (2) |" in text
-    assert "Правильный пункт не первым (гибрид, вес текста 0.5)" in text
+    assert "Правильный пункт не первым (гибрид, вес текста 0.25)" in text
 
 
 def test_list_result_counts_if_it_covers_relevant_clause() -> None:
