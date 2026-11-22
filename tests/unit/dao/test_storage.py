@@ -1,10 +1,12 @@
 """Контракт локального файлового хранилища и регрессии его адресации."""
 
 import asyncio
+import errno
 import os
 import stat
 import threading
 from pathlib import Path
+from typing import BinaryIO
 from uuid import UUID
 
 import pytest
@@ -57,6 +59,88 @@ def test_repeated_save_replaces_contents_for_the_same_key(storage: LocalFileStor
     asyncio.run(scenario())
 
 
+def test_open_reader_keeps_complete_old_version_during_replacement(
+    storage: LocalFileStorage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        args = {"session_id": "synthetic", "doc_id": DOCUMENT_ID, "filename": "report.docx"}
+        original = b"original record\n" * 8192
+        replacement = b"replacement record\n" * 16384
+        key = await storage.save(**args, content=original)
+        loop = asyncio.get_running_loop()
+        reader_opened = asyncio.Event()
+        resume_reader = threading.Event()
+        original_fdopen = os.fdopen
+
+        def pause_after_open(fd: int, mode: str = "r", *, closefd: bool = True) -> BinaryIO:
+            if mode == "rb":
+                loop.call_soon_threadsafe(reader_opened.set)
+                assert resume_reader.wait(timeout=5), "Не получен сигнал продолжить чтение"
+            return original_fdopen(fd, mode, closefd=closefd)
+
+        with monkeypatch.context() as patch:
+            patch.setattr("edu_doc_agent.dao.storage.os.fdopen", pause_after_open)
+            read_task = asyncio.create_task(storage.read(key))
+            try:
+                await asyncio.wait_for(reader_opened.wait(), timeout=5)
+                assert await storage.save(**args, content=replacement) == key
+            finally:
+                resume_reader.set()
+
+            assert await asyncio.wait_for(read_task, timeout=5) == original
+
+        assert await storage.read(key) == replacement
+
+    asyncio.run(scenario())
+
+
+def test_new_reader_sees_complete_version_during_publication(
+    storage: LocalFileStorage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        args = {"session_id": "synthetic", "doc_id": DOCUMENT_ID, "filename": "report.docx"}
+        original = b"original record\n" * 8192
+        replacement = b"replacement record\n" * 16384
+        key = await storage.save(**args, content=original)
+        name = Path(key).name
+        loop = asyncio.get_running_loop()
+        original_replace = os.replace
+        original_unlink = os.unlink
+        observed: list[bytes] = []
+
+        def read_current_key() -> None:
+            pending = asyncio.run_coroutine_threadsafe(storage.read(key), loop)
+            try:
+                version = pending.result(timeout=5)
+            finally:
+                pending.cancel()
+            assert version in (original, replacement)
+            observed.append(version)
+
+        def observe_replace(
+            source: str, destination: str, *, src_dir_fd: int, dst_dir_fd: int
+        ) -> None:
+            read_current_key()
+            original_replace(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+            read_current_key()
+
+        def observe_unlink(path: Path | str, *, dir_fd: int | None = None) -> None:
+            original_unlink(path, dir_fd=dir_fd)
+            if Path(path).name == name:
+                read_current_key()
+
+        with monkeypatch.context() as patch:
+            patch.setattr("edu_doc_agent.dao.storage.os.replace", observe_replace)
+            # Проба после unlink ловит разрыв при схеме «удалить, затем установить».
+            patch.setattr("edu_doc_agent.dao.storage.os.unlink", observe_unlink)
+            assert await storage.save(**args, content=replacement) == key
+
+        assert observed
+        assert await storage.read(key) == replacement
+
+    asyncio.run(scenario())
+
+
 def test_case_distinct_sessions_have_distinct_storage_directories(
     storage: LocalFileStorage,
 ) -> None:
@@ -91,8 +175,9 @@ def test_session_id_matching_root_file_can_save(storage: LocalFileStorage) -> No
     assert root_file.read_bytes() == b"storage documentation"
 
 
-def test_save_preserves_private_file_mode(storage: LocalFileStorage) -> None:
-    previous_umask = os.umask(0o077)
+@pytest.mark.parametrize("mask", [0o077, 0o022], ids=["umask-077", "umask-022"])
+def test_save_preserves_private_file_mode(storage: LocalFileStorage, mask: int) -> None:
+    previous_umask = os.umask(mask)
     try:
         key = asyncio.run(
             storage.save(
@@ -174,8 +259,15 @@ def test_delete_refuses_directories(storage: LocalFileStorage) -> None:
     assert directory.is_dir()
 
 
+@pytest.mark.parametrize(
+    "unlink_error",
+    [
+        pytest.param(None, id="unlink-succeeds"),
+        pytest.param(OSError(errno.EIO, "synthetic I/O error"), id="unlink-fails"),
+    ],
+)
 def test_cancelled_delete_finishes_before_file_is_saved_again(
-    storage: LocalFileStorage, monkeypatch: pytest.MonkeyPatch
+    storage: LocalFileStorage, monkeypatch: pytest.MonkeyPatch, unlink_error: OSError | None
 ) -> None:
     async def scenario() -> None:
         args = {"session_id": "synthetic", "doc_id": DOCUMENT_ID, "filename": "report.docx"}
@@ -190,6 +282,8 @@ def test_cancelled_delete_finishes_before_file_is_saved_again(
             if path == name and dir_fd is not None:
                 loop.call_soon_threadsafe(entered.set)
                 assert release.wait(timeout=5), "Не получен сигнал завершить unlink"
+                if unlink_error is not None:
+                    raise unlink_error
             original_unlink(path, dir_fd=dir_fd)
 
         with monkeypatch.context() as patch:
@@ -206,10 +300,17 @@ def test_cancelled_delete_finishes_before_file_is_saved_again(
             finally:
                 release.set()
 
-            with pytest.raises(asyncio.CancelledError):
+            with pytest.raises(asyncio.CancelledError) as exc:
                 await asyncio.wait_for(task, timeout=5)
 
-        assert not await storage.exists(key)
+        if unlink_error is None:
+            assert exc.value.__cause__ is None
+            assert not await storage.exists(key)
+        else:
+            cause = exc.value.__cause__
+            assert isinstance(cause, OSError)
+            assert cause.errno == errno.EIO
+            assert await storage.read(key) == b"original"
         assert await storage.save(**args, content=b"replacement") == key
         assert await storage.read(key) == b"replacement"
 
