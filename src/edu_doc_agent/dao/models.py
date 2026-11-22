@@ -3,6 +3,7 @@ from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    DDL,
     BigInteger,
     Boolean,
     CheckConstraint,
@@ -14,6 +15,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    event,
     text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR
@@ -127,6 +129,9 @@ class Document(Base):
 
 
 # --- Нормативы для RAG (ADR-0005) -----------------------------------------------------------
+
+# Base.metadata.create_all() (тесты без миграций) создаёт и расширение, как миграция c4e8a1f37b20
+event.listen(Base.metadata, "before_create", DDL("CREATE EXTENSION IF NOT EXISTS vector"))
 
 EMBEDDING_DIM = 1024  # BGE-M3; другая модель — другая размерность и миграция колонки
 

@@ -6,7 +6,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import Connection, create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.pool import NullPool
 from sqlalchemy.schema import CreateSchema, DropSchema
@@ -32,6 +32,7 @@ def database(tmp_path: Path) -> Iterator[Database]:
         with admin.begin() as connection:
             assert connection.dialect.server_version_info[0] == 17
             connection.execute(CreateSchema(schema))
+            _vector_extension_in(connection, schema)
         created = True
         yield Database(isolated_url, engine, tmp_path, schema)
     finally:
@@ -42,6 +43,26 @@ def database(tmp_path: Path) -> Iterator[Database]:
                     connection.execute(DropSchema(schema, cascade=True))
         finally:
             admin.dispose()
+
+
+def _vector_extension_in(connection: Connection, schema: str) -> None:
+    """pgvector — в схеме теста: иначе тип `vector` не виден при search_path только на неё.
+
+    Расширение одно на базу, поэтому ставим его суперпользователем здесь; миграция с
+    `CREATE EXTENSION IF NOT EXISTS` тогда проходит и под ролью без прав суперпользователя.
+    При удалении схемы теста расширение удаляется вместе с ней.
+    """
+    current = connection.scalar(
+        text(
+            "SELECT n.nspname FROM pg_extension e "
+            "JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'vector'"
+        )
+    )
+    quoted = connection.dialect.identifier_preparer.quote(schema)
+    if current is None:
+        connection.execute(text(f"CREATE EXTENSION vector SCHEMA {quoted}"))
+    elif current != schema:
+        connection.execute(text(f"ALTER EXTENSION vector SET SCHEMA {quoted}"))
 
 
 @pytest.fixture
