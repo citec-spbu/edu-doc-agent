@@ -198,14 +198,11 @@ class RegulationFragment(Base):
     number: Mapped[str] = mapped_column(String)
     path: Mapped[str] = mapped_column(String)
     text: Mapped[str] = mapped_column(String)
-    codes: Mapped[list[str]] = mapped_column(
-        ARRAY(String), default=list, server_default=text("'{}'::varchar[]")
-    )
+    # умолчания строками: имя `text` в теле класса занято колонкой, sqlalchemy.text недоступен
+    codes: Mapped[list[str]] = mapped_column(ARRAY(String), default=list, server_default="{}")
     parent: Mapped[str | None] = mapped_column(String, nullable=True)
     category: Mapped[str | None] = mapped_column(String, nullable=True)  # категория / группа
-    changed_by: Mapped[list[dict]] = mapped_column(
-        JSONB, default=list, server_default=text("'[]'::jsonb")
-    )
+    changed_by: Mapped[list[dict]] = mapped_column(JSONB, default=list, server_default="[]")
     embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIM))
     # генерирует PostgreSQL; при вставке не передаётся
     tsv: Mapped[str | None] = mapped_column(

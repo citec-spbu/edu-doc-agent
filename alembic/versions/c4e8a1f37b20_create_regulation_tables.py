@@ -62,7 +62,7 @@ def upgrade() -> None:
         sa.Column(
             "codes",
             postgresql.ARRAY(sa.String()),
-            server_default=sa.text("'{}'::varchar[]"),
+            server_default="{}",
             nullable=False,
         ),
         sa.Column("parent", sa.String(), nullable=True),
@@ -70,7 +70,7 @@ def upgrade() -> None:
         sa.Column(
             "changed_by",
             postgresql.JSONB(astext_type=sa.Text()),
-            server_default=sa.text("'[]'::jsonb"),
+            server_default="[]",
             nullable=False,
         ),
         sa.Column("embedding", Vector(1024), nullable=False),
