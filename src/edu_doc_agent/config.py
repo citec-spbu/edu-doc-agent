@@ -85,6 +85,13 @@ class Settings(BaseSettings):
             return None
         return value
 
+    @field_validator("storage_dir", mode="before")
+    @classmethod
+    def _default_storage_dir_if_empty(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return Path("storage")
+        return value
+
 
 @lru_cache
 def get_settings() -> Settings:

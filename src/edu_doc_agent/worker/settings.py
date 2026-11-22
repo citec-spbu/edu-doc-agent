@@ -25,12 +25,14 @@ settings = get_settings()
 
 async def startup(ctx: dict[str, Any]) -> None:
     """Хук, который выполняется один раз при старте процесса воркера."""
+    current_settings = get_settings()
 
     logging.basicConfig(
-        level=settings.log_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        level=current_settings.log_level,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
     ctx["dao"] = SessionRunDAO()
-    ctx["storage"] = LocalFileStorage(settings.storage_dir)
+    ctx["storage"] = LocalFileStorage(current_settings.storage_dir)
     ctx["max_tries"] = MAX_TRIES
     logger.info("Worker is starting up. Connected to Redis.")
 
