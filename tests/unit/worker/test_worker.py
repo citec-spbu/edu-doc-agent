@@ -3,12 +3,14 @@
 import asyncio
 import importlib
 import logging
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 from arq.worker import create_worker
 
+from edu_doc_agent.api import dependencies
 from edu_doc_agent.config import Settings
 from tests.fakes import InMemorySessionRunDAO
 
@@ -138,3 +140,26 @@ def test_worker_lifecycle_hooks_configure_logging(
         asyncio.run(scenario())
 
     assert any(call.kwargs.get("level") == "DEBUG" for call in basic_config.call_args_list)
+
+
+def test_api_provider_and_worker_startup_share_configured_storage(
+    tasks: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = importlib.import_module("edu_doc_agent.worker.settings")
+    settings = Settings(_env_file=None, storage_dir=tmp_path / "configured-storage")
+    monkeypatch.setattr(dependencies, "get_settings", lambda: settings)
+    monkeypatch.setattr(module, "get_settings", lambda: settings)
+
+    async def scenario() -> None:
+        api_storage = dependencies.get_file_storage()
+        context = {}
+        await module.WorkerSettings.on_startup(context)
+        worker_storage = context["storage"]
+        key = await api_storage.save(
+            session_id="synthetic", doc_id="report", filename="report.docx", content=b"report"
+        )
+
+        assert (settings.storage_dir / key).is_file()
+        assert await worker_storage.read(key) == b"report"
+
+    asyncio.run(scenario())
