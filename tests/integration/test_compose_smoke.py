@@ -96,7 +96,7 @@ def compose_project(tmp_path: Path) -> Iterator[tuple]:
         compose("down", "--volumes", "--remove-orphans", timeout=60)
 
 
-def test_api_and_worker_share_file_storage(compose_project: tuple, tmp_path: Path) -> None:
+def test_api_and_worker_share_file_storage(compose_project: tuple) -> None:
     _, _, compose = compose_project
     write = dedent("""\
         import asyncio
@@ -125,16 +125,13 @@ def test_api_and_worker_share_file_storage(compose_project: tuple, tmp_path: Pat
             key = sys.argv[1]
             assert await storage.read(key) == b"synthetic report"
             assert await storage.delete(key)
+            assert not await storage.exists(key)
 
         asyncio.run(check())
     """)
     run = ("run", "--rm", "--no-deps", "--pull", "never", "--no-TTY")
     storage_key = compose(*run, "api", "python", "-c", write).strip()
-    mounted_file = tmp_path / "storage" / storage_key
-    assert mounted_file.read_bytes() == b"synthetic report"
-
     compose(*run, "worker", "python", "-c", read, storage_key)
-    assert not mounted_file.exists()
 
 
 def test_compose_stack_processes_a_session(compose_project: tuple, tmp_path: Path) -> None:

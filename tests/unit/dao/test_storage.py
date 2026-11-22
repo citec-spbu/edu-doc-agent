@@ -1,6 +1,8 @@
 """Контракт локального файлового хранилища и регрессии его адресации."""
 
 import asyncio
+import os
+import stat
 from pathlib import Path
 from uuid import UUID
 
@@ -54,16 +56,73 @@ def test_repeated_save_replaces_contents_for_the_same_key(storage: LocalFileStor
     asyncio.run(scenario())
 
 
+def test_case_distinct_sessions_have_distinct_storage_directories(
+    storage: LocalFileStorage,
+) -> None:
+    async def scenario() -> None:
+        args = {"doc_id": DOCUMENT_ID, "filename": "report.docx"}
+        first = await storage.save(session_id="Group", **args, content=b"first")
+        second = await storage.save(session_id="group", **args, content=b"second")
+
+        assert Path(first).parent.as_posix().casefold() != Path(second).parent.as_posix().casefold()
+        assert await storage.read(first) == b"first"
+        assert await storage.read(second) == b"second"
+
+    asyncio.run(scenario())
+
+
+def test_session_id_matching_root_file_can_save(storage: LocalFileStorage) -> None:
+    storage.base_dir.mkdir()
+    root_file = storage.base_dir / "README.md"
+    root_file.write_bytes(b"storage documentation")
+
+    async def scenario() -> None:
+        key = await storage.save(
+            session_id=root_file.name, doc_id=DOCUMENT_ID, filename="report.docx", content=b"report"
+        )
+        assert Path(key).parts[0] == "sessions"
+        assert await storage.read(key) == b"report"
+        for operation in (storage.read, storage.exists, storage.delete):
+            with pytest.raises(InvalidStoragePathError):
+                await operation(root_file.name)
+
+    asyncio.run(scenario())
+    assert root_file.read_bytes() == b"storage documentation"
+
+
+def test_save_preserves_private_file_mode(storage: LocalFileStorage) -> None:
+    previous_umask = os.umask(0o077)
+    try:
+        key = asyncio.run(
+            storage.save(
+                session_id="synthetic",
+                doc_id=DOCUMENT_ID,
+                filename="report.docx",
+                content=b"report",
+            )
+        )
+    finally:
+        os.umask(previous_umask)
+
+    assert stat.S_IMODE((storage.base_dir / key).stat().st_mode) == 0o600
+
+
 def test_failed_publication_keeps_original_and_removes_temporary_file(
     storage: LocalFileStorage, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def failed_replace(_source: str, _destination: Path) -> None:
-        raise OSError("synthetic failure")
-
     async def scenario() -> None:
         args = {"session_id": "synthetic", "doc_id": DOCUMENT_ID, "filename": "report.docx"}
         key = await storage.save(**args, content=b"original")
         target = storage.resolve_path(key)
+
+        def failed_replace(
+            source: str, destination: str, *, src_dir_fd: int, dst_dir_fd: int
+        ) -> None:
+            assert src_dir_fd == dst_dir_fd
+            assert Path(source).name == source
+            assert destination == target.name
+            assert os.path.samestat(os.fstat(dst_dir_fd), target.parent.stat())
+            raise OSError("synthetic failure")
 
         with monkeypatch.context() as patch:
             patch.setattr("edu_doc_agent.dao.storage.os.replace", failed_replace)
@@ -84,14 +143,17 @@ def test_read_translates_file_disappearing_during_open(
             session_id="synthetic", doc_id=DOCUMENT_ID, filename="report.docx", content=b"report"
         )
         target = storage.resolve_path(key)
-        original_read_bytes = Path.read_bytes
+        original_open = os.open
 
-        def read_after_delete(path: Path) -> bytes:
-            if path == target:
-                path.unlink()
-            return original_read_bytes(path)
+        def open_after_delete(
+            path: Path | str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+        ) -> int:
+            if path == target.name:
+                assert dir_fd is not None and flags & os.O_NOFOLLOW
+                os.unlink(path, dir_fd=dir_fd)
+            return original_open(path, flags, mode, dir_fd=dir_fd)
 
-        monkeypatch.setattr(Path, "read_bytes", read_after_delete)
+        monkeypatch.setattr("edu_doc_agent.dao.storage.os.open", open_after_delete)
         with pytest.raises(StorageFileNotFoundError) as exc:
             await storage.read(key)
         assert isinstance(exc.value.__cause__, FileNotFoundError)
@@ -101,13 +163,32 @@ def test_read_translates_file_disappearing_during_open(
 
 
 def test_delete_refuses_directories(storage: LocalFileStorage) -> None:
-    directory = storage.base_dir / "synthetic"
+    key = "synthetic/report.docx"
+    directory = storage.base_dir / key
     directory.mkdir(parents=True)
 
     with pytest.raises(InvalidStoragePathError):
-        asyncio.run(storage.delete("synthetic"))
+        asyncio.run(storage.delete(key))
 
     assert directory.is_dir()
+
+
+def test_file_operations_handle_regular_file_in_place_of_session_directory(
+    storage: LocalFileStorage,
+) -> None:
+    storage.base_dir.mkdir()
+    parent = storage.base_dir / "synthetic"
+    parent.write_bytes(b"regular file")
+
+    async def scenario() -> None:
+        key = "synthetic/report.docx"
+        assert not await storage.exists(key)
+        with pytest.raises(StorageFileNotFoundError):
+            await storage.read(key)
+        assert not await storage.delete(key)
+
+    asyncio.run(scenario())
+    assert parent.read_bytes() == b"regular file"
 
 
 @pytest.mark.parametrize(
@@ -158,18 +239,26 @@ def test_file_operations_refuse_invalid_keys(storage: LocalFileStorage, key: str
 
 
 def test_save_refuses_session_directory_symlink(storage: LocalFileStorage) -> None:
-    target = storage.base_dir / "second"
-    target.mkdir(parents=True)
-    (storage.base_dir / "first").symlink_to(target, target_is_directory=True)
+    async def scenario() -> None:
+        args = {"session_id": "first", "doc_id": DOCUMENT_ID, "filename": "report.docx"}
+        key = await storage.save(**args, content=b"report")
+        directory = (storage.base_dir / key).parent
+        assert await storage.delete(key)
+        directory.rmdir()
 
-    with pytest.raises(InvalidStoragePathError):
-        asyncio.run(
-            storage.save(
-                session_id="first", doc_id=DOCUMENT_ID, filename="report.docx", content=b"report"
-            )
-        )
+        target = storage.base_dir / "second"
+        target.mkdir()
+        directory.symlink_to(target, target_is_directory=True)
 
-    assert not list(target.iterdir())
+        with pytest.raises(InvalidStoragePathError):
+            await storage.save(**args, content=b"report")
+        for operation in (storage.read, storage.exists, storage.delete):
+            with pytest.raises(InvalidStoragePathError):
+                await operation(key)
+
+        assert not list(target.iterdir())
+
+    asyncio.run(scenario())
 
 
 def test_file_operations_refuse_dangling_file_symlink(storage: LocalFileStorage) -> None:
