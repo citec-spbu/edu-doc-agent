@@ -12,6 +12,7 @@ ED = "808"
 def row(id: str, text: str, *, part: int = 0, kind: str = "clause", doc_id: str = FGOS) -> dict:
     return {
         "id": id,
+        "number": id.split(":")[1],
         "edition": ED,
         "part": part,
         "doc_id": doc_id,
@@ -30,6 +31,9 @@ ROWS = [
     row(f"{FGOS}:4.1", "Первая часть. ", part=0),
     row(f"{FGOS}:4.1", "Вторая часть.", part=1),
     row(f"{OS}:2.3", "2.3. Пункт ОС", doc_id=OS),
+    row(f"{OS}:2.2.4", "2.2.4. рабочие программы, содержащие:", doc_id=OS),
+    row(f"{OS}:2.2.4.2", "2.2.4.2. фонд оценочных средств;", doc_id=OS),
+    row(f"{OS}:2.2.4.1", "2.2.4.1. цели и задачи;", doc_id=OS),
 ]
 
 
@@ -62,6 +66,18 @@ class FakeDAO:
     async def get_parts(self, keys):
         wanted = set(keys)
         return [r for r in ROWS if (r["id"], r["edition"]) in wanted]
+
+    async def list_heads(self, doc_ids):
+        return {(OS, ED, "2.2.4")}
+
+    async def get_subtree(self, doc_id, edition, number):
+        return [
+            r
+            for r in ROWS
+            if r["doc_id"] == doc_id
+            and r["kind"] == "clause"
+            and (r["number"] == number or r["number"].startswith(number + "."))
+        ]
 
     async def list_documents(self):
         return [
@@ -102,8 +118,9 @@ def test_exact_miss_falls_back_to_hybrid() -> None:
     )
     hits = run(RegulationSearch(dao, FakeEmbedder()).search("УК-99 и объем", top_k=2))
     assert names(dao) == ["codes", "full_text", "nearest"]
-    # 4.1 нашли оба способа — он первый; разделённый пункт склеен из частей
-    assert [h.id for h in hits] == [f"{FGOS}:4.1", f"{FGOS}:1.9"]
+    # 4.1 нашли оба способа — он первый; второй — из векторного: у него вес больше,
+    # чем у полнотекстового; разделённый пункт склеен из частей
+    assert [h.id for h in hits] == [f"{FGOS}:4.1", f"{OS}:2.3"]
     assert hits[0].text == "Первая часть. Вторая часть."
     assert {h.method for h in hits} == {"hybrid"} and [h.rank for h in hits] == [1, 2]
 
@@ -132,3 +149,18 @@ def test_get_clause_and_documents_for_direction() -> None:
     assert clause is not None and clause.text == "Первая часть. Вторая часть."
     assert run(search.get_clause(f"{FGOS}:9.9", ED)) is None
     assert run(search.documents_for_direction("02.03.02")) == [FGOS, OS]
+
+
+def test_list_item_returns_whole_list() -> None:
+    dao = FakeDAO(full_text=[f"{OS}:2.2.4.2", f"{OS}:2.3"], nearest=[f"{OS}:2.2.4.1"])
+    hits = run(RegulationSearch(dao, FakeEmbedder()).search("что содержит рабочая программа"))
+    head = hits[0]
+    assert head.id == f"{OS}:2.2.4"
+    assert head.text == (
+        "2.2.4. рабочие программы, содержащие:\n2.2.4.1. цели и задачи;\n"
+        "2.2.4.2. фонд оценочных средств;"
+    )
+    assert head.covers == [f"{OS}:2.2.4", f"{OS}:2.2.4.1", f"{OS}:2.2.4.2"]
+    assert [h.id for h in hits] == [f"{OS}:2.2.4", f"{OS}:2.3"]
+    # чтение по ссылке — сам пункт, без подпунктов
+    assert run(RegulationSearch(dao).get_clause(f"{OS}:2.2.4", ED)).covers == []

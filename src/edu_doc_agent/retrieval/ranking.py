@@ -36,19 +36,95 @@ def query_keys(query: str) -> QueryKeys:
     return QueryKeys(tuple(dict.fromkeys(codes)), tuple(dict.fromkeys(numbers)))
 
 
-def rrf(rankings: Sequence[Sequence[Hashable]], k: int = RRF_K) -> list[Hashable]:
-    """Reciprocal Rank Fusion: сумма 1 / (k + место) по спискам, без сырых оценок.
+def rrf(
+    rankings: Sequence[Sequence[Hashable]],
+    weights: Sequence[float] | None = None,
+    k: int = RRF_K,
+) -> list[Hashable]:
+    """Взвешенный Reciprocal Rank Fusion: сумма вес / (k + место) по спискам.
 
-    Ключ, встретившийся в списке несколько раз (части одного пункта), учитывается по лучшему
-    месту. При равной сумме выше тот, кто раньше встретился в первом списке.
+    Сырые оценки списков несравнимы, поэтому важны только места. Ключ, встретившийся в
+    списке несколько раз (части одного пункта), учитывается по лучшему месту. При равной
+    сумме выше тот, кто раньше встретился в первом списке. Вес 0 — список не учитывается.
     """
+    weights = weights if weights is not None else [1.0] * len(rankings)
     scores: dict[Hashable, float] = {}
     first_seen: dict[Hashable, int] = {}
-    for ranking in rankings:
+    for ranking, weight in zip(rankings, weights, strict=True):
         best: dict[Hashable, int] = {}
         for place, key in enumerate(ranking, start=1):
             best.setdefault(key, place)
         for key, place in best.items():
-            scores[key] = scores.get(key, 0.0) + 1.0 / (k + place)
-            first_seen.setdefault(key, len(first_seen))
+            if weight > 0:
+                scores[key] = scores.get(key, 0.0) + weight / (k + place)
+                first_seen.setdefault(key, len(first_seen))
     return sorted(scores, key=lambda key: (-scores[key], first_seen[key]))
+
+
+# --- перечни: вводный пункт «…, содержащие:» и его подпункты возвращаются одним результатом
+
+_NUMBER = re.compile(r"\d+(?:\.\d+)+")
+
+
+def clause_of(fragment_id: str) -> tuple[str, str] | None:
+    """`'spbu-os:2.2.4.1'` -> `('spbu-os', '2.2.4.1')`; компетенция, профстандарт -> None."""
+    doc_id, _, number = fragment_id.partition(":")
+    return (doc_id, number) if _NUMBER.fullmatch(number) else None
+
+
+def number_order(number: str) -> tuple[int, ...]:
+    """Порядок пунктов в документе: 2.2.10 после 2.2.9."""
+    return tuple(int(n) for n in number.split("."))
+
+
+def collapse_lists(
+    keys: Sequence[tuple[str, str]], list_heads: set[tuple[str, str, str]]
+) -> list[tuple[tuple[str, str], bool]]:
+    """Подпункты перечня -> его вводный пункт; вернуть (ключ, раскрыть ли перечень).
+
+    `keys` — (id, edition) по рангу; `list_heads` — (doc_id, edition, номер) пунктов,
+    которые вводят перечень (кончаются двоеточием). Найденный подпункт заменяется ближайшим
+    таким предком (или самим собой, если он вводит перечень). Если в выдаче оказались и
+    перечень, и вложенный в него перечень, остаётся внешний — на месте лучшего из них.
+    """
+    out: list[tuple[tuple[str, str], bool]] = []
+    heads_out: dict[tuple[str, str], str] = {}  # ключ перечня в выдаче -> его номер
+    for key in keys:
+        fragment_id, edition = key
+        clause = clause_of(fragment_id)
+        head = None
+        if clause is not None:
+            doc_id, number = clause
+            parts = number.split(".")
+            for size in range(len(parts), 1, -1):  # сам пункт, затем предки снизу вверх
+                candidate = ".".join(parts[:size])
+                if (doc_id, edition, candidate) in list_heads:
+                    head = candidate
+                    break
+        if head is None:
+            if all(k != key for k, _ in out):
+                out.append((key, False))
+            continue
+        head_key = (f"{doc_id}:{head}", edition)
+        if any(
+            k[1] == edition
+            and k[0].split(":", 1)[0] == doc_id
+            and (head == n or head.startswith(n + "."))
+            for k, n in heads_out.items()
+        ):
+            continue  # уже есть этот перечень или объемлющий его
+        nested = [
+            k
+            for k, n in heads_out.items()
+            if k[1] == edition and k[0].split(":", 1)[0] == doc_id and n.startswith(head + ".")
+        ]
+        if nested:  # внешний перечень встаёт на место лучшего из вложенных
+            place = min(i for i, (k, _) in enumerate(out) if k in nested)
+            out = [item for item in out if item[0] not in nested]
+            out.insert(place, (head_key, True))
+            for k in nested:
+                del heads_out[k]
+        else:
+            out.append((head_key, True))
+        heads_out[head_key] = head
+    return out

@@ -4,11 +4,16 @@
 
 1. В запросе есть код компетенции / профстандарта или «п. 2.3» — точный поиск
    (`method="exact"`). Если он что-то нашёл, это и есть ответ.
-2. Иначе гибрид: полнотекстовый поиск и векторный (BGE-M3) сливаются через RRF
-   (`method="hybrid"`). Если модель эмбеддингов недоступна — только полнотекстовый
-   (`method="fts"`). Такие результаты не подтверждают, что требование к коду существует.
+2. Иначе гибрид: полнотекстовый поиск и векторный (BGE-M3) сливаются взвешенным RRF
+   (`method="hybrid"`); вектор надёжнее, у полнотекстового вес меньше (`FTS_WEIGHT`,
+   подобран на золотом наборе). Если модель эмбеддингов недоступна — только
+   полнотекстовый (`method="fts"`). Такие результаты не подтверждают, что требование
+   к коду существует.
 
-Разделённый на части пункт возвращается целиком; редакция результата — та, что в базе.
+Разделённый на части пункт возвращается целиком. Перечень («2.2.4. рабочие программы…,
+содержащие:» и подпункты 2.2.4.1–2.2.4.3) — одним результатом: найденный подпункт
+заменяется вводным пунктом со всеми подпунктами (`covers` — их id). Редакция результата —
+та, что в базе.
 Список документов (`doc_ids`) задаёт вызывающий код по данным программы, а не LLM.
 """
 
@@ -22,7 +27,7 @@ from pydantic import BaseModel
 from edu_doc_agent.dao.regulations import ClauseKey, RegulationDAO
 from edu_doc_agent.llm.embeddings import Embedder
 from edu_doc_agent.llm.openai_compat import LLMError
-from edu_doc_agent.retrieval.ranking import query_keys, rrf
+from edu_doc_agent.retrieval.ranking import collapse_lists, number_order, query_keys, rrf
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +35,7 @@ Method = Literal["exact", "hybrid", "fts", "vector"]
 # auto — как описано выше; fts / vector — один способ после точного (для оценки качества)
 Mode = Literal["auto", "fts", "vector"]
 CANDIDATES = 50  # сколько кандидатов берёт каждый способ поиска до слияния
+FTS_WEIGHT = 0.5  # вес полнотекстового списка в RRF (у векторного — 1)
 
 
 class RegulationHit(BaseModel):
@@ -41,19 +47,27 @@ class RegulationHit(BaseModel):
     doc_type: str
     kind: str  # clause / competency / prof_standard_ref
     path: str
-    text: str  # дословно; у пункта из частей — склейка всех частей
+    text: str  # дословно; у пункта из частей — склейка частей, у перечня — пунктов по строкам
     context: str = ""  # вводные строки родительских пунктов: без них пункт перечня непонятен
     category: str | None = None
     rank: int  # место в выдаче, с 1
     method: Method
+    covers: list[str] = []  # у перечня: id всех вошедших пунктов (вводный и подпункты)
 
 
 class RegulationSearch:
     """Поиск и чтение пунктов нормативов. Сам ничего не пишет."""
 
-    def __init__(self, dao: RegulationDAO, embedder: Embedder | None = None) -> None:
+    def __init__(
+        self,
+        dao: RegulationDAO,
+        embedder: Embedder | None = None,
+        *,
+        fts_weight: float = FTS_WEIGHT,
+    ) -> None:
         self._dao = dao
         self._embedder = embedder
+        self._fts_weight = fts_weight
 
     async def search(
         self,
@@ -63,6 +77,7 @@ class RegulationSearch:
         doc_types: Sequence[str] | None = None,
         top_k: int = 5,
         mode: Mode = "auto",
+        fts_weight: float | None = None,
     ) -> list[RegulationHit]:
         filters = {"doc_ids": doc_ids, "doc_types": doc_types, "limit": CANDIDATES}
         keys = query_keys(query)
@@ -72,20 +87,21 @@ class RegulationSearch:
                 *(await self._dao.find_by_numbers(keys.numbers, **filters) if keys.numbers else []),
             ]
             if exact:
-                return await self._hits(list(dict.fromkeys(exact))[:top_k], "exact")
+                return await self._ranked(list(dict.fromkeys(exact)), "exact", top_k)
 
         if mode == "vector":
             vector = await self._vector(query, filters)
-            return await self._hits(list(dict.fromkeys(vector or []))[:top_k], "vector")
+            return await self._ranked(list(dict.fromkeys(vector or [])), "vector", top_k)
         full_text = await self._dao.full_text(query, **filters)
         vector = await self._vector(query, filters) if mode == "auto" else None
         if vector is None:
-            return await self._hits(list(dict.fromkeys(full_text))[:top_k], "fts")
-        return await self._hits(rrf([full_text, vector])[:top_k], "hybrid")
+            return await self._ranked(list(dict.fromkeys(full_text)), "fts", top_k)
+        weight = self._fts_weight if fts_weight is None else fts_weight
+        return await self._ranked(rrf([full_text, vector], [weight, 1.0]), "hybrid", top_k)
 
     async def get_clause(self, id: str, edition: str) -> RegulationHit | None:
-        """Пункт целиком по ссылке из результата поиска или из правила каталога."""
-        hits = await self._hits([(id, edition)], "exact")
+        """Пункт по ссылке из результата поиска или из правила каталога (без подпунктов)."""
+        hits = await self._hits([((id, edition), False)], "exact")
         return hits[0] if hits else None
 
     async def documents_for_direction(self, direction_code: str) -> list[str]:
@@ -137,17 +153,41 @@ class RegulationSearch:
             return None
         return await self._dao.nearest(embedding, **filters)
 
-    async def _hits(self, keys: Sequence[ClauseKey], method: Method) -> list[RegulationHit]:
-        parts = await self._dao.get_parts(keys)
+    async def _ranked(
+        self, keys: Sequence[ClauseKey], method: Method, top_k: int
+    ) -> list[RegulationHit]:
+        """Свернуть перечни, отрезать top_k и собрать тексты."""
+        doc_ids = sorted({fragment_id.split(":", 1)[0] for fragment_id, _ in keys})
+        heads = await self._dao.list_heads(doc_ids) if doc_ids else set()
+        return await self._hits(collapse_lists(keys, heads)[:top_k], method)
+
+    async def _hits(
+        self, items: Sequence[tuple[ClauseKey, bool]], method: Method
+    ) -> list[RegulationHit]:
+        plain = [key for key, expand in items if not expand]
         by_key: dict[ClauseKey, list[dict]] = {}
-        for row in parts:
+        for row in await self._dao.get_parts(plain):
             by_key.setdefault((row["id"], row["edition"]), []).append(row)
         hits = []
-        for key in keys:
-            rows = by_key.get(key)
-            if not rows:
+        for key, expand in items:
+            covers: list[str] = []
+            if expand:
+                doc_id, _, number = key[0].partition(":")
+                rows = await self._dao.get_subtree(doc_id, key[1], number)
+                clauses: dict[str, list[dict]] = {}
+                for row in rows:
+                    clauses.setdefault(row["number"], []).append(row)
+                order = sorted(clauses, key=number_order)
+                texts = ["".join(r["text"] for r in clauses[n]) for n in order]
+                covers = [clauses[n][0]["id"] for n in order]
+                first = clauses[number][0] if number in clauses else None
+                text = "\n".join(texts)
+            else:
+                rows = by_key.get(key, [])
+                first = rows[0] if rows else None
+                text = "".join(r["text"] for r in rows)
+            if first is None:
                 continue
-            first = rows[0]
             hits.append(
                 RegulationHit(
                     id=first["id"],
@@ -156,11 +196,12 @@ class RegulationSearch:
                     doc_type=first["doc_type"],
                     kind=first["kind"],
                     path=first["path"],
-                    text="".join(r["text"] for r in rows),
+                    text=text,
                     context=first["context"],
                     category=first["category"],
                     rank=len(hits) + 1,
                     method=method,
+                    covers=covers,
                 )
             )
         return hits

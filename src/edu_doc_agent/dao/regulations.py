@@ -211,6 +211,34 @@ class RegulationDAO:
         )
         return await self._keys(_filtered(query, doc_ids, doc_types))
 
+    async def list_heads(self, doc_ids: Sequence[str]) -> set[tuple[str, str, str]]:
+        """(doc_id, edition, номер) пунктов, вводящих перечень: текст кончается двоеточием."""
+        f = _FRAGMENTS.c
+        query = select(f.doc_id, f.edition, f.number).where(
+            f.kind == "clause",
+            f.doc_id.in_(list(doc_ids)),
+            func.right(func.rtrim(f.text), 1) == ":",
+        )
+        async with self._session_factory() as db:
+            return {(r.doc_id, r.edition, r.number) for r in await db.execute(query)}
+
+    async def get_subtree(self, doc_id: str, edition: str, number: str) -> list[dict[str, Any]]:
+        """Пункт и все его подпункты (части по порядку); порядок пунктов — у вызывающего."""
+        f = _FRAGMENTS.c
+        columns = [f[name] for name in FRAGMENT_FIELDS]
+        query = (
+            select(*columns)
+            .where(
+                f.doc_id == doc_id,
+                f.edition == edition,
+                f.kind == "clause",
+                (f.number == number) | f.number.startswith(number + "."),
+            )
+            .order_by(f.part)
+        )
+        async with self._session_factory() as db:
+            return [dict(r) for r in (await db.execute(query)).mappings()]
+
     async def _keys(self, query: Select) -> list[ClauseKey]:
         async with self._session_factory() as db:
             return [(row.id, row.edition) for row in await db.execute(query)]

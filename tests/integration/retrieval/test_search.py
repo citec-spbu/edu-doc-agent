@@ -75,7 +75,15 @@ CORPUS = [
         OS,
         "spbu_standard",
         None,
-        [clause(OS, "2.3", "2.3. Образовательная программа содержит рабочие программы дисциплин")],
+        [
+            clause(
+                OS, "2.3", "2.3. Образовательная программа содержит рабочие программы дисциплин"
+            ),
+            clause(OS, "2.4", "2.4. рабочие программы курсов и практик, содержащие:"),
+            clause(OS, "2.4.1", "2.4.1. цели и задачи;"),
+            clause(OS, "2.4.10", "2.4.10. фонд оценочных средств."),
+            clause(OS, "2.4.2", "2.4.2. требования к условиям реализации;"),
+        ],
     ),
 ]
 
@@ -135,3 +143,12 @@ def test_get_clause_and_documents_for_direction(search: RegulationSearch) -> Non
     assert clause_hit is not None and clause_hit.text.endswith("программы бакалавриата.")
     assert run(search.get_clause(f"{FGOS}:4.1", "нет такой")) is None
     assert run(search.documents_for_direction("02.03.02")) == [FGOS, OS]
+
+
+def test_list_item_returns_whole_list_in_document_order(search: RegulationSearch) -> None:
+    hits = run(search.search("фонд оценочных средств", doc_ids=[OS]))
+    lists = [h for h in hits if h.covers]
+    assert [h.id for h in lists] == [f"{OS}:2.4"]  # подпункты не повторяются отдельно
+    assert lists[0].covers == [f"{OS}:2.4", f"{OS}:2.4.1", f"{OS}:2.4.2", f"{OS}:2.4.10"]
+    assert lists[0].text.splitlines()[0] == "2.4. рабочие программы курсов и практик, содержащие:"
+    assert not any(h.id.startswith(f"{OS}:2.4.") for h in hits)

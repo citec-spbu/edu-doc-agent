@@ -2,9 +2,13 @@
 
     uv run python -m edu_doc_agent.retrieval.evaluate data/regulations/golden.yaml
 
-Для каждого способа (auto — как у агентов: точный, затем гибрид; fts и vector — по одному)
-считаются Hit@1/3/5 — доля вопросов, где правильный пункт в первых k, — и MRR@10.
-Нужны загруженный корпус и, для auto и vector, Ollama с моделью эмбеддингов.
+Две метрики, обе — доля вопросов из золотого набора:
+
+- «первым» — правильный пункт на первом месте выдачи;
+- «в первых 5» — правильный пункт среди первых пяти (столько по умолчанию видит агент).
+
+Сравниваются способы: только векторный, только полнотекстовый и гибрид с разным весом
+полнотекстового списка в RRF. Нужны загруженный корпус и Ollama с моделью эмбеддингов.
 """
 
 import argparse
@@ -16,10 +20,11 @@ from pathlib import Path
 
 import yaml
 
-from edu_doc_agent.retrieval.search import Mode, RegulationHit, RegulationSearch
+from edu_doc_agent.retrieval.search import FTS_WEIGHT, Mode, RegulationHit, RegulationSearch
 
-K_VALUES = (1, 3, 5)
-DEPTH = 10
+TOP = 5  # «в первых 5»
+DEPTH = 10  # сколько результатов смотрим, чтобы показать место правильного пункта
+FTS_WEIGHTS = (1.0, 0.5, 0.25)
 
 
 @dataclass
@@ -46,26 +51,34 @@ def is_relevant(hit_id: str, relevant: Sequence[str]) -> bool:
 
 
 def first_relevant(hits: Sequence[RegulationHit], relevant: Sequence[str]) -> int | None:
-    return next((h.rank for h in hits if is_relevant(h.id, relevant)), None)
+    """Место первого правильного результата; перечень засчитывается, если правильный пункт
+    вошёл в него (`covers`)."""
+    return next(
+        (h.rank for h in hits if any(is_relevant(i, relevant) for i in [h.id, *h.covers])),
+        None,
+    )
 
 
 def metrics(outcomes: Sequence[Outcome]) -> dict[str, float]:
     n = len(outcomes) or 1
-    result = {
-        f"Hit@{k}": sum(1 for o in outcomes if o.rank is not None and o.rank <= k) / n
-        for k in K_VALUES
+    return {
+        "первым": sum(1 for o in outcomes if o.rank == 1) / n,
+        f"в первых {TOP}": sum(1 for o in outcomes if o.rank is not None and o.rank <= TOP) / n,
     }
-    result[f"MRR@{DEPTH}"] = sum(1 / o.rank for o in outcomes if o.rank is not None) / n
-    return result
 
 
 async def evaluate(
-    search: RegulationSearch, questions: Sequence[Question], mode: Mode
+    search: RegulationSearch,
+    questions: Sequence[Question],
+    mode: Mode,
+    fts_weight: float | None = None,
 ) -> list[Outcome]:
     outcomes = []
     for q in questions:
         doc_ids = await search.documents_for_direction(q.direction)
-        hits = await search.search(q.question, doc_ids=doc_ids, top_k=DEPTH, mode=mode)
+        hits = await search.search(
+            q.question, doc_ids=doc_ids, top_k=DEPTH, mode=mode, fts_weight=fts_weight
+        )
         outcomes.append(Outcome(q, first_relevant(hits, q.relevant), [h.id for h in hits]))
     return outcomes
 
@@ -73,18 +86,28 @@ async def evaluate(
 def report(results: dict[str, list[Outcome]]) -> str:
     modes = list(results)
     names = list(metrics([]))
-    lines = ["| Способ | " + " | ".join(names) + " |", "|---" * (len(names) + 1) + "|"]
+    n = len(results[modes[0]])
+    lines = [
+        f"Вопросов: {n}. Доля вопросов, где правильный пункт…",
+        "",
+        "| Способ | " + " | ".join(names) + " |",
+        "|---" * (len(names) + 1) + "|",
+    ]
     for mode in modes:
         values = metrics(results[mode])
-        lines.append(f"| {mode} | " + " | ".join(f"{values[n]:.2f}" for n in names) + " |")
-    lines += ["", "| # | Вопрос | " + " | ".join(modes) + " |", "|---" * (len(modes) + 2) + "|"]
+        cells = " | ".join(f"{values[name]:.0%} ({round(values[name] * n)})" for name in names)
+        lines.append(f"| {mode} | {cells} |")
+    lines += ["", "Место правильного пункта (— — нет в первых 10):", ""]
+    lines += ["| # | Вопрос | " + " | ".join(modes) + " |", "|---" * (len(modes) + 2) + "|"]
     for i, q in enumerate(results[modes[0]], start=1):
         ranks = [results[m][i - 1].rank for m in modes]
         cells = " | ".join(str(r) if r else "—" for r in ranks)
         lines.append(f"| {i} | {q.question.question} | {cells} |")
-    misses = [o for o in results[modes[0]] if o.rank is None or o.rank > 3]
+    # разбор ошибок — для способа, которым ищут агенты (гибрид с весом по умолчанию)
+    main_mode = next((m for m in modes if m == f"гибрид, вес текста {FTS_WEIGHT:g}"), modes[0])
+    misses = [o for o in results[main_mode] if o.rank != 1]
     if misses:
-        lines += ["", f"Не в первой тройке ({modes[0]}):", ""]
+        lines += ["", f"Правильный пункт не первым ({main_mode}):", ""]
         for o in misses:
             lines.append(f"- {o.question.question}")
             lines.append(f"  - ожидалось: {', '.join(o.question.relevant)}")
@@ -106,7 +129,14 @@ async def _run(args: argparse.Namespace) -> int:
     try:
         dao = RegulationDAO(async_sessionmaker(engine, expire_on_commit=False))
         search = RegulationSearch(dao, OllamaEmbedder.from_settings(settings))
-        results = {mode: await evaluate(search, questions, mode) for mode in args.modes}
+        results = {
+            "вектор": await evaluate(search, questions, "vector"),
+            "текст": await evaluate(search, questions, "fts"),
+        }
+        for weight in args.fts_weights:
+            results[f"гибрид, вес текста {weight:g}"] = await evaluate(
+                search, questions, "auto", weight
+            )
     finally:
         await engine.dispose()
     text = report(results)
@@ -119,7 +149,7 @@ async def _run(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Оценка поиска по нормативам")
     parser.add_argument("golden", type=Path)
-    parser.add_argument("--modes", nargs="+", default=["auto", "fts", "vector"])
+    parser.add_argument("--fts-weights", nargs="+", type=float, default=list(FTS_WEIGHTS))
     parser.add_argument("--out", type=Path, help="сохранить отчёт в Markdown")
     return asyncio.run(_run(parser.parse_args(argv)))
 
