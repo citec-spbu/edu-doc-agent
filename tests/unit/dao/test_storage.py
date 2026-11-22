@@ -3,6 +3,7 @@
 import asyncio
 import os
 import stat
+import threading
 from pathlib import Path
 from uuid import UUID
 
@@ -173,6 +174,64 @@ def test_delete_refuses_directories(storage: LocalFileStorage) -> None:
     assert directory.is_dir()
 
 
+def test_cancelled_delete_finishes_before_file_is_saved_again(
+    storage: LocalFileStorage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        args = {"session_id": "synthetic", "doc_id": DOCUMENT_ID, "filename": "report.docx"}
+        key = await storage.save(**args, content=b"original")
+        name = Path(key).name
+        loop = asyncio.get_running_loop()
+        entered = asyncio.Event()
+        release = threading.Event()
+        original_unlink = os.unlink
+
+        def paused_unlink(path: Path | str, *, dir_fd: int | None = None) -> None:
+            if path == name and dir_fd is not None:
+                loop.call_soon_threadsafe(entered.set)
+                assert release.wait(timeout=5), "Не получен сигнал завершить unlink"
+            original_unlink(path, dir_fd=dir_fd)
+
+        with monkeypatch.context() as patch:
+            patch.setattr("edu_doc_agent.dao.storage.os.unlink", paused_unlink)
+            task = asyncio.create_task(storage.delete(key))
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=5)
+                task.cancel()
+                await asyncio.sleep(0)
+                assert not task.done(), "Отмена не должна обгонять удаление"
+                task.cancel()
+                await asyncio.sleep(0)
+                assert not task.done(), "Повторная отмена не должна обгонять удаление"
+            finally:
+                release.set()
+
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=5)
+
+        assert not await storage.exists(key)
+        assert await storage.save(**args, content=b"replacement") == key
+        assert await storage.read(key) == b"replacement"
+
+    asyncio.run(scenario())
+
+
+def test_file_operations_leave_fifo_in_place(storage: LocalFileStorage) -> None:
+    key = "synthetic/report.docx"
+    fifo = storage.base_dir / key
+    fifo.parent.mkdir(parents=True)
+    os.mkfifo(fifo, mode=0o600)
+
+    async def scenario() -> None:
+        assert not await storage.exists(key)
+        with pytest.raises(StorageFileNotFoundError):
+            await storage.read(key)
+        assert not await storage.delete(key)
+
+    asyncio.run(scenario())
+    assert stat.S_ISFIFO(fifo.lstat().st_mode)
+
+
 def test_file_operations_handle_regular_file_in_place_of_session_directory(
     storage: LocalFileStorage,
 ) -> None:
@@ -194,14 +253,15 @@ def test_file_operations_handle_regular_file_in_place_of_session_directory(
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        pytest.param("session_id", "..", id="parent-session"),
-        pytest.param("session_id", "../neighbor", id="nested-session"),
-        pytest.param("session_id", "synthetic\n", id="session-newline"),
+        pytest.param("session_id", "", id="empty-session"),
+        pytest.param("session_id", "synthetic\x00", id="nul-in-session"),
+        pytest.param("session_id", "synthetic\ud800", id="invalid-utf8-session"),
         pytest.param("doc_id", "folder/doc", id="nested-document"),
         pytest.param("doc_id", "report\n", id="document-newline"),
         pytest.param("filename", "../report.docx", id="relative-name"),
         pytest.param("filename", "folder\\report.docx", id="windows-separator"),
         pytest.param("filename", "report\x00.docx", id="nul-in-name"),
+        pytest.param("filename", "report\x7f.docx", id="ascii-del-in-name"),
         pytest.param("filename", "report\ud800.docx", id="invalid-utf8"),
         pytest.param("filename", "  ", id="blank-name"),
     ],
@@ -306,7 +366,16 @@ def test_distinct_document_names_keep_distinct_contents(
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("session_id", ["учебная-сессия", "s" * 256], ids=["unicode", "overlong"])
+@pytest.mark.parametrize(
+    "session_id",
+    [
+        pytest.param("учебная-сессия", id="unicode"),
+        pytest.param("s" * 256, id="overlong"),
+        pytest.param("..", id="dots"),
+        pytest.param("../neighbor", id="slash"),
+        pytest.param("synthetic\n", id="newline"),
+    ],
+)
 def test_encoded_session_directory_does_not_alias_literal_id(
     storage: LocalFileStorage, session_id: str
 ) -> None:
@@ -350,15 +419,18 @@ def test_save_limits_utf8_component_size(
     asyncio.run(scenario())
 
 
-def test_previous_storage_keys_remain_usable(storage: LocalFileStorage) -> None:
-    key = f"synthetic/{DOCUMENT_ID}_report.docx"
+@pytest.mark.parametrize(
+    "filename", ["report.docx", "report\u0085notes.docx"], ids=["plain", "nel"]
+)
+def test_previous_storage_keys_remain_usable(storage: LocalFileStorage, filename: str) -> None:
+    key = f"synthetic/{DOCUMENT_ID}_{filename}"
     previous = storage.base_dir / key
     previous.parent.mkdir(parents=True)
     previous.write_bytes(b"previous")
 
     async def scenario() -> None:
         current = await storage.save(
-            session_id="synthetic", doc_id=DOCUMENT_ID, filename="report.docx", content=b"current"
+            session_id="synthetic", doc_id=DOCUMENT_ID, filename=filename, content=b"current"
         )
         assert current != key
         assert await storage.read(current) == b"current"

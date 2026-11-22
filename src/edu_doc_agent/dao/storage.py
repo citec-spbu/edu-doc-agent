@@ -58,12 +58,15 @@ class FileStorage(Protocol):
         ...
 
     async def delete(self, storage_key: str) -> bool:
-        """Удаляет файл. Возвращает True, если файл был удалён, False — если его не было."""
+        """Удаляет обычный файл и возвращает True, при его отсутствии возвращает False.
+
+        Перед передачей отмены дожидается завершения начатого удаления.
+        """
         ...
 
 
-def _has_control_chars(value: str) -> bool:
-    """Проверяет наличие NUL-байта и управляющих символов (ASCII < 32 или 127)."""
+def _has_ascii_control_chars(value: str) -> bool:
+    """Проверяет наличие ASCII-символов U+0000–U+001F и U+007F."""
     return any(ord(ch) < 32 or ch == "\x7f" for ch in value)
 
 
@@ -71,16 +74,11 @@ def _encode_utf8(value: str) -> bytes:
     try:
         return value.encode("utf-8")
     except UnicodeEncodeError as exc:
-        raise InvalidStoragePathError("Компонент пути должен кодироваться в UTF-8") from exc
+        raise InvalidStoragePathError("Строка должна кодироваться в UTF-8") from exc
 
 
 def _session_directory(session_id: str) -> str:
-    if (
-        session_id in {"", ".", ".."}
-        or "/" in session_id
-        or "\\" in session_id
-        or _has_control_chars(session_id)
-    ):
+    if not session_id or "\x00" in session_id:
         raise InvalidStoragePathError(f"Некорректный session_id: {session_id!r}")
 
     return sha256(_encode_utf8(session_id)).hexdigest()
@@ -88,7 +86,7 @@ def _session_directory(session_id: str) -> str:
 
 def _validate_filename(filename: str) -> str:
     """Отклоняет пустые имена, управляющие символы и попытки path traversal в имени файла."""
-    if _has_control_chars(filename):
+    if _has_ascii_control_chars(filename):
         raise InvalidStoragePathError(f"Управляющие символы в имени файла: {filename!r}")
     if "/" in filename or "\\" in filename:
         raise InvalidStoragePathError(f"Разделители пути запрещены в имени файла: {filename!r}")
@@ -120,7 +118,7 @@ def _fit_filename(prefix: str, filename: str) -> str:
 
 
 def _key_parts(storage_key: str) -> list[str]:
-    if _has_control_chars(storage_key) or "\\" in storage_key:
+    if _has_ascii_control_chars(storage_key) or "\\" in storage_key:
         raise InvalidStoragePathError(f"Некорректный storage_key: {storage_key!r}")
 
     parts = storage_key.split("/")
@@ -291,10 +289,13 @@ class LocalFileStorage:
         def _unlink() -> bool:
             try:
                 with self._open_parent(parts) as parent:
-                    if stat.S_ISDIR(_entry_mode(name, parent)):
+                    mode = _entry_mode(name, parent)
+                    if stat.S_ISDIR(mode):
                         raise InvalidStoragePathError(
                             f"Ожидался файл, а не директория: {storage_key!r}"
                         )
+                    if not stat.S_ISREG(mode):
+                        return False
                     os.unlink(name, dir_fd=parent)
             except (FileNotFoundError, NotADirectoryError):
                 return False
@@ -304,4 +305,21 @@ class LocalFileStorage:
                 ) from exc
             return True
 
-        return await asyncio.to_thread(_unlink)
+        operation = asyncio.get_running_loop().run_in_executor(None, _unlink)
+        cancellation = None
+        # После CancelledError вызывающий код может заново сохранить файл по этому ключу.
+        while True:
+            try:
+                deleted = await asyncio.shield(operation)
+            except asyncio.CancelledError as exc:
+                if operation.cancelled():
+                    raise
+                cancellation = exc
+            except Exception as exc:
+                if cancellation is not None:
+                    raise cancellation from exc
+                raise
+            else:
+                if cancellation is not None:
+                    raise cancellation
+                return deleted
