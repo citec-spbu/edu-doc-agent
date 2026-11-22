@@ -203,6 +203,7 @@ class RegulationFragment(Base):
     number: Mapped[str] = mapped_column(String)
     path: Mapped[str] = mapped_column(String)
     text: Mapped[str] = mapped_column(String)
+    context: Mapped[str] = mapped_column(String, default="", server_default="")
     # умолчания строками: имя `text` в теле класса занято колонкой, sqlalchemy.text недоступен
     codes: Mapped[list[str]] = mapped_column(ARRAY(String), default=list, server_default="{}")
     parent: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -211,5 +212,6 @@ class RegulationFragment(Base):
     embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIM))
     # генерирует PostgreSQL; при вставке не передаётся
     tsv: Mapped[str | None] = mapped_column(
-        TSVECTOR, Computed("to_tsvector('russian', path || ' ' || text)", persisted=True)
+        TSVECTOR,
+        Computed("to_tsvector('russian', path || ' ' || context || ' ' || text)", persisted=True),
     )

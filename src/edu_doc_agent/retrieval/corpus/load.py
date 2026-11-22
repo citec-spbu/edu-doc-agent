@@ -31,8 +31,12 @@ class LoadResult:
 
 
 def embedding_input(fragment: Fragment) -> str:
-    """Строка для эмбеддинга: путь по разделам и текст (ADR-0005, схема хранения)."""
-    return f"{fragment.path}\n{fragment.text}"
+    """Строка для эмбеддинга: путь, контекст и текст (ADR-0005, схема хранения)."""
+    return _input(fragment.path, fragment.context, fragment.text)
+
+
+def _input(path: str, context: str, text: str) -> str:
+    return "\n".join(part for part in (path, context, text) if part)
 
 
 def fragment_row(fragment: Fragment) -> dict[str, Any]:
@@ -74,7 +78,7 @@ async def load_documents(
                 result.unchanged.append(doc_id)
                 continue
 
-        known = {f"{r['path']}\n{r['text']}": r["embedding"] for r in stored}
+        known = {_input(r["path"], r["context"], r["text"]): r["embedding"] for r in stored}
         missing = list(
             dict.fromkeys(key for f in doc.fragments if (key := embedding_input(f)) not in known)
         )

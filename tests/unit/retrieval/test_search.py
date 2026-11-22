@@ -19,6 +19,7 @@ def row(id: str, text: str, *, part: int = 0, kind: str = "clause", doc_id: str 
         "kind": kind,
         "path": f"путь › {id}",
         "text": text,
+        "context": "",
         "category": None,
     }
 

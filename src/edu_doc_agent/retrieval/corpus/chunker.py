@@ -41,6 +41,7 @@ from edu_doc_agent.retrieval.corpus.models import (
 
 MAX_PART_CHARS = 1500  # длиннее — пункт делится на части по предложениям
 MIN_PART_CHARS = 200  # хвост короче присоединяется к предыдущей части
+LEAD_MAX_CHARS = 300  # родительский пункт короче — заголовок или вводная строка перечня
 
 
 @dataclass(frozen=True)
@@ -102,9 +103,36 @@ def chunk_document(
     fragments = state.bind_changes()
     if overrides is not None:
         fragments = _apply(fragments, overrides, info, state.warnings)
+    fragments = _with_context(fragments)
     fragments = [part for fragment in fragments for part in _split(fragment)]
     state.warnings.extend(_check(fragments, info))
     return CorpusDocument(document=info, fragments=fragments, warnings=state.warnings)
+
+
+def _with_context(fragments: list[Fragment]) -> list[Fragment]:
+    """`context` — то, без чего фрагмент непонятен: вводные строки родительских пунктов.
+
+    «2.2.4.1. цели и задачи…» сам по себе не говорит, что речь о рабочих программах;
+    контекст — «2.2. … комплекта учебно-методической документации, включающей…» и
+    «2.2.4. рабочие программы курсов, дисциплин…, содержащие:». У компетенции — вводная
+    строка её пункта и категория, у строки перечня профстандартов — группа. Берутся только
+    короткие родители (заголовки, вводные строки перечней): длинный пункт — самостоятельный.
+    Контекст участвует в поиске, но не в цитате: `text` остаётся дословным.
+    """
+    leads = {
+        f.number: f.text for f in fragments if f.kind == "clause" and len(f.text) <= LEAD_MAX_CHARS
+    }
+    result = []
+    for f in fragments:
+        parts = f.number.split(".")
+        parents = [".".join(parts[:i]) for i in range(1, len(parts))]
+        if f.kind == "competency":
+            parents.append(f.number)  # вводная строка пункта, где перечислены компетенции
+        lines = [leads[n] for n in parents if n in leads]
+        if f.kind != "clause" and f.category:
+            lines.append(f.category)
+        result.append(f.model_copy(update={"context": "\n".join(lines)}))
+    return result
 
 
 def _apply(

@@ -32,6 +32,7 @@ FRAGMENT_FIELDS = (
     "number",
     "path",
     "text",
+    "context",
     "codes",
     "parent",
     "category",

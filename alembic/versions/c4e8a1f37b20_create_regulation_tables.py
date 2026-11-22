@@ -59,6 +59,7 @@ def upgrade() -> None:
         sa.Column("number", sa.String(), nullable=False),
         sa.Column("path", sa.String(), nullable=False),
         sa.Column("text", sa.String(), nullable=False),
+        sa.Column("context", sa.String(), server_default="", nullable=False),
         sa.Column(
             "codes",
             postgresql.ARRAY(sa.String()),
@@ -77,7 +78,9 @@ def upgrade() -> None:
         sa.Column(
             "tsv",
             postgresql.TSVECTOR(),
-            sa.Computed("to_tsvector('russian', path || ' ' || text)", persisted=True),
+            sa.Computed(
+                "to_tsvector('russian', path || ' ' || context || ' ' || text)", persisted=True
+            ),
             nullable=True,
         ),
         sa.CheckConstraint(

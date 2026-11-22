@@ -26,7 +26,9 @@ from edu_doc_agent.retrieval.ranking import query_keys, rrf
 
 logger = logging.getLogger(__name__)
 
-Method = Literal["exact", "hybrid", "fts"]
+Method = Literal["exact", "hybrid", "fts", "vector"]
+# auto — как описано выше; fts / vector — один способ после точного (для оценки качества)
+Mode = Literal["auto", "fts", "vector"]
 CANDIDATES = 50  # сколько кандидатов берёт каждый способ поиска до слияния
 
 
@@ -40,6 +42,7 @@ class RegulationHit(BaseModel):
     kind: str  # clause / competency / prof_standard_ref
     path: str
     text: str  # дословно; у пункта из частей — склейка всех частей
+    context: str = ""  # вводные строки родительских пунктов: без них пункт перечня непонятен
     category: str | None = None
     rank: int  # место в выдаче, с 1
     method: Method
@@ -59,6 +62,7 @@ class RegulationSearch:
         doc_ids: Sequence[str] | None = None,
         doc_types: Sequence[str] | None = None,
         top_k: int = 5,
+        mode: Mode = "auto",
     ) -> list[RegulationHit]:
         filters = {"doc_ids": doc_ids, "doc_types": doc_types, "limit": CANDIDATES}
         keys = query_keys(query)
@@ -70,8 +74,11 @@ class RegulationSearch:
             if exact:
                 return await self._hits(list(dict.fromkeys(exact))[:top_k], "exact")
 
+        if mode == "vector":
+            vector = await self._vector(query, filters)
+            return await self._hits(list(dict.fromkeys(vector or []))[:top_k], "vector")
         full_text = await self._dao.full_text(query, **filters)
-        vector = await self._vector(query, filters)
+        vector = await self._vector(query, filters) if mode == "auto" else None
         if vector is None:
             return await self._hits(list(dict.fromkeys(full_text))[:top_k], "fts")
         return await self._hits(rrf([full_text, vector])[:top_k], "hybrid")
@@ -150,6 +157,7 @@ class RegulationSearch:
                     kind=first["kind"],
                     path=first["path"],
                     text="".join(r["text"] for r in rows),
+                    context=first["context"],
                     category=first["category"],
                     rank=len(hits) + 1,
                     method=method,

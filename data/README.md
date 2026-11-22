@@ -38,6 +38,13 @@ uv run python -m edu_doc_agent.retrieval.corpus.load data/regulations/manifest.y
 Повторная загрузка неизменённого корпуса ничего не пишет; эмбеддинги пересчитываются только
 для изменившихся фрагментов. `--prune` удаляет из базы документы, которых нет в манифесте.
 
+Проверка выдачи и оценка качества поиска (`golden.yaml` — вопросы и правильные пункты):
+
+```bash
+uv run python -m edu_doc_agent.retrieval.search "объем программы" --direction 02.03.02
+uv run python -m edu_doc_agent.retrieval.evaluate data/regulations/golden.yaml
+```
+
 В `REPORT.md` — число пунктов, компетенций и профстандартов по документам и замечания:
 пропуски в нумерации, УК/ОПК не подряд, строки таблиц без кода. Замечание чинится правкой
 в `overrides.yaml`, исходный PDF не трогаем.
