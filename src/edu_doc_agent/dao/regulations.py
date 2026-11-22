@@ -140,6 +140,7 @@ class RegulationDAO:
         *,
         doc_ids: Sequence[str] | None = None,
         doc_types: Sequence[str] | None = None,
+        kinds: Sequence[str] | None = None,
         limit: int = 50,
     ) -> list[ClauseKey]:
         """Фрагменты с любым из кодов; сначала сами компетенции и профстандарты, потом пункты,
@@ -151,7 +152,7 @@ class RegulationDAO:
             .order_by(case((f.kind == "clause", 1), else_=0), f.doc_id, f.id, f.part)
             .limit(limit)
         )
-        return await self._keys(_filtered(query, doc_ids, doc_types))
+        return await self._keys(_filtered(query, doc_ids, doc_types, kinds))
 
     async def find_by_numbers(
         self,
@@ -159,6 +160,7 @@ class RegulationDAO:
         *,
         doc_ids: Sequence[str] | None = None,
         doc_types: Sequence[str] | None = None,
+        kinds: Sequence[str] | None = None,
         limit: int = 50,
     ) -> list[ClauseKey]:
         """Пункты с указанными номерами («2.3»)."""
@@ -169,7 +171,7 @@ class RegulationDAO:
             .order_by(f.doc_id, f.id, f.part)
             .limit(limit)
         )
-        return await self._keys(_filtered(query, doc_ids, doc_types))
+        return await self._keys(_filtered(query, doc_ids, doc_types, kinds))
 
     async def full_text(
         self,
@@ -177,6 +179,7 @@ class RegulationDAO:
         *,
         doc_ids: Sequence[str] | None = None,
         doc_types: Sequence[str] | None = None,
+        kinds: Sequence[str] | None = None,
         limit: int = 50,
     ) -> list[ClauseKey]:
         """Полнотекстовый поиск по tsv: слова запроса через ИЛИ, порядок — ts_rank_cd.
@@ -192,7 +195,7 @@ class RegulationDAO:
             .order_by(func.ts_rank_cd(f.tsv, tsquery).desc(), f.id, f.part)
             .limit(limit)
         )
-        return await self._keys(_filtered(query, doc_ids, doc_types))
+        return await self._keys(_filtered(query, doc_ids, doc_types, kinds))
 
     async def nearest(
         self,
@@ -200,6 +203,7 @@ class RegulationDAO:
         *,
         doc_ids: Sequence[str] | None = None,
         doc_types: Sequence[str] | None = None,
+        kinds: Sequence[str] | None = None,
         limit: int = 50,
     ) -> list[ClauseKey]:
         """Ближайшие по косинусному расстоянию (точный перебор, ANN-индекса нет)."""
@@ -209,7 +213,7 @@ class RegulationDAO:
             .order_by(f.embedding.cosine_distance(list(embedding)), f.id, f.part)
             .limit(limit)
         )
-        return await self._keys(_filtered(query, doc_ids, doc_types))
+        return await self._keys(_filtered(query, doc_ids, doc_types, kinds))
 
     async def list_heads(self, doc_ids: Sequence[str]) -> set[tuple[str, str, str]]:
         """(doc_id, edition, номер) пунктов, вводящих перечень: текст кончается двоеточием."""
@@ -245,10 +249,15 @@ class RegulationDAO:
 
 
 def _filtered(
-    query: Select, doc_ids: Sequence[str] | None, doc_types: Sequence[str] | None
+    query: Select,
+    doc_ids: Sequence[str] | None,
+    doc_types: Sequence[str] | None,
+    kinds: Sequence[str] | None = None,
 ) -> Select:
     if doc_ids is not None:
         query = query.where(_FRAGMENTS.c.doc_id.in_(list(doc_ids)))
     if doc_types is not None:
         query = query.where(_FRAGMENTS.c.doc_type.in_(list(doc_types)))
+    if kinds is not None:
+        query = query.where(_FRAGMENTS.c.kind.in_(list(kinds)))
     return query

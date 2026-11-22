@@ -4,6 +4,7 @@ import asyncio
 
 from edu_doc_agent.llm import FakeEmbedder, LLMError
 from edu_doc_agent.retrieval.search import RegulationSearch
+from edu_doc_agent.retrieval.tools import RegulationTools
 
 FGOS, OS = "fgos-02.03.02", "spbu-os"
 ED = "808"
@@ -133,19 +134,26 @@ def test_without_embeddings_only_full_text() -> None:
     assert "nearest" not in names(dao)
 
 
-def test_wrappers_filter_by_document_type() -> None:
+def test_tools_pass_program_documents_and_types_to_queries() -> None:
     dao = FakeDAO(full_text=[f"{OS}:2.3"])
-    search = RegulationSearch(dao)
-    run(search.search_spbu_regulations("структура программы", doc_ids=[OS], top_k=3))
-    run(search.search_fgos("структура программы"))
-    run(search.search_all_regulations("структура программы"))
-    types = [kwargs["doc_types"] for name, kwargs in dao.calls if name == "full_text"]
-    assert types == [["spbu_standard"], ["fgos"], None]
+    tools = RegulationTools(RegulationSearch(dao), doc_ids=[FGOS, OS])
+    run(tools.search_spbu_regulations("структура программы", top_k=3))
+    run(tools.search_fgos("структура программы"))
+    run(tools.search_prof_standards("программист"))
+    run(tools.search_all_regulations("структура программы"))
+    calls = [kwargs for name, kwargs in dao.calls if name == "full_text"]
+    assert [(c["doc_types"], c["kinds"]) for c in calls] == [
+        (["spbu_standard"], None),
+        (["fgos"], None),
+        (None, ["prof_standard_ref"]),
+        (None, None),
+    ]
+    assert all(c["doc_ids"] == [FGOS, OS] for c in calls)
 
 
 def test_get_clause_and_documents_for_direction() -> None:
     search = RegulationSearch(FakeDAO())
-    clause = run(search.get_fgos_clause(f"{FGOS}:4.1", ED))
+    clause = run(search.get_clause(f"{FGOS}:4.1", ED))
     assert clause is not None and clause.text == "Первая часть. Вторая часть."
     assert run(search.get_clause(f"{FGOS}:9.9", ED)) is None
     assert run(search.documents_for_direction("02.03.02")) == [FGOS, OS]

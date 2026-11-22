@@ -15,6 +15,7 @@
 заменяется вводным пунктом со всеми подпунктами (`covers` — их id). Редакция результата —
 та, что в базе.
 Список документов (`doc_ids`) задаёт вызывающий код по данным программы, а не LLM.
+Инструменты для агентов поверх этого поиска — retrieval/tools.py.
 """
 
 import asyncio
@@ -79,11 +80,12 @@ class RegulationSearch:
         *,
         doc_ids: Sequence[str] | None = None,
         doc_types: Sequence[str] | None = None,
+        kinds: Sequence[str] | None = None,
         top_k: int = 5,
         mode: Mode = "auto",
         fts_weight: float | None = None,
     ) -> list[RegulationHit]:
-        filters = {"doc_ids": doc_ids, "doc_types": doc_types, "limit": CANDIDATES}
+        filters = {"doc_ids": doc_ids, "doc_types": doc_types, "kinds": kinds, "limit": CANDIDATES}
         keys = query_keys(query)
         if keys:
             exact = [
@@ -116,34 +118,6 @@ class RegulationSearch:
             for d in documents
             if d["direction_code"] == direction_code or d["doc_type"] == "spbu_standard"
         ]
-
-    # обёртки под инструменты агентов (ADR-0003)
-
-    async def search_fgos(
-        self, query: str, *, doc_ids: Sequence[str] | None = None, top_k: int = 5
-    ) -> list[RegulationHit]:
-        return await self.search(query, doc_ids=doc_ids, doc_types=["fgos"], top_k=top_k)
-
-    async def search_spbu_regulations(
-        self, query: str, *, doc_ids: Sequence[str] | None = None, top_k: int = 5
-    ) -> list[RegulationHit]:
-        return await self.search(query, doc_ids=doc_ids, doc_types=["spbu_standard"], top_k=top_k)
-
-    async def search_prof_standards(
-        self, query: str, *, doc_ids: Sequence[str] | None = None, top_k: int = 5
-    ) -> list[RegulationHit]:
-        return await self.search(query, doc_ids=doc_ids, doc_types=["prof_standard"], top_k=top_k)
-
-    async def search_all_regulations(
-        self, query: str, *, doc_ids: Sequence[str] | None = None, top_k: int = 5
-    ) -> list[RegulationHit]:
-        return await self.search(query, doc_ids=doc_ids, top_k=top_k)
-
-    async def get_fgos_clause(self, id: str, edition: str) -> RegulationHit | None:
-        return await self.get_clause(id, edition)
-
-    async def get_spbu_clause(self, id: str, edition: str) -> RegulationHit | None:
-        return await self.get_clause(id, edition)
 
     # --- внутреннее
 

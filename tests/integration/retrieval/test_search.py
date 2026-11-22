@@ -9,6 +9,7 @@ from edu_doc_agent.llm import FakeEmbedder
 from edu_doc_agent.retrieval.corpus.load import load_documents
 from edu_doc_agent.retrieval.corpus.models import CorpusDocument, DocumentInfo, Fragment
 from edu_doc_agent.retrieval.search import RegulationSearch
+from edu_doc_agent.retrieval.tools import RegulationTools
 
 pytestmark = pytest.mark.integration
 
@@ -128,11 +129,12 @@ def test_hybrid_respects_doc_ids_and_joins_parts(search: RegulationSearch) -> No
     )
 
 
-def test_document_type_wrappers(search: RegulationSearch) -> None:
-    assert {h.doc_type for h in run(search.search_fgos("программы"))} == {"fgos"}
-    assert {h.doc_type for h in run(search.search_spbu_regulations("программы"))} == {
-        "spbu_standard"
-    }
+def test_tools_for_program(search: RegulationSearch) -> None:
+    tools = run(RegulationTools.for_program(search, "02.03.02"))
+    assert tools.doc_ids == [FGOS, OS]
+    assert {h.doc_type for h in run(tools.search_fgos("программы"))} == {"fgos"}
+    assert {h.doc_id for h in run(tools.search_spbu_regulations("программы"))} == {OS}
+    assert {h.doc_id for h in run(tools.search_all_regulations("программы"))} <= {FGOS, OS}
 
 
 def test_full_text_only_without_embedder(dao: RegulationDAO, search: RegulationSearch) -> None:
@@ -141,7 +143,7 @@ def test_full_text_only_without_embedder(dao: RegulationDAO, search: RegulationS
 
 
 def test_get_clause_and_documents_for_direction(search: RegulationSearch) -> None:
-    clause_hit = run(search.get_fgos_clause(f"{FGOS}:4.1", "1"))
+    clause_hit = run(search.get_clause(f"{FGOS}:4.1", "1"))
     assert clause_hit is not None and clause_hit.text.endswith("программы бакалавриата.")
     assert run(search.get_clause(f"{FGOS}:4.1", "нет такой")) is None
     assert run(search.documents_for_direction("02.03.02")) == [FGOS, OS]
