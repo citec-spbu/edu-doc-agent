@@ -619,6 +619,7 @@ def test_arq_records_terminal_failure(
                     settings.WorkerSettings,
                     redis_pool=pool,
                     queue_name=name,
+                    cron_jobs=[],
                     burst=True,
                     max_burst_jobs=1,
                     max_tries=0 if failure == "max-tries" else 3,
