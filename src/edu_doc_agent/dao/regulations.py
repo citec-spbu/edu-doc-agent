@@ -1,7 +1,7 @@
 """Репозиторий нормативов для RAG (ADR-0005): документы и фрагменты в PostgreSQL + pgvector."""
 
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy import (
     Select,
@@ -46,6 +46,8 @@ _RUSSIAN = literal_column("'russian'::regconfig")
 
 # ключ пункта в выдаче поиска: (id, edition); части одного пункта дают один ключ
 ClauseKey = tuple[str, str]
+# слова запроса в полнотекстовом поиске: any — хотя бы одно (ИЛИ), all — все (И)
+TextMatch = Literal["any", "all"]
 
 
 class RegulationDAO:
@@ -177,22 +179,26 @@ class RegulationDAO:
         self,
         text: str,
         *,
+        match: TextMatch = "any",
         doc_ids: Sequence[str] | None = None,
         doc_types: Sequence[str] | None = None,
         kinds: Sequence[str] | None = None,
         limit: int = 50,
     ) -> list[ClauseKey]:
-        """Полнотекстовый поиск по tsv: слова запроса через ИЛИ, порядок — ts_rank_cd.
+        """Полнотекстовый поиск по tsv, порядок — ts_rank_cd.
 
-        ИЛИ, а не И: вопрос на естественном языке редко содержит все слова пункта.
+        `match="any"` — слова запроса через ИЛИ: вопрос на естественном языке редко содержит
+        все слова пункта, зато под запрос подходит большая часть документа. `"all"` — через И:
+        находит мало, но точно.
         """
         f = _FRAGMENTS.c
-        plain = cast(func.plainto_tsquery(_RUSSIAN, text), Text)
-        tsquery = func.to_tsquery(_RUSSIAN, func.replace(plain, " & ", " | "))
+        plain = func.plainto_tsquery(_RUSSIAN, text)
+        if match == "any":
+            plain = func.to_tsquery(_RUSSIAN, func.replace(cast(plain, Text), " & ", " | "))
         query = (
             select(f.id, f.edition)
-            .where(f.tsv.op("@@")(tsquery))
-            .order_by(func.ts_rank_cd(f.tsv, tsquery).desc(), f.id, f.part)
+            .where(f.tsv.op("@@")(plain))
+            .order_by(func.ts_rank_cd(f.tsv, plain).desc(), f.id, f.part)
             .limit(limit)
         )
         return await self._keys(_filtered(query, doc_ids, doc_types, kinds))
@@ -214,6 +220,22 @@ class RegulationDAO:
             .limit(limit)
         )
         return await self._keys(_filtered(query, doc_ids, doc_types, kinds))
+
+    async def similarities(
+        self, embedding: Sequence[float], keys: Sequence[ClauseKey]
+    ) -> dict[ClauseKey, float]:
+        """Косинусное сходство запроса с пунктами (у пункта из частей — лучшая часть)."""
+        if not keys:
+            return {}
+        f = _FRAGMENTS.c
+        similarity = func.max(1 - f.embedding.cosine_distance(list(embedding)))
+        query = (
+            select(f.id, f.edition, similarity.label("similarity"))
+            .where(tuple_(f.id, f.edition).in_(list(keys)))
+            .group_by(f.id, f.edition)
+        )
+        async with self._session_factory() as db:
+            return {(r.id, r.edition): float(r.similarity) for r in await db.execute(query)}
 
     async def list_heads(self, doc_ids: Sequence[str]) -> set[tuple[str, str, str]]:
         """(doc_id, edition, номер) пунктов, вводящих перечень: текст кончается двоеточием."""

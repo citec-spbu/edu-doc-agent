@@ -87,8 +87,12 @@ def test_each_tool_searches_its_documents() -> None:
 
 def test_code_is_found_exactly_and_clause_read_by_reference() -> None:
     t = tools()
-    (hit,) = run(t.search_fgos("что требует УК-1", top_k=3))
+    hit, *rest = run(t.search_fgos("что требует УК-1", top_k=3))
     assert (hit.id, hit.method) == (f"{FGOS}:3.2:УК-1", "exact")
+    assert all(h.method == "fts" for h in rest)  # остальное — по словам запроса
+    assert all(h.method != "exact" for h in run(t.search_fgos("Что такое УК-1.2?")))
+    hits = run(t.search_all_regulations("пункт 1.9 и 2.4"))
+    assert [h.id for h in hits if h.method == "exact"] == [f"{FGOS}:1.9", f"{OS}:2.4"]
     clause_hit = run(t.get_fgos_clause(hit.id, hit.edition))
     assert clause_hit is not None and clause_hit.text == hit.text
     assert run(t.get_spbu_clause(f"{OS}:9.9", "1")) is None

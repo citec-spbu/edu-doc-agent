@@ -99,18 +99,39 @@ def run(coro):
     return asyncio.run(coro)
 
 
-def test_code_is_found_exactly_with_definition_first(search: RegulationSearch) -> None:
+def test_code_is_found_exactly_first_then_by_meaning(search: RegulationSearch) -> None:
     hits = run(search.search("что требует ук-1?", doc_ids=[FGOS, OS]))
-    assert [(h.id, h.method) for h in hits] == [
+    assert [(h.id, h.method) for h in hits[:2]] == [
         (f"{FGOS}:3.2:УК-1", "exact"),  # сама компетенция раньше пункта, где она упомянута
         (f"{FGOS}:3.2", "exact"),
     ]
     assert hits[0].category == "Системное и критическое мышление"
+    # остальные места — по смыслу запроса, без повторов точных
+    assert {h.method for h in hits[2:]} == {"hybrid"} and len({h.id for h in hits}) == len(hits)
+    assert all(h.similarity is not None and -1 <= h.similarity <= 1 for h in hits)
 
 
-def test_clause_number_with_document_filter(search: RegulationSearch) -> None:
+def test_indicator_is_not_an_exact_match(search: RegulationSearch) -> None:
+    hits = run(search.search("Что такое УК-1.2?", doc_ids=[FGOS, OS]))
+    assert hits and all(h.method == "hybrid" for h in hits)
+
+
+def test_clause_numbers_with_document_filter(search: RegulationSearch) -> None:
     hits = run(search.search("что сказано в п. 2.3", doc_ids=[FGOS, OS]))
-    assert [(h.id, h.method) for h in hits] == [(f"{OS}:2.3", "exact")]
+    assert (hits[0].id, hits[0].method) == (f"{OS}:2.3", "exact")
+    assert all(h.method != "exact" for h in hits[1:])
+    hits = run(search.search("пункт 2.3 и 1.9", doc_ids=[FGOS, OS]))
+    assert [h.id for h in hits if h.method == "exact"] == [f"{FGOS}:1.9", f"{OS}:2.3"]
+
+
+def test_full_text_with_all_words(dao: RegulationDAO, search: RegulationSearch) -> None:
+    any_word = run(dao.full_text("объем рабочих программ", doc_ids=[FGOS, OS]))
+    all_words = run(dao.full_text("объем рабочих программ", match="all", doc_ids=[FGOS, OS]))
+    assert {f"{FGOS}:1.9", f"{OS}:2.3"} <= {i for i, _ in any_word}
+    assert all_words == []  # ни в одном пункте нет всех трёх слов
+    assert [i for i, _ in run(dao.full_text("рабочие программы дисциплин", match="all"))] == [
+        f"{OS}:2.3"
+    ]
 
 
 def test_hybrid_respects_doc_ids_and_joins_parts(search: RegulationSearch) -> None:

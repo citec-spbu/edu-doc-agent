@@ -2,13 +2,16 @@
 
     uv run python -m edu_doc_agent.retrieval.evaluate data/regulations/golden.yaml
 
-Две метрики, обе — доля вопросов из золотого набора:
+Две метрики, обе — доля вопросов из золотого набора, на которые в нормативах есть ответ:
 
 - «первым» — правильный пункт на первом месте выдачи;
 - «в первых 5» — правильный пункт среди первых пяти (столько по умолчанию видит агент).
 
-Сравниваются способы: только векторный, только полнотекстовый и гибрид с разным весом
-полнотекстового списка в RRF. Нужны загруженный корпус и Ollama с моделью эмбеддингов.
+Сравниваются способы: только векторный, только полнотекстовый (слова запроса через ИЛИ и
+через И) и гибрид с разным сочетанием слов и весом полнотекстового списка в RRF.
+Вопросы без ответа (`relevant: []`) в метрики не входят: по ним видно, какое сходство с
+запросом у первого результата, когда ответа нет. Нужны загруженный корпус и Ollama с моделью
+эмбеддингов.
 """
 
 import argparse
@@ -17,21 +20,30 @@ import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import median
 
 import yaml
 
-from edu_doc_agent.retrieval.search import FTS_WEIGHT, Mode, RegulationHit, RegulationSearch
+from edu_doc_agent.dao.regulations import TextMatch
+from edu_doc_agent.retrieval.search import (
+    FTS_MATCH,
+    FTS_WEIGHT,
+    Mode,
+    RegulationHit,
+    RegulationSearch,
+)
 
 TOP = 5  # «в первых 5»
 DEPTH = 10  # сколько результатов смотрим, чтобы показать место правильного пункта
-FTS_WEIGHTS = (1.0, 0.5, 0.25)
+FTS_WEIGHTS = (1.0, 0.25)
+MATCH_NAMES: dict[TextMatch, str] = {"any": "ИЛИ", "all": "И"}
 
 
 @dataclass
 class Question:
     question: str
     direction: str
-    relevant: list[str]  # id пунктов; «префикс*» — любой id с этим началом
+    relevant: list[str]  # id пунктов; «префикс*» — любой id с этим началом; [] — ответа нет
 
 
 @dataclass
@@ -39,6 +51,32 @@ class Outcome:
     question: Question
     rank: int | None  # место первого правильного пункта (с 1) или None
     found: list[str]  # id первых результатов
+    similarity: float | None = None  # сходство первого результата с вопросом
+
+
+@dataclass(frozen=True)
+class Variant:
+    """Способ поиска для сравнения."""
+
+    name: str
+    mode: Mode
+    fts_match: TextMatch | None = None
+    fts_weight: float | None = None
+
+
+def hybrid_name(match: TextMatch, weight: float) -> str:
+    return f"гибрид, {MATCH_NAMES[match]}, вес текста {weight:g}"
+
+
+def variants(weights: Sequence[float] = FTS_WEIGHTS) -> list[Variant]:
+    out = [
+        Variant("вектор", "vector"),
+        Variant("текст, ИЛИ", "fts", "any"),
+        Variant("текст, И", "fts", "all"),
+    ]
+    for match in MATCH_NAMES:
+        out += [Variant(hybrid_name(match, w), "auto", match, w) for w in weights]
+    return out
 
 
 def load_golden(path: Path) -> list[Question]:
@@ -60,35 +98,42 @@ def first_relevant(hits: Sequence[RegulationHit], relevant: Sequence[str]) -> in
 
 
 def metrics(outcomes: Sequence[Outcome]) -> dict[str, float]:
-    n = len(outcomes) or 1
+    answerable = [o for o in outcomes if o.question.relevant]
+    n = len(answerable) or 1
     return {
-        "первым": sum(1 for o in outcomes if o.rank == 1) / n,
-        f"в первых {TOP}": sum(1 for o in outcomes if o.rank is not None and o.rank <= TOP) / n,
+        "первым": sum(1 for o in answerable if o.rank == 1) / n,
+        f"в первых {TOP}": sum(1 for o in answerable if o.rank is not None and o.rank <= TOP) / n,
     }
 
 
 async def evaluate(
-    search: RegulationSearch,
-    questions: Sequence[Question],
-    mode: Mode,
-    fts_weight: float | None = None,
+    search: RegulationSearch, questions: Sequence[Question], variant: Variant
 ) -> list[Outcome]:
     outcomes = []
     for q in questions:
         doc_ids = await search.documents_for_direction(q.direction)
         hits = await search.search(
-            q.question, doc_ids=doc_ids, top_k=DEPTH, mode=mode, fts_weight=fts_weight
+            q.question,
+            doc_ids=doc_ids,
+            top_k=DEPTH,
+            mode=variant.mode,
+            fts_match=variant.fts_match,
+            fts_weight=variant.fts_weight,
         )
-        outcomes.append(Outcome(q, first_relevant(hits, q.relevant), [h.id for h in hits]))
+        similarity = hits[0].similarity if hits else None
+        outcomes.append(
+            Outcome(q, first_relevant(hits, q.relevant), [h.id for h in hits], similarity)
+        )
     return outcomes
 
 
 def report(results: dict[str, list[Outcome]]) -> str:
     modes = list(results)
     names = list(metrics([]))
-    n = len(results[modes[0]])
+    answerable = [o for o in results[modes[0]] if o.question.relevant]
+    n = len(answerable)
     lines = [
-        f"Вопросов: {n}. Доля вопросов, где правильный пункт…",
+        f"Вопросов с ответом: {n}. Доля вопросов, где правильный пункт…",
         "",
         "| Способ | " + " | ".join(names) + " |",
         "|---" * (len(names) + 1) + "|",
@@ -99,20 +144,50 @@ def report(results: dict[str, list[Outcome]]) -> str:
         lines.append(f"| {mode} | {cells} |")
     lines += ["", "Место правильного пункта (— — нет в первых 10):", ""]
     lines += ["| # | Вопрос | " + " | ".join(modes) + " |", "|---" * (len(modes) + 2) + "|"]
-    for i, q in enumerate(results[modes[0]], start=1):
-        ranks = [results[m][i - 1].rank for m in modes]
-        cells = " | ".join(str(r) if r else "—" for r in ranks)
-        lines.append(f"| {i} | {q.question.question} | {cells} |")
-    # разбор ошибок — для способа, которым ищут агенты (гибрид с весом по умолчанию)
-    main_mode = next((m for m in modes if m == f"гибрид, вес текста {FTS_WEIGHT:g}"), modes[0])
-    misses = [o for o in results[main_mode] if o.rank != 1]
+    for i, o in enumerate(results[modes[0]]):
+        if not o.question.relevant:
+            continue
+        cells = " | ".join(str(results[m][i].rank or "—") for m in modes)
+        lines.append(f"| {i + 1} | {o.question.question} | {cells} |")
+    # разбор — для способа, которым ищут агенты (гибрид с настройками по умолчанию)
+    default = hybrid_name(FTS_MATCH, FTS_WEIGHT)
+    main_mode = default if default in results else modes[-1]
+    misses = [o for o in results[main_mode] if o.question.relevant and o.rank != 1]
     if misses:
         lines += ["", f"Правильный пункт не первым ({main_mode}):", ""]
         for o in misses:
             lines.append(f"- {o.question.question}")
             lines.append(f"  - ожидалось: {', '.join(o.question.relevant)}")
             lines.append(f"  - найдено: {', '.join(o.found[:5]) or '—'}")
+    lines += _similarity_lines(results[main_mode], main_mode)
     return "\n".join(lines)
+
+
+def _similarity_lines(outcomes: Sequence[Outcome], mode: str) -> list[str]:
+    """Сходство первого результата: с ответом и без — чтобы выбрать порог «не нашлось»."""
+
+    def values(answerable: bool) -> list[float]:
+        return sorted(
+            o.similarity
+            for o in outcomes
+            if o.similarity is not None and bool(o.question.relevant) == answerable
+        )
+
+    found, missing = values(True), values(False)
+    if not found:
+        return []
+    lines = [
+        "",
+        f"Сходство первого результата с вопросом ({mode}):",
+        "",
+        f"- есть ответ: от {found[0]:.2f} до {found[-1]:.2f}, медиана {median(found):.2f}",
+    ]
+    if missing:
+        lines.append(f"- ответа нет: от {missing[0]:.2f} до {missing[-1]:.2f}")
+        for o in outcomes:
+            if not o.question.relevant and o.similarity is not None and o.found:
+                lines.append(f"  - {o.question.question} — {o.similarity:.2f}, {o.found[0]}")
+    return lines
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -129,14 +204,7 @@ async def _run(args: argparse.Namespace) -> int:
     try:
         dao = RegulationDAO(async_sessionmaker(engine, expire_on_commit=False))
         search = RegulationSearch(dao, OllamaEmbedder.from_settings(settings))
-        results = {
-            "вектор": await evaluate(search, questions, "vector"),
-            "текст": await evaluate(search, questions, "fts"),
-        }
-        for weight in args.fts_weights:
-            results[f"гибрид, вес текста {weight:g}"] = await evaluate(
-                search, questions, "auto", weight
-            )
+        results = {v.name: await evaluate(search, questions, v) for v in variants(args.fts_weights)}
     finally:
         await engine.dispose()
     text = report(results)

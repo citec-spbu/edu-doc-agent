@@ -7,14 +7,20 @@ import re
 from collections.abc import Hashable, Sequence
 from dataclasses import dataclass
 
-from edu_doc_agent.retrieval.corpus.codes import PROF_STANDARD_CODE, find_competency_codes
+from edu_doc_agent.retrieval.corpus.codes import COMPETENCY_CODE, PROF_STANDARD_CODE, normalize_code
 
 RRF_K = 60  # константа RRF: сглаживает разницу между верхними местами списков
 
-# номер пункта только с явным «п.» / «пункт»: голые «02.03.02» и «2.3» — не пункты
-_CLAUSE_NUMBER = re.compile(
-    r"(?:\bп(?:ункт[а-я]*)?\.?|\bпп\.?|\bподпункт[а-я]*)\s*(\d+(?:\.\d+)+)\b", re.IGNORECASE
+_NUMBER_IN_QUERY = r"\d+(?:\.\d+)+"
+# номер пункта только с явным «п.» / «пункт»: голые «02.03.02» и «2.3» — не пункты;
+# после «п.» — один номер или перечень: «пункт 2.3 и 2.4», «пп. 2.3, 2.4»
+_CLAUSE_NUMBERS = re.compile(
+    rf"(?:\bп(?:ункт[а-я]*)?\.?|\bпп\.?|\bподпункт[а-я]*)\s*"
+    rf"({_NUMBER_IN_QUERY}(?:\s*(?:,|\bи\b|\bили\b)\s*{_NUMBER_IN_QUERY})*)",
+    re.IGNORECASE,
 )
+# после кода компетенции — номер индикатора: «УК-1.2»
+_INDICATOR_TAIL = re.compile(r"\.\d")
 
 
 @dataclass(frozen=True)
@@ -29,10 +35,25 @@ class QueryKeys:
 
 
 def query_keys(query: str) -> QueryKeys:
-    """`'Что требует УК-1 и п. 2.3?'` -> коды `('УК-1',)`, номера `('2.3',)`."""
-    # в чате коды пишут и строчными: «ук-1»
-    codes = [*find_competency_codes(query.upper()), *PROF_STANDARD_CODE.findall(query)]
-    numbers = [m.rstrip(".") for m in _CLAUSE_NUMBER.findall(query)]
+    """`'Что требует УК-1 и п. 2.3?'` -> коды `('УК-1',)`, номера `('2.3',)`.
+
+    Индикатор («УК-1.2») — не код компетенции: во ФГОС индикаторов нет, и найденная
+    «точно» УК-1 выдавала бы несуществующее требование за подтверждённое. Индикатор
+    ищется как обычный текст.
+    """
+    upper = query.upper()  # в чате коды пишут и строчными: «ук-1»
+    competencies = [
+        normalize_code(m.group(0))
+        for m in COMPETENCY_CODE.finditer(upper)
+        if not _INDICATOR_TAIL.match(upper, m.end())
+    ]
+    codes = [*competencies, *PROF_STANDARD_CODE.findall(query)]
+    numbers = [
+        number
+        for match in _CLAUSE_NUMBERS.findall(query)
+        for number in re.findall(_NUMBER_IN_QUERY, match)
+        if not number.startswith("0")  # «02.03.02» в перечне — код направления, не пункт
+    ]
     return QueryKeys(tuple(dict.fromkeys(codes)), tuple(dict.fromkeys(numbers)))
 
 

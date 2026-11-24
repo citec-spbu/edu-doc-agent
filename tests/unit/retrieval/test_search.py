@@ -64,6 +64,11 @@ class FakeDAO:
     async def nearest(self, embedding, **kwargs):
         return await self._answer("nearest", kwargs)
 
+    async def similarities(self, embedding, keys):
+        self.calls.append(("similarities", {"keys": list(keys)}))
+        # у каждого пункта своё сходство; у частей одного пункта — одно
+        return {key: round(0.5 + 0.01 * len(key[0]), 3) for key in keys}
+
     async def get_parts(self, keys):
         wanted = set(keys)
         return [r for r in ROWS if (r["id"], r["edition"]) in wanted]
@@ -103,12 +108,24 @@ def names(dao: FakeDAO) -> list[str]:
     return [name for name, _ in dao.calls]
 
 
-def test_code_in_query_finds_exactly() -> None:
-    dao = FakeDAO(codes=[f"{FGOS}:3.2:УК-1"], full_text=[f"{FGOS}:1.9"])
-    hits = run(RegulationSearch(dao, FakeEmbedder()).search("что требует ук-1", doc_ids=[FGOS]))
-    assert [(h.id, h.method, h.rank) for h in hits] == [(f"{FGOS}:3.2:УК-1", "exact", 1)]
-    assert names(dao) == ["codes"]  # гибрид не нужен
+def test_exact_match_comes_first_and_the_rest_is_filled_by_hybrid() -> None:
+    dao = FakeDAO(
+        codes=[f"{FGOS}:3.2:УК-1"],
+        full_text=[f"{FGOS}:1.9", f"{FGOS}:3.2:УК-1"],
+        nearest=[f"{FGOS}:3.2:УК-1", f"{FGOS}:4.1"],
+    )
+    search = RegulationSearch(dao, FakeEmbedder())
+    hits = run(search.search("в обязательной ли части дисциплины для ук-1", doc_ids=[FGOS]))
+    # найденное точно — первым, остальное — гибрид по всему запросу, без повторов
+    assert [(h.id, h.method) for h in hits] == [
+        (f"{FGOS}:3.2:УК-1", "exact"),
+        (f"{FGOS}:4.1", "hybrid"),
+        (f"{FGOS}:1.9", "hybrid"),
+    ]
+    assert names(dao) == ["codes", "full_text", "nearest", "similarities"]
     assert dao.calls[0][1]["codes"] == ("УК-1",) and dao.calls[0][1]["doc_ids"] == [FGOS]
+    assert all(h.similarity is not None for h in hits)
+    assert run(search.search("УК-1", top_k=1))[0].method == "exact"
 
 
 def test_exact_miss_falls_back_to_hybrid() -> None:
@@ -118,7 +135,7 @@ def test_exact_miss_falls_back_to_hybrid() -> None:
         nearest=[f"{FGOS}:4.1", f"{OS}:2.3"],
     )
     hits = run(RegulationSearch(dao, FakeEmbedder()).search("УК-99 и объем", top_k=2))
-    assert names(dao) == ["codes", "full_text", "nearest"]
+    assert names(dao) == ["codes", "full_text", "nearest", "similarities"]
     # 4.1 нашли оба способа — он первый; второй — из векторного: у него вес больше,
     # чем у полнотекстового; разделённый пункт склеен из частей
     assert [h.id for h in hits] == [f"{FGOS}:4.1", f"{OS}:2.3"]
@@ -126,12 +143,21 @@ def test_exact_miss_falls_back_to_hybrid() -> None:
     assert {h.method for h in hits} == {"hybrid"} and [h.rank for h in hits] == [1, 2]
 
 
+def test_full_text_match_and_weight_are_passed_on() -> None:
+    dao = FakeDAO(full_text=[f"{FGOS}:1.9"])
+    run(RegulationSearch(dao, fts_match="all").search("объем программы"))
+    run(RegulationSearch(dao).search("объем программы", fts_match="all"))
+    run(RegulationSearch(dao).search("объем программы"))
+    matches = [kwargs["match"] for name, kwargs in dao.calls if name == "full_text"]
+    assert matches == ["all", "all", "any"]
+
+
 def test_without_embeddings_only_full_text() -> None:
     dao = FakeDAO(full_text=[f"{FGOS}:1.9"], nearest=[f"{OS}:2.3"])
     for embedder in (None, BrokenEmbedder()):
         hits = run(RegulationSearch(dao, embedder).search("объем программы"))
-        assert [(h.id, h.method) for h in hits] == [(f"{FGOS}:1.9", "fts")]
-    assert "nearest" not in names(dao)
+        assert [(h.id, h.method, h.similarity) for h in hits] == [(f"{FGOS}:1.9", "fts", None)]
+    assert "nearest" not in names(dao) and "similarities" not in names(dao)
 
 
 def test_tools_pass_program_documents_and_types_to_queries() -> None:
@@ -170,5 +196,7 @@ def test_list_item_returns_whole_list() -> None:
     )
     assert head.covers == [f"{OS}:2.2.4", f"{OS}:2.2.4.1", f"{OS}:2.2.4.2"]
     assert [h.id for h in hits] == [f"{OS}:2.2.4", f"{OS}:2.3"]
+    # сходство перечня — лучшее из его пунктов
+    assert head.similarity == max(round(0.5 + 0.01 * len(i), 3) for i in head.covers)
     # чтение по ссылке — сам пункт, без подпунктов
     assert run(RegulationSearch(dao).get_clause(f"{OS}:2.2.4", ED)).covers == []

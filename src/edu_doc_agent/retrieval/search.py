@@ -2,13 +2,18 @@
 
 Порядок:
 
-1. В запросе есть код компетенции / профстандарта или «п. 2.3» — точный поиск
-   (`method="exact"`). Если он что-то нашёл, это и есть ответ.
-2. Иначе гибрид: полнотекстовый поиск и векторный (BGE-M3) сливаются взвешенным RRF
-   (`method="hybrid"`); вектор надёжнее, у полнотекстового вес меньше (`FTS_WEIGHT`,
-   подобран на золотом наборе). Если модель эмбеддингов недоступна — только
-   полнотекстовый (`method="fts"`). Такие результаты не подтверждают, что требование
-   к коду существует.
+1. В запросе есть код компетенции / профстандарта или «п. 2.3» — точный поиск; найденное
+   идёт первым (`method="exact"`). Остальные места добирает гибрид по всему запросу: на
+   вопрос «Дисциплины, формирующие ОПК-2, должны быть в обязательной части?» ответ в
+   пункте 2.9, а не в тексте ОПК-2. Индикатор («УК-1.2») не код: во ФГОС индикаторов нет.
+2. Гибрид: полнотекстовый поиск и векторный (BGE-M3) сливаются взвешенным RRF
+   (`method="hybrid"`); вектор надёжнее, у полнотекстового вес меньше (`FTS_WEIGHT`).
+   Если модель эмбеддингов недоступна — только полнотекстовый (`method="fts"`).
+   Такие результаты не подтверждают, что требование к коду существует.
+
+У каждого результата `similarity` — косинусное сходство запроса с пунктом: по нему агент
+отличает слабое совпадение от ответа (на вопрос, ответа на который в нормативах нет, поиск
+всё равно вернёт top_k пунктов). Без модели эмбеддингов — None.
 
 Разделённый на части пункт возвращается целиком. Перечень («2.2.4. рабочие программы…,
 содержащие:» и подпункты 2.2.4.1–2.2.4.3) — одним результатом: найденный подпункт
@@ -25,7 +30,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from edu_doc_agent.dao.regulations import ClauseKey, RegulationDAO
+from edu_doc_agent.dao.regulations import ClauseKey, RegulationDAO, TextMatch
 from edu_doc_agent.llm.embeddings import Embedder
 from edu_doc_agent.llm.openai_compat import LLMError
 from edu_doc_agent.retrieval.ranking import collapse_lists, number_order, query_keys, rrf
@@ -36,11 +41,10 @@ Method = Literal["exact", "hybrid", "fts", "vector"]
 # auto — как описано выше; fts / vector — один способ после точного (для оценки качества)
 Mode = Literal["auto", "fts", "vector"]
 CANDIDATES = 50  # сколько кандидатов берёт каждый способ поиска до слияния
-# вес полнотекстового списка в RRF (у векторного — 1). На золотом наборе (22 вопроса):
-# правильный пункт первым — вектор 91%, гибрид с весом 1 — 68%, 0.5 — 82%, 0.25 — 86%,
-# текст — 45%; в первых 5 — 100% у всех вариантов с вектором. Малый вес оставляет тексту
-# голос там, где эмбеддинги слабы (аббревиатуры, редкие термины, числа).
+# вес полнотекстового списка в RRF (у векторного — 1) и как он сочетает слова запроса;
+# подобраны на золотом наборе (retrieval/evaluate.py, data/regulations/golden.yaml)
 FTS_WEIGHT = 0.25
+FTS_MATCH: TextMatch = "any"
 
 
 class RegulationHit(BaseModel):
@@ -58,6 +62,9 @@ class RegulationHit(BaseModel):
     rank: int  # место в выдаче, с 1
     method: Method
     covers: list[str] = []  # у перечня: id всех вошедших пунктов (вводный и подпункты)
+    # косинусное сходство запроса с пунктом (у перечня — с лучшим из пунктов); None — без
+    # модели эмбеддингов
+    similarity: float | None = None
 
 
 class RegulationSearch:
@@ -69,10 +76,12 @@ class RegulationSearch:
         embedder: Embedder | None = None,
         *,
         fts_weight: float = FTS_WEIGHT,
+        fts_match: TextMatch = FTS_MATCH,
     ) -> None:
         self._dao = dao
         self._embedder = embedder
         self._fts_weight = fts_weight
+        self._fts_match = fts_match
 
     async def search(
         self,
@@ -84,30 +93,35 @@ class RegulationSearch:
         top_k: int = 5,
         mode: Mode = "auto",
         fts_weight: float | None = None,
+        fts_match: TextMatch | None = None,
     ) -> list[RegulationHit]:
         filters = {"doc_ids": doc_ids, "doc_types": doc_types, "kinds": kinds, "limit": CANDIDATES}
         keys = query_keys(query)
-        if keys:
-            exact = [
-                *(await self._dao.find_by_codes(keys.codes, **filters) if keys.codes else []),
-                *(await self._dao.find_by_numbers(keys.numbers, **filters) if keys.numbers else []),
-            ]
-            if exact:
-                return await self._ranked(list(dict.fromkeys(exact)), "exact", top_k)
+        exact: list[ClauseKey] = []
+        if keys.codes:
+            exact += await self._dao.find_by_codes(keys.codes, **filters)
+        if keys.numbers:
+            exact += await self._dao.find_by_numbers(keys.numbers, **filters)
 
+        embedding = await self._embed(query) if mode != "fts" else None
+        method: Method
         if mode == "vector":
-            vector = await self._vector(query, filters)
-            return await self._ranked(list(dict.fromkeys(vector or [])), "vector", top_k)
-        full_text = await self._dao.full_text(query, **filters)
-        vector = await self._vector(query, filters) if mode == "auto" else None
-        if vector is None:
-            return await self._ranked(list(dict.fromkeys(full_text)), "fts", top_k)
-        weight = self._fts_weight if fts_weight is None else fts_weight
-        return await self._ranked(rrf([full_text, vector], [weight, 1.0]), "hybrid", top_k)
+            found = await self._dao.nearest(embedding, **filters) if embedding else []
+            method = "vector"
+        else:
+            match = fts_match or self._fts_match
+            full_text = await self._dao.full_text(query, match=match, **filters)
+            if embedding is None:
+                found, method = full_text, "fts"
+            else:
+                vector = await self._dao.nearest(embedding, **filters)
+                weight = self._fts_weight if fts_weight is None else fts_weight
+                found, method = rrf([full_text, vector], [weight, 1.0]), "hybrid"
+        return await self._ranked(exact, found, method, top_k, embedding)
 
     async def get_clause(self, id: str, edition: str) -> RegulationHit | None:
         """Пункт по ссылке из результата поиска или из правила каталога (без подпунктов)."""
-        hits = await self._hits([((id, edition), False)], "exact")
+        hits = await self._hits([((id, edition), False, "exact")])
         return hits[0] if hits else None
 
     async def documents_for_direction(self, direction_code: str) -> list[str]:
@@ -121,7 +135,7 @@ class RegulationSearch:
 
     # --- внутреннее
 
-    async def _vector(self, query: str, filters: dict) -> list[ClauseKey] | None:
+    async def _embed(self, query: str) -> list[float] | None:
         if self._embedder is None:
             return None
         try:
@@ -129,25 +143,43 @@ class RegulationSearch:
         except LLMError as error:
             logger.warning("эмбеддинги недоступны, только полнотекстовый поиск: %s", error)
             return None
-        return await self._dao.nearest(embedding, **filters)
+        return list(embedding)
 
     async def _ranked(
-        self, keys: Sequence[ClauseKey], method: Method, top_k: int
+        self,
+        exact: Sequence[ClauseKey],
+        found: Sequence[ClauseKey],
+        method: Method,
+        top_k: int,
+        embedding: Sequence[float] | None,
     ) -> list[RegulationHit]:
-        """Свернуть перечни, отрезать top_k и собрать тексты."""
+        """Точные — первыми, затем найденные остальными способами; свернуть перечни,
+        отрезать top_k, собрать тексты и сходство с запросом."""
+        keys = list(dict.fromkeys([*exact, *found]))
         doc_ids = sorted({fragment_id.split(":", 1)[0] for fragment_id, _ in keys})
         heads = await self._dao.list_heads(doc_ids) if doc_ids else set()
-        return await self._hits(collapse_lists(keys, heads)[:top_k], method)
+        exact_items = {key for key, _ in collapse_lists(list(dict.fromkeys(exact)), heads)}
+        items = [
+            (key, expand, "exact" if key in exact_items else method)
+            for key, expand in collapse_lists(keys, heads)[:top_k]
+        ]
+        hits = await self._hits(items)
+        if embedding is not None and hits:
+            clauses = {h.rank: [(i, h.edition) for i in h.covers or [h.id]] for h in hits}
+            wanted = [key for ids in clauses.values() for key in ids]
+            similarity = await self._dao.similarities(embedding, wanted)
+            for hit in hits:
+                values = [similarity[key] for key in clauses[hit.rank] if key in similarity]
+                hit.similarity = round(max(values), 3) if values else None
+        return hits
 
-    async def _hits(
-        self, items: Sequence[tuple[ClauseKey, bool]], method: Method
-    ) -> list[RegulationHit]:
-        plain = [key for key, expand in items if not expand]
+    async def _hits(self, items: Sequence[tuple[ClauseKey, bool, Method]]) -> list[RegulationHit]:
+        plain = [key for key, expand, _ in items if not expand]
         by_key: dict[ClauseKey, list[dict]] = {}
         for row in await self._dao.get_parts(plain):
             by_key.setdefault((row["id"], row["edition"]), []).append(row)
         hits = []
-        for key, expand in items:
+        for key, expand, method in items:
             covers: list[str] = []
             if expand:
                 doc_id, _, number = key[0].partition(":")
@@ -207,7 +239,9 @@ async def _cli(args) -> int:
         await engine.dispose()
     for hit in hits:
         text = hit.text if args.full else hit.text[:300] + ("…" if len(hit.text) > 300 else "")
-        print(f"{hit.rank}. [{hit.method}] {hit.id} ({hit.edition})\n   {hit.path}\n   {text}\n")
+        similarity = "" if hit.similarity is None else f", сходство {hit.similarity:.2f}"
+        print(f"{hit.rank}. [{hit.method}{similarity}] {hit.id} ({hit.edition})")
+        print(f"   {hit.path}\n   {text}\n")
     if not hits:
         print("Ничего не найдено")
     return 0

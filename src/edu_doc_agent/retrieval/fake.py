@@ -5,8 +5,9 @@
     corpus = [chunk_document(...)]          # или CorpusDocument из YAML-снимка data/corpus
     tools = await RegulationTools.for_program(InMemoryRegulationSearch(corpus), "02.03.02")
 
-Точный поиск по коду и номеру пункта — как в настоящем; вместо гибридного — число общих
-слов запроса и фрагмента (method="fts"). Качество поиска на заглушке не проверяют.
+Точный поиск по коду и номеру пункта — как в настоящем (найденное первым, остальное добирается
+поиском по словам); вместо гибридного — число общих слов запроса и фрагмента
+(method="fts", similarity=None). Качество поиска на заглушке не проверяют.
 """
 
 import re
@@ -41,21 +42,23 @@ class InMemoryRegulationSearch:
             and (kinds is None or f.kind in kinds)
         ]
         keys = query_keys(query)
-        exact = [
-            f
-            for f in pool
-            if set(keys.codes) & set(f.codes) or (f.kind == "clause" and f.number in keys.numbers)
-        ]
-        if exact:
-            return self._hits(exact, "exact", top_k)
+        exact = sorted(  # как в настоящем: сначала сами компетенции, потом где упомянуты
+            (
+                f
+                for f in pool
+                if set(keys.codes) & set(f.codes)
+                or (f.kind == "clause" and f.number in keys.numbers)
+            ),
+            key=lambda f: f.kind == "clause",
+        )
         words = _words(query)
         scored = [(len(words & _words(f"{f.path} {f.context} {f.text}")), f) for f in pool]
         ranked = [f for score, f in sorted(scored, key=lambda x: -x[0]) if score > 0]
-        return self._hits(ranked, "fts", top_k)
+        return self._hits([*((f, "exact") for f in exact), *((f, "fts") for f in ranked)], top_k)
 
     async def get_clause(self, id: str, edition: str) -> RegulationHit | None:
         found = [f for f in self._fragments if f.id == id and f.edition == edition]
-        hits = self._hits(found, "exact", 1)
+        hits = self._hits([(f, "exact") for f in found], 1)
         return hits[0] if hits else None
 
     async def documents_for_direction(self, direction_code: str) -> list[str]:
@@ -65,10 +68,10 @@ class InMemoryRegulationSearch:
             if d.direction_code == direction_code or d.doc_type == "spbu_standard"
         ]
 
-    def _hits(self, fragments: list[Fragment], method: str, top_k: int) -> list[RegulationHit]:
+    def _hits(self, found: list[tuple[Fragment, str]], top_k: int) -> list[RegulationHit]:
         hits: list[RegulationHit] = []
         seen: set[tuple[str, str]] = set()
-        for f in fragments:
+        for f, method in found:
             key = (f.id, f.edition)
             if key in seen:
                 continue
