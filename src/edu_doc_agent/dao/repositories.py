@@ -228,11 +228,12 @@ class SessionRunDAO:
                 Run.reconcile_attempts >= max_reconcile_attempts,
             )
             .limit(limit)
+            .with_for_update(skip_locked=True)
         )
         async with self._session_factory() as db:
             stmt = (
                 update(Run)
-                .where(Run.id.in_(target_ids))
+                .where(Run.id.in_(target_ids), Run.status == "running")
                 .values(status="failed", updated_at=func.clock_timestamp())
                 .returning(Run.id)
             )
@@ -257,11 +258,12 @@ class SessionRunDAO:
                 Run.reconcile_attempts < max_reconcile_attempts,
             )
             .limit(limit)
+            .with_for_update(skip_locked=True)
         )
         async with self._session_factory() as db:
             stmt = (
                 update(Run)
-                .where(Run.id.in_(target_ids))
+                .where(Run.id.in_(target_ids), Run.status == "running")
                 .values(
                     status="queued",
                     reconcile_attempts=Run.reconcile_attempts + 1,
@@ -368,7 +370,7 @@ class SessionRunDAO:
         expected_reconcile_attempts: int,
     ) -> bool:
         """Откатывает инкремент reconcile_attempts, если постановка в Redis не удалась.
-        updated_at намеренно не обновляется, чтобы задача подхватилась на следующем проходе.
+        updated_at не сдвигается повторно (сохраняется время предыдущего шага).
         """
         if expected_reconcile_attempts <= 0:
             return False
