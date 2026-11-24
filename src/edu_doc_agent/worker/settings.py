@@ -10,11 +10,12 @@ import asyncio
 import logging
 from typing import Any
 
+from arq import cron
 from arq.connections import RedisSettings
 
 from edu_doc_agent.config import get_settings
 from edu_doc_agent.dao import LocalFileStorage, SessionRunDAO
-from edu_doc_agent.worker.tasks import process_session_task
+from edu_doc_agent.worker.tasks import process_session_task, reconcile_stale_runs_task
 
 JOB_TIMEOUT = 600
 MAX_TRIES = 3
@@ -35,6 +36,9 @@ async def startup(ctx: dict[str, Any]) -> None:
     ctx["storage"] = LocalFileStorage(current_settings.storage_dir)
     ctx["max_tries"] = MAX_TRIES
     ctx["heartbeat_interval"] = settings.run_heartbeat_interval_seconds
+    ctx["stale_running_seconds"] = settings.run_stale_running_seconds
+    ctx["stale_queued_seconds"] = settings.run_stale_queued_seconds
+    ctx["max_reconcile_attempts"] = settings.run_max_reconcile_attempts
     logger.info("Worker is starting up. Connected to Redis.")
 
 
@@ -65,3 +69,7 @@ class WorkerSettings:
     # Глобальные архитектурные ограничения
     job_timeout = JOB_TIMEOUT
     max_tries = MAX_TRIES
+
+    cron_jobs = [
+        cron(reconcile_stale_runs_task, second=0, run_at_startup=True),
+    ]

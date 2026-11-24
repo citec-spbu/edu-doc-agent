@@ -6,6 +6,7 @@ import asyncio
 import logging
 from typing import Any
 
+from edu_doc_agent.worker.reconciler import RunReconciler
 from edu_doc_agent.worker.runner import SessionRunner
 
 logger = logging.getLogger(__name__)
@@ -36,3 +37,20 @@ async def process_session_task(ctx: dict[str, Any], session_id: str, run_id: str
         logic_callable=_stub_session_logic,
         job_deadline=ctx.get("job_deadline"),
     )
+
+
+async def reconcile_stale_runs_task(ctx: dict[str, Any]) -> dict[str, int]:
+    """Периодическая задача ARQ: восстанавливает зависшие запуски и завершает poison pill."""
+    reconciler = RunReconciler(
+        dao=ctx["dao"],
+        redis=ctx["redis"],
+        stale_running_seconds=ctx.get("stale_running_seconds", 120.0),
+        stale_queued_seconds=ctx.get("stale_queued_seconds", 120.0),
+        max_reconcile_attempts=ctx.get("max_reconcile_attempts", 3),
+    )
+    report = await reconciler.reconcile()
+    return {
+        "failed_count": report.failed_count,
+        "requeued_count": report.requeued_count,
+        "enqueued_count": report.enqueued_count,
+    }
