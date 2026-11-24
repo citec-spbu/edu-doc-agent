@@ -24,19 +24,25 @@ def database(tmp_path: Path) -> Iterator[Database]:
         pytest.fail("TEST_DATABASE_URL должен использовать postgresql+psycopg")
     schema = f"dao_test_{uuid4().hex}"
     admin = create_engine(url, poolclass=NullPool, connect_args={"connect_timeout": 3})
-    isolated_url = url.update_query_dict({"options": f"-csearch_path={schema}"})
-    engine = create_engine(isolated_url, poolclass=NullPool, connect_args={"connect_timeout": 3})
+    engine = None
     created = False
     try:
         # Недоступная явно указанная БД — ошибка, а не skip.
         with admin.begin() as connection:
             assert connection.dialect.server_version_info[0] == 17
             connection.execute(CreateSchema(schema))
-            _vector_extension_in(connection, schema)
+            extensions = _vector_extension_schema(connection)
         created = True
+        # Объекты теста — в своей схеме; схема pgvector — второй в пути, чтобы был виден тип
+        # vector.
+        isolated_url = url.update_query_dict({"options": f"-csearch_path={schema},{extensions}"})
+        engine = create_engine(
+            isolated_url, poolclass=NullPool, connect_args={"connect_timeout": 3}
+        )
         yield Database(isolated_url, engine, tmp_path, schema)
     finally:
-        engine.dispose()
+        if engine is not None:
+            engine.dispose()
         try:
             if created:
                 with admin.begin() as connection:
@@ -45,24 +51,22 @@ def database(tmp_path: Path) -> Iterator[Database]:
             admin.dispose()
 
 
-def _vector_extension_in(connection: Connection, schema: str) -> None:
-    """pgvector — в схеме теста: иначе тип `vector` не виден при search_path только на неё.
+def _vector_extension_schema(connection: Connection) -> str:
+    """Схема, где стоит pgvector; если расширения нет — ставит его в public.
 
-    Расширение одно на базу, поэтому ставим его суперпользователем здесь; миграция с
-    `CREATE EXTENSION IF NOT EXISTS` тогда проходит и под ролью без прав суперпользователя.
-    При удалении схемы теста расширение удаляется вместе с ней.
+    Расширение одно на базу и общее для всех схем, поэтому в схему теста его не переносим:
+    `DROP SCHEMA … CASCADE` в конце теста удалил бы его вместе с колонками vector вне теста.
+    Ставим его здесь суперпользователем; миграция с `CREATE EXTENSION IF NOT EXISTS` тогда
+    проходит и под ролью без прав суперпользователя.
     """
-    current = connection.scalar(
+    connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector SCHEMA public"))
+    schema = connection.scalar(
         text(
             "SELECT n.nspname FROM pg_extension e "
             "JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'vector'"
         )
     )
-    quoted = connection.dialect.identifier_preparer.quote(schema)
-    if current is None:
-        connection.execute(text(f"CREATE EXTENSION vector SCHEMA {quoted}"))
-    elif current != schema:
-        connection.execute(text(f"ALTER EXTENSION vector SET SCHEMA {quoted}"))
+    return connection.dialect.identifier_preparer.quote(schema)
 
 
 @pytest.fixture

@@ -206,3 +206,15 @@ def test_defaults_and_constraints(migrated_database: Database) -> None:
     for model, row in bad:
         with pytest.raises(IntegrityError), engine.begin() as connection:
             connection.execute(model.__table__.insert(), [row])
+
+
+def test_vector_extension_is_not_moved_into_test_schema(migrated_database: Database) -> None:
+    # иначе DROP SCHEMA … CASCADE в конце теста удалил бы расширение и колонки vector вне теста
+    with migrated_database.engine.connect() as connection:
+        schema = connection.scalar(
+            text(
+                "SELECT n.nspname FROM pg_extension e "
+                "JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'vector'"
+            )
+        )
+    assert schema is not None and schema != migrated_database.schema
