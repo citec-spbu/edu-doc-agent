@@ -1,8 +1,10 @@
 """Репозиторий для управления каноническим состоянием Session и Run в PostgreSQL."""
 
+from dataclasses import dataclass
+from datetime import timedelta
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -12,6 +14,15 @@ from edu_doc_agent.dao.database import async_session_maker
 from edu_doc_agent.dao.models import Run, Session
 
 ACTIVE_RUN_CONSTRAINT = "uq_runs_active_session"
+
+
+@dataclass(frozen=True)
+class ReconciledRun:
+    """Запуск, восстановленный Reconciler'ом для повторной постановки в очередь ARQ."""
+
+    run_id: UUID
+    session_id: str
+    reconcile_attempts: int
 
 
 class ActiveRunConflictError(Exception):
@@ -28,6 +39,23 @@ def _is_active_run_conflict(exc: IntegrityError) -> bool:
     diag = getattr(orig, "diag", None)
     constraint_name = getattr(diag, "constraint_name", None)
     return constraint_name == ACTIVE_RUN_CONSTRAINT
+
+
+def _stale_run_condition(stale_running_seconds: float, stale_queued_seconds: float):
+    """Условие выбора зависших запусков в PostgreSQL по серверному времени."""
+    now = func.clock_timestamp()
+    running_cutoff = now - timedelta(seconds=stale_running_seconds)
+    queued_cutoff = now - timedelta(seconds=stale_queued_seconds)
+
+    stale_running = and_(
+        Run.status == "running",
+        func.coalesce(Run.last_heartbeat_at, Run.updated_at) < running_cutoff,
+    )
+    stale_queued = and_(
+        Run.status == "queued",
+        Run.updated_at < queued_cutoff,
+    )
+    return or_(stale_running, stale_queued)
 
 
 class SessionRunDAO:
@@ -162,3 +190,74 @@ class SessionRunDAO:
             stmt = select(Run).where(Run.id == run_id, Run.session_id == session_id)
             result = await db.execute(stmt)
             return result.scalar_one_or_none()
+
+    async def touch_heartbeat(self, run_id: UUID) -> bool:
+        """Обновляет last_heartbeat_at для выполняющегося Run ('running').
+
+        Возвращает True, если пульс обновлён, или False, если Run уже не в 'running'.
+        """
+        async with self._session_factory() as db:
+            stmt = (
+                update(Run)
+                .where(Run.id == run_id, Run.status == "running")
+                .values(last_heartbeat_at=func.clock_timestamp())
+                .returning(Run.id)
+            )
+            result = await db.execute(stmt)
+            await db.commit()
+            return result.scalar_one_or_none() is not None
+
+    async def fail_exhausted_stale_runs(
+        self,
+        *,
+        stale_running_seconds: float,
+        stale_queued_seconds: float,
+        max_reconcile_attempts: int,
+    ) -> list[UUID]:
+        """Переводит зависшие запуски, достигшие лимита восстановлений, в 'failed'."""
+        async with self._session_factory() as db:
+            stmt = (
+                update(Run)
+                .where(
+                    _stale_run_condition(stale_running_seconds, stale_queued_seconds),
+                    Run.reconcile_attempts >= max_reconcile_attempts,
+                )
+                .values(status="failed", updated_at=func.clock_timestamp())
+                .returning(Run.id)
+            )
+            result = await db.execute(stmt)
+            await db.commit()
+            return list(result.scalars().all())
+
+    async def requeue_stale_runs(
+        self,
+        *,
+        stale_running_seconds: float,
+        stale_queued_seconds: float,
+        max_reconcile_attempts: int,
+    ) -> list[ReconciledRun]:
+        """Атомарно переводит зависшие запуски в 'queued' и увеличивает reconcile_attempts."""
+        async with self._session_factory() as db:
+            stmt = (
+                update(Run)
+                .where(
+                    _stale_run_condition(stale_running_seconds, stale_queued_seconds),
+                    Run.reconcile_attempts < max_reconcile_attempts,
+                )
+                .values(
+                    status="queued",
+                    reconcile_attempts=Run.reconcile_attempts + 1,
+                    updated_at=func.clock_timestamp(),
+                )
+                .returning(Run.id, Run.session_id, Run.reconcile_attempts)
+            )
+            result = await db.execute(stmt)
+            await db.commit()
+            return [
+                ReconciledRun(
+                    run_id=row.id,
+                    session_id=row.session_id,
+                    reconcile_attempts=row.reconcile_attempts,
+                )
+                for row in result.all()
+            ]
