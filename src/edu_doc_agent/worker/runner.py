@@ -178,13 +178,23 @@ class SessionRunner:
                             "session_id": session_id,
                             "run_id": str(run_uuid),
                         }
-                    if not logic_task.done():
-                        logic_task.cancel()
-                        with suppress(asyncio.CancelledError):
-                            await logic_task
                     raise
                 finally:
-                    await _stop_heartbeat(heartbeat_task)
+                    try:
+                        if not logic_task.done():
+                            logic_task.cancel()
+                            try:
+                                await logic_task
+                            except asyncio.CancelledError:
+                                pass
+                            except Exception:
+                                logger.exception(
+                                    "Ошибка при отмене logic_task. session_id=%s, run_id=%s",
+                                    session_id,
+                                    run_uuid,
+                                )
+                    finally:
+                        await _stop_heartbeat(heartbeat_task)
             except Exception:
                 try:
                     await _finish_status_update(
