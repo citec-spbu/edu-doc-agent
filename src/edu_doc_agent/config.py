@@ -65,6 +65,7 @@ class Settings(BaseSettings):
 
     # --- Хранилище файлов ---
     storage_dir: Path = Path("storage")
+    max_upload_file_bytes: int = Field(default=50 * 1024 * 1024, gt=0)
 
     # --- LLM ---
     llm_provider: str | None = None

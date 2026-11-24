@@ -11,6 +11,7 @@ dependencies = [
     "openpyxl>=3.1.5",
     "pydantic-settings>=2.15.0",
     "python-docx>=1.2.0",
+    "python-multipart>=0.0.32",
     # pymorphy2 (зависимость yargy) импортирует pkg_resources, удалённый в setuptools>=81
     "setuptools<81",
     "streamlit>=1.65.0",
