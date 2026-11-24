@@ -216,17 +216,23 @@ class SessionRunDAO:
         *,
         stale_running_seconds: float,
         max_reconcile_attempts: int,
+        limit: int = 100,
     ) -> list[UUID]:
         """Переводит зависшие 'running', достигшие лимита восстановлений, в 'failed'."""
         cutoff = func.clock_timestamp() - timedelta(seconds=stale_running_seconds)
+        target_ids = (
+            select(Run.id)
+            .where(
+                Run.status == "running",
+                func.coalesce(Run.last_heartbeat_at, Run.updated_at) < cutoff,
+                Run.reconcile_attempts >= max_reconcile_attempts,
+            )
+            .limit(limit)
+        )
         async with self._session_factory() as db:
             stmt = (
                 update(Run)
-                .where(
-                    Run.status == "running",
-                    func.coalesce(Run.last_heartbeat_at, Run.updated_at) < cutoff,
-                    Run.reconcile_attempts >= max_reconcile_attempts,
-                )
+                .where(Run.id.in_(target_ids))
                 .values(status="failed", updated_at=func.clock_timestamp())
                 .returning(Run.id)
             )
@@ -239,17 +245,23 @@ class SessionRunDAO:
         *,
         stale_running_seconds: float,
         max_reconcile_attempts: int,
+        limit: int = 100,
     ) -> list[ReconciledRun]:
         """Атомарно переводит зависшие 'running' в 'queued' с инкрементом reconcile_attempts."""
         cutoff = func.clock_timestamp() - timedelta(seconds=stale_running_seconds)
+        target_ids = (
+            select(Run.id)
+            .where(
+                Run.status == "running",
+                func.coalesce(Run.last_heartbeat_at, Run.updated_at) < cutoff,
+                Run.reconcile_attempts < max_reconcile_attempts,
+            )
+            .limit(limit)
+        )
         async with self._session_factory() as db:
             stmt = (
                 update(Run)
-                .where(
-                    Run.status == "running",
-                    func.coalesce(Run.last_heartbeat_at, Run.updated_at) < cutoff,
-                    Run.reconcile_attempts < max_reconcile_attempts,
-                )
+                .where(Run.id.in_(target_ids))
                 .values(
                     status="queued",
                     reconcile_attempts=Run.reconcile_attempts + 1,
@@ -268,13 +280,22 @@ class SessionRunDAO:
                 for row in result.all()
             ]
 
-    async def list_stale_queued_runs(self, *, stale_queued_seconds: float) -> list[ReconciledRun]:
+    async def list_stale_queued_runs(
+        self,
+        *,
+        stale_queued_seconds: float,
+        limit: int = 100,
+    ) -> list[ReconciledRun]:
         """Возвращает кандидатов в статусе 'queued' старше порога для проверки в Redis."""
         cutoff = func.clock_timestamp() - timedelta(seconds=stale_queued_seconds)
         async with self._session_factory() as db:
-            stmt = select(Run.id, Run.session_id, Run.reconcile_attempts).where(
-                Run.status == "queued",
-                Run.updated_at < cutoff,
+            stmt = (
+                select(Run.id, Run.session_id, Run.reconcile_attempts)
+                .where(
+                    Run.status == "queued",
+                    Run.updated_at < cutoff,
+                )
+                .limit(limit)
             )
             result = await db.execute(stmt)
             return [
@@ -346,7 +367,9 @@ class SessionRunDAO:
         *,
         expected_reconcile_attempts: int,
     ) -> bool:
-        """Откатывает инкремент reconcile_attempts, если постановка в Redis не удалась."""
+        """Откатывает инкремент reconcile_attempts, если постановка в Redis не удалась.
+        updated_at намеренно не обновляется, чтобы задача подхватилась на следующем проходе.
+        """
         if expected_reconcile_attempts <= 0:
             return False
         async with self._session_factory() as db:
@@ -359,7 +382,7 @@ class SessionRunDAO:
                 )
                 .values(
                     reconcile_attempts=Run.reconcile_attempts - 1,
-                    updated_at=func.clock_timestamp(),
+                    updated_at=Run.updated_at,
                 )
                 .returning(Run.id)
             )
