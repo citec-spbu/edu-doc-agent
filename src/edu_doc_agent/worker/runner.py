@@ -68,15 +68,18 @@ class SessionRunner:
         run_id: UUID,
         interval: float,
         expected_reconcile_attempts: int | None,
+        on_lease_lost: Callable[[], None] | None = None,
     ) -> None:
         """Периодически обновляет last_heartbeat_at, пока задача выполняется."""
+        op_timeout = min(interval, 10.0)
         while True:
             await asyncio.sleep(interval)
             try:
-                updated = await self._dao.touch_heartbeat(
-                    run_id,
-                    expected_reconcile_attempts=expected_reconcile_attempts,
-                )
+                async with asyncio.timeout(op_timeout):
+                    updated = await self._dao.touch_heartbeat(
+                        run_id,
+                        expected_reconcile_attempts=expected_reconcile_attempts,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -92,6 +95,8 @@ class SessionRunner:
                     "Остановка heartbeat: lease потерян или run_id=%s больше не в 'running'",
                     run_id,
                 )
+                if on_lease_lost is not None:
+                    on_lease_lost()
                 return
 
     async def execute(
@@ -136,17 +141,48 @@ class SessionRunner:
                 max_tries,
             )
 
+            lease_lost = False
+            logic_task: asyncio.Task[Any] = asyncio.create_task(logic_callable(session_id))
+
+            def _handle_lease_lost() -> None:
+                nonlocal lease_lost
+                lease_lost = True
+                if not logic_task.done():
+                    logic_task.cancel()
+
             heartbeat_task: asyncio.Task[None] | None = None
             if self._heartbeat_interval is not None and self._heartbeat_interval > 0:
                 heartbeat_task = asyncio.create_task(
-                    self._heartbeat_loop(run_uuid, self._heartbeat_interval, lease_token)
+                    self._heartbeat_loop(
+                        run_uuid,
+                        self._heartbeat_interval,
+                        lease_token,
+                        on_lease_lost=_handle_lease_lost,
+                    )
                 )
 
             try:
                 try:
                     # По умолчанию длительность job ограничивает только ARQ.
                     async with asyncio.timeout(execution_timeout):
-                        await logic_callable(session_id)
+                        await logic_task
+                except asyncio.CancelledError:
+                    if lease_lost:
+                        logger.warning(
+                            "Выполнение прервано из-за потери lease: session_id=%s, run_id=%s",
+                            session_id,
+                            run_uuid,
+                        )
+                        return {
+                            "status": "conflict",
+                            "session_id": session_id,
+                            "run_id": str(run_uuid),
+                        }
+                    if not logic_task.done():
+                        logic_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await logic_task
+                    raise
                 finally:
                     await _stop_heartbeat(heartbeat_task)
             except Exception:
