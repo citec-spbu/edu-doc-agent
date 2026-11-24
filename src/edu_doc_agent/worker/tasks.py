@@ -24,7 +24,10 @@ async def process_session_task(ctx: dict[str, Any], session_id: str, run_id: str
     job_try = ctx.get("job_try", 1)
     max_tries = ctx.get("max_tries", 3)
 
-    runner = SessionRunner(dao=ctx["dao"])
+    runner = SessionRunner(
+        dao=ctx["dao"],
+        heartbeat_interval=ctx.get("heartbeat_interval", 30.0),
+    )
     return await runner.execute(
         session_id=session_id,
         run_id=run_id,

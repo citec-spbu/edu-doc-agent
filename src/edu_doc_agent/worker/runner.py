@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Coroutine
+from contextlib import suppress
 from typing import Any
 from uuid import UUID
 
@@ -46,8 +47,9 @@ class SessionRunner:
       восстанавливается силами фонового Reconciler'а.
     """
 
-    def __init__(self, dao: SessionRunDAO) -> None:
+    def __init__(self, dao: SessionRunDAO, heartbeat_interval: float | None = 30.0) -> None:
         self._dao = dao
+        self._heartbeat_interval = heartbeat_interval
 
     async def execute(
         self,
@@ -93,6 +95,12 @@ class SessionRunner:
                 max_tries,
             )
 
+            heartbeat_task: asyncio.Task[None] | None = None
+            if self._heartbeat_interval is not None and self._heartbeat_interval > 0:
+                heartbeat_task = asyncio.create_task(
+                    self._heartbeat_loop(run_uuid, self._heartbeat_interval)
+                )
+
             try:
                 # По умолчанию длительность job ограничивает только ARQ.
                 async with asyncio.timeout(execution_timeout):
@@ -113,6 +121,11 @@ class SessionRunner:
                     run_uuid,
                 )
                 raise
+            finally:
+                if heartbeat_task is not None:
+                    heartbeat_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await heartbeat_task
 
             completed = await _finish_status_update(self._dao.mark_run_completed(run_uuid))
             if not completed:
@@ -156,3 +169,26 @@ class SessionRunner:
             "session_id": session_id,
             "run_id": str(run_uuid),
         }
+
+    async def _heartbeat_loop(self, run_id: UUID, interval: float) -> None:
+        """Периодически обновляет last_heartbeat_at, пока задача выполняется."""
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                updated = await self._dao.touch_heartbeat(run_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Не удалось обновить heartbeat для run_id=%s",
+                    run_id,
+                    exc_info=True,
+                )
+                continue
+
+            if not updated:
+                logger.info(
+                    "Остановка heartbeat: run_id=%s больше не в статусе 'running'",
+                    run_id,
+                )
+                return
