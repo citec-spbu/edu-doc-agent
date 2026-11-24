@@ -185,6 +185,11 @@ class SessionRunner:
                     session_id,
                     run_uuid,
                 )
+                return {
+                    "status": "conflict",
+                    "session_id": session_id,
+                    "run_id": str(run_uuid),
+                }
 
         except asyncio.CancelledError:
             if lease_token is None:
