@@ -61,6 +61,9 @@ class WorkerSettings:
 
     # Функции, которые разрешено выполнять
     functions = [process_session_task]
+    cron_jobs = [
+        cron(reconcile_stale_runs_task, second=0, run_at_startup=True, timeout=30),
+    ]
 
     on_startup = startup
     on_shutdown = shutdown
@@ -69,7 +72,3 @@ class WorkerSettings:
     # Глобальные архитектурные ограничения
     job_timeout = JOB_TIMEOUT
     max_tries = MAX_TRIES
-
-    cron_jobs = [
-        cron(reconcile_stale_runs_task, second=0, run_at_startup=True),
-    ]
