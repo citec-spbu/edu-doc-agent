@@ -35,10 +35,10 @@ async def startup(ctx: dict[str, Any]) -> None:
     ctx["dao"] = SessionRunDAO()
     ctx["storage"] = LocalFileStorage(current_settings.storage_dir)
     ctx["max_tries"] = MAX_TRIES
-    ctx["heartbeat_interval"] = settings.run_heartbeat_interval_seconds
-    ctx["stale_running_seconds"] = settings.run_stale_running_seconds
-    ctx["stale_queued_seconds"] = settings.run_stale_queued_seconds
-    ctx["max_reconcile_attempts"] = settings.run_max_reconcile_attempts
+    ctx["heartbeat_interval"] = current_settings.run_heartbeat_interval_seconds
+    ctx["stale_running_seconds"] = current_settings.run_stale_running_seconds
+    ctx["stale_queued_seconds"] = current_settings.run_stale_queued_seconds
+    ctx["max_reconcile_attempts"] = current_settings.run_max_reconcile_attempts
     logger.info("Worker is starting up. Connected to Redis.")
 
 
