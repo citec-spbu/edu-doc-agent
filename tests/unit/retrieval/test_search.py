@@ -143,13 +143,14 @@ def test_exact_miss_falls_back_to_hybrid() -> None:
     assert {h.method for h in hits} == {"hybrid"} and [h.rank for h in hits] == [1, 2]
 
 
-def test_full_text_match_and_weight_are_passed_on() -> None:
+def test_hybrid_uses_all_words_and_fallback_any_word() -> None:
     dao = FakeDAO(full_text=[f"{FGOS}:1.9"])
-    run(RegulationSearch(dao, fts_match="all").search("объем программы"))
-    run(RegulationSearch(dao).search("объем программы", fts_match="all"))
-    run(RegulationSearch(dao).search("объем программы"))
+    run(RegulationSearch(dao, FakeEmbedder()).search("объем программы"))  # гибрид — И
+    run(RegulationSearch(dao).search("объем программы"))  # без эмбеддингов — ИЛИ
+    run(RegulationSearch(dao, FakeEmbedder(), fts_match="any").search("объем программы"))
+    run(RegulationSearch(dao).search("объем программы", fts_match="all"))  # явно — как задано
     matches = [kwargs["match"] for name, kwargs in dao.calls if name == "full_text"]
-    assert matches == ["all", "all", "any"]
+    assert matches == ["all", "any", "any", "all"]
 
 
 def test_without_embeddings_only_full_text() -> None:
