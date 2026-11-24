@@ -265,9 +265,9 @@ flowchart TB
 
 **Восстановление зависших запусков (текущая реализация).** Сценарии, при которых run остаётся в активном статусе без живого воркера или задачи в очереди (падение API между commit и `enqueue_job()`, жёсткое падение воркера по OOM, сброс Redis, исчерпание `max_tries` до вызова Runner, временная недоступность БД при записи итогового статуса), обрабатываются связкой Heartbeat и `RunReconciler`:
 
-- Во время выполнения бизнес-логики `SessionRunner` запускает фоновую корутину, которая каждые `RUN_HEARTBEAT_INTERVAL_SECONDS` (по умолчанию 30 с) обновляет `last_heartbeat_at` в PostgreSQL.
+- Во время выполнения бизнес-логики `SessionRunner` запускает фоновую корутину, которая каждые `RUN_HEARTBEAT_INTERVAL_SECONDS` (по умолчанию 30 с) обновляет `last_heartbeat_at` в PostgreSQL. При потере lease бизнес-функция принудительно отменяется (`status=conflict`). Бизнес-логика и тяжёлые синхронные операции (парсинг, извлечение, синхронный LLM-клиент) не должны блокировать event loop (использовать `asyncio.to_thread`), иначе Heartbeat не сможет обновлять пульс.
 - `RunReconciler` (`reconcile_stale_runs_task`) запускается при старте воркера (`run_at_startup=True`) и далее каждую минуту по cron в `WorkerSettings`.
-- Запуски в статусе `running` без пульса дольше `RUN_STALE_RUNNING_SECONDS` (120 с) и `queued` старше `RUN_STALE_QUEUED_SECONDS` (120 с) атомарно переводятся в `queued` с инкрементом `reconcile_attempts` и повторно ставятся в ARQ с уникальным `_job_id="{run_id}:reconcile:{reconcile_attempts}"`.
+- Запуски в статусе `running` без пульса дольше `RUN_STALE_RUNNING_SECONDS` (по умолчанию 120 с; при старте валидируется `RUN_STALE_RUNNING_SECONDS >= 2 * RUN_HEARTBEAT_INTERVAL_SECONDS`) и `queued` старше `RUN_STALE_QUEUED_SECONDS` (120 с), отсутствующие в очереди Redis, атомарно переводятся в `queued` с инкрементом `reconcile_attempts` и повторно ставятся в ARQ с уникальным `_job_id="{run_id}:reconcile:{reconcile_attempts}"`.
 - Если `reconcile_attempts >= RUN_MAX_RECONCILE_ATTEMPTS` (по умолчанию 3), запуск переводится в терминальный статус `failed` без повторной постановки (защита от poison pill).
 
 **Ограничения текущей реализации.** После внедрения Heartbeat и `RunReconciler` остаются следующие ограничения:
