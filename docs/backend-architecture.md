@@ -62,7 +62,7 @@ flowchart TB
 
     subgraph System ["Система edu-doc-agent"]
         UI["Streamlit UI<br/>(Веб-приложение в контейнере)"]
-        API["API-сервис (FastAPI)<br/>Диалоги и статусы<br/>Целевая роль включает загрузку и выдачу файлов"]
+        API["API-сервис (FastAPI)<br/>Диалоги, документы и статусы<br/>Целевая роль включает загрузку и выдачу файлов"]
         REDIS[("Redis<br/>(Очередь задач и шина событий)")]
 
         WORKER["Воркер<br/>(ARQ: Runner и граф LangGraph)"]
@@ -165,7 +165,7 @@ SHA-256 вычисляется от полного идентификатора 
   - Сохраняет байты через `FileStorage.save()`, затем идемпотентно гарантирует существование `Session` и пишет метаданные в `documents`. При сбое записи в БД или отмене запроса файл удаляется из `FileStorage`.
 - **`GET /{session_id}/documents`** (`200 OK`, `DocumentListResponse`) — список метаданных документов сессии в порядке загрузки (`storage_key` в публичный ответ не попадает).
 - **`GET /{session_id}/documents/{doc_id}`** (`200 OK` / `404 Not Found`) — скачивание содержимого файла с `Content-Disposition` (UTF-8) и `media_type`. Если запись есть в БД, а файл отсутствует в `FileStorage`, возвращает `500 Internal Server Error`.
-- **`DELETE /{session_id}/documents/{doc_id}`** (`204 No Content` / `404 Not Found` / `409 Conflict`) — удаляет запись из БД и файл из `FileStorage`. Блокирует строку `Session` (`FOR UPDATE`) и возвращает `409 Conflict`, если в сессии есть активный `Run` (`queued`, `running`, `waiting_for_input`).
+- **`DELETE /{session_id}/documents/{doc_id}`** (`204 No Content` / `404 Not Found` / `409 Conflict`) — удаляет запись из БД и файл из `FileStorage`. Блокирует строку `Session` (`FOR UPDATE`) и запрещает мутации документов во время активного запуска: при наличии активного `Run` (`queued`, `running`, `waiting_for_input`) возвращает `409 Conflict` до проверки существования конкретного `doc_id`.
 
 ## С4, уровень 3: Компоненты воркера
 

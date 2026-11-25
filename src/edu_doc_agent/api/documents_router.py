@@ -2,8 +2,9 @@
 
 import asyncio
 import logging
+from collections.abc import Coroutine
 from pathlib import Path as FilePath
-from typing import Annotated
+from typing import Annotated, Any
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
@@ -24,10 +25,11 @@ from edu_doc_agent.api.schemas import DocumentListResponse, DocumentResponse
 from edu_doc_agent.config import get_settings
 from edu_doc_agent.dao import (
     ActiveRunConflictError,
+    Document,
     DocumentDAO,
     FileStorage,
+    FileStorageError,
     InvalidStoragePathError,
-    StorageFileNotFoundError,
 )
 from edu_doc_agent.parsing import supported_suffixes
 
@@ -36,6 +38,86 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/sessions", tags=["documents"])
 
 _READ_CHUNK_SIZE = 64 * 1024  # 64 KiB
+_DEFAULT_CONTENT_TYPE = "application/octet-stream"
+_CANONICAL_CONTENT_TYPES: dict[str, str] = {
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
+
+
+def _has_ascii_control_chars(value: str) -> bool:
+    return any(ord(ch) < 32 or ch == "\x7f" for ch in value)
+
+
+def _validate_session_id(session_id: str) -> str:
+    if not session_id or not session_id.strip() or "\x00" in session_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Некорректный идентификатор сессии.",
+        )
+    return session_id
+
+
+def _validate_upload_filename(raw_filename: str | None) -> tuple[str, str]:
+    """Проверяет имя файла и расширение до чтения тела запроса в память."""
+    if raw_filename is None or _has_ascii_control_chars(raw_filename):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Некорректное имя файла.",
+        )
+    if "/" in raw_filename or "\\" in raw_filename:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Имя файла не должно содержать разделители пути.",
+        )
+    filename = raw_filename.strip()
+    if not filename or filename in {".", ".."}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Не указано имя файла.",
+        )
+
+    suffix = FilePath(filename).suffix.lower()
+    allowed = supported_suffixes()
+    if suffix not in allowed:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"Неподдерживаемый формат файла '{suffix}'. Допустимы: {', '.join(allowed)}.",
+        )
+    return filename, suffix
+
+
+def _ascii_fallback_filename(filename: str) -> str:
+    """Безопасное ASCII-имя для старых клиентов в заголовке Content-Disposition."""
+    cleaned = "".join(
+        ch if 32 <= ord(ch) < 127 and ch not in {'"', "\\", ";"} else "_" for ch in filename
+    ).strip(" ._")
+    if not cleaned:
+        suffix = FilePath(filename).suffix
+        safe_suffix = suffix if suffix.isascii() else ""
+        return f"document{safe_suffix}"
+    return cleaned
+
+
+async def _await_uninterruptible[T](operation: Coroutine[Any, Any, T]) -> T:
+    """Дожидается завершения операции даже при повторном CancelledError, затем пробрасывает его."""
+    task = asyncio.create_task(operation)
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            if task.cancelled():
+                raise
+            cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+        else:
+            if cancellation is not None:
+                raise cancellation
+            return result
 
 
 async def _read_upload_bounded(file: UploadFile, max_bytes: int) -> bytes:
@@ -74,20 +156,9 @@ async def upload_document(
     doc_type: Annotated[str | None, Form(description="Тип документа (rpd, plan, ...)")] = None,
 ) -> DocumentResponse:
     """Загружает документ в хранилище и сохраняет его метаданные в PostgreSQL."""
-    filename = (file.filename or "").strip()
-    if not filename:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Не указано имя файла.",
-        )
-
-    suffix = FilePath(filename).suffix.lower()
-    allowed = supported_suffixes()
-    if suffix not in allowed:
-        raise HTTPException(
-            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail=f"Неподдерживаемый формат файла '{suffix}'. Допустимы: {', '.join(allowed)}.",
-        )
+    _validate_session_id(session_id)
+    filename, suffix = _validate_upload_filename(file.filename)
+    normalized_doc_type = (doc_type or "").strip() or None
 
     max_bytes = get_settings().max_upload_file_bytes
     content = await _read_upload_bounded(file, max_bytes)
@@ -98,7 +169,7 @@ async def upload_document(
         )
 
     doc_id = uuid4()
-    content_type = file.content_type or "application/octet-stream"
+    content_type = _CANONICAL_CONTENT_TYPES.get(suffix, _DEFAULT_CONTENT_TYPE)
 
     try:
         storage_key = await storage.save(
@@ -113,18 +184,27 @@ async def upload_document(
             detail="Некорректное имя файла или идентификатор сессии.",
         ) from exc
 
-    try:
-        doc = await dao.create_document(
+    db_saved = False
+
+    async def _create_metadata() -> Document:
+        nonlocal db_saved
+        created = await dao.create_document(
             session_id=session_id,
             doc_id=doc_id,
             filename=filename,
             content_type=content_type,
             size_bytes=len(content),
             storage_key=storage_key,
-            doc_type=doc_type,
+            doc_type=normalized_doc_type,
         )
+        db_saved = True
+        return created
+
+    try:
+        doc = await _await_uninterruptible(_create_metadata())
     except BaseException:
-        await asyncio.shield(_cleanup_storage(storage, storage_key))
+        if not db_saved:
+            await _await_uninterruptible(_cleanup_storage(storage, storage_key))
         raise
 
     return DocumentResponse.model_validate(doc)
@@ -164,20 +244,29 @@ async def download_document(
 
     try:
         content = await storage.read(doc.storage_key)
-    except StorageFileNotFoundError as exc:
+    except FileStorageError as exc:
         logger.error(
-            "Файл отсутствует в хранилище для существующей записи БД: doc_id=%s, storage_key=%s",
+            "Ошибка чтения файла из хранилища: doc_id=%s, storage_key=%s, error=%s",
             doc_id,
             doc.storage_key,
+            exc,
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Файл документа отсутствует в хранилище.",
+            detail="Файл документа недоступен в хранилище.",
         ) from exc
 
+    suffix = FilePath(doc.filename).suffix.lower()
+    media_type = _CANONICAL_CONTENT_TYPES.get(suffix, _DEFAULT_CONTENT_TYPE)
+    fallback_name = _ascii_fallback_filename(doc.filename)
     encoded_name = quote(doc.filename, safe="")
-    headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}"}
-    return Response(content=content, media_type=doc.content_type, headers=headers)
+    headers = {
+        "Content-Disposition": (
+            f"attachment; filename=\"{fallback_name}\"; filename*=UTF-8''{encoded_name}"
+        ),
+        "X-Content-Type-Options": "nosniff",
+    }
+    return Response(content=content, media_type=media_type, headers=headers)
 
 
 @router.delete(

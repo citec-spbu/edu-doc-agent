@@ -8,6 +8,8 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL
 
+DEFAULT_MAX_UPLOAD_FILE_BYTES = 50 * 1024 * 1024
+
 
 class Settings(BaseSettings):
     """Все настройки проекта в одном месте.
@@ -65,7 +67,7 @@ class Settings(BaseSettings):
 
     # --- Хранилище файлов ---
     storage_dir: Path = Path("storage")
-    max_upload_file_bytes: int = Field(default=50 * 1024 * 1024, gt=0)
+    max_upload_file_bytes: int = Field(default=DEFAULT_MAX_UPLOAD_FILE_BYTES, gt=0)
 
     # --- LLM ---
     llm_provider: str | None = None
@@ -91,6 +93,13 @@ class Settings(BaseSettings):
     def _default_storage_dir_if_empty(cls, value: object) -> object:
         if isinstance(value, str) and not value.strip():
             return Path("storage")
+        return value
+
+    @field_validator("max_upload_file_bytes", mode="before")
+    @classmethod
+    def _default_max_upload_bytes_if_empty(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return DEFAULT_MAX_UPLOAD_FILE_BYTES
         return value
 
 
