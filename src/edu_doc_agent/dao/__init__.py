@@ -13,7 +13,7 @@ Data Access Layer (DAO).
 
 from edu_doc_agent.dao.documents import DocumentDAO
 from edu_doc_agent.dao.models import Base, Document, Run, Session
-from edu_doc_agent.dao.repositories import ActiveRunConflictError, ReconciledRun, SessionRunDAO
+from edu_doc_agent.dao.repositories import ActiveRunConflictError, SessionRunDAO
 from edu_doc_agent.dao.storage import (
     FileStorage,
     FileStorageError,
@@ -31,7 +31,6 @@ __all__ = [
     "FileStorageError",
     "InvalidStoragePathError",
     "LocalFileStorage",
-    "ReconciledRun",
     "Run",
     "Session",
     "SessionRunDAO",
