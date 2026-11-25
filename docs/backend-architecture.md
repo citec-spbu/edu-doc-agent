@@ -95,7 +95,7 @@ flowchart TB
 ```
 
 - **Streamlit UI** — чат-интерфейс в браузере. Общается только с API.
-- **API-сервис (FastAPI + Uvicorn)** отвечает за диалоги, статусы и постановку задач. Через общий модуль Data Access он пишет диалоги в PostgreSQL, доставляет в чат вопросы воркера к пользователю и принимает ответы. В файловом контуре API реализована зависимость `get_file_storage()`, которая предоставляет `FileStorage`.
+- **API-сервис (FastAPI + Uvicorn)** отвечает за диалоги, загрузку/выдачу документов сессии, статусы и постановку задач. Через общий модуль Data Access он работает с PostgreSQL (`SessionRunDAO`, `DocumentDAO`) и файловым хранилищем (`get_file_storage()`).
 - **Redis** служит исключительно транспортным слоем (очередь задач ARQ и доставка событий). Он не является источником истины: при его рестарте система восстанавливает каноническое состояние из PostgreSQL.
 - **Воркер (ARQ)** запускает граф бизнес-логики на LangGraph в среде выполнения Runner. Он читает и пишет данные в PostgreSQL, читает каталог правил (YAML) и обращается к LLM-провайдеру. При запуске воркера `FileStorage` добавляется в контекст ARQ под ключом `storage`.
 - **PostgreSQL с pgvector** — хранит диалоги, канонические статусы задач, модель ОП, несоответствия, состояние графа и векторы нормативов.
@@ -148,6 +148,24 @@ SHA-256 вычисляется от полного идентификатора 
 и только затем передают `CancelledError`. К этому моменту файл уже может
 быть записан или удалён. Повтор по тому же ключу после получения отмены
 начинается после предыдущей операции.
+
+## Документы сессии (Documents API)
+
+Метаданные загруженных файлов хранятся в таблице `documents` (PostgreSQL), а бинарное содержимое — в `FileStorage`. Связка управляется через `DocumentDAO` (короткоживущие транзакции) и роутер `documents_router.py`.
+
+**Таблица `documents`:**
+- `id` (`UUID`, PK), `session_id` (FK → `sessions.id`, `ON DELETE CASCADE`, индекс `ix_documents_session_id`);
+- `filename`, `content_type`, `size_bytes` (`CHECK (size_bytes > 0)`), `storage_key` (`UNIQUE`);
+- `doc_type` (nullable, опциональный тип документа ОП), `derived_from` (nullable, FK → `documents.id`, `ON DELETE SET NULL` — задел под версионирование), `created_at`.
+
+**Эндпоинты (префикс `/api/v1/sessions`):**
+
+- **`POST /{session_id}/documents`** (`201 Created`, `DocumentResponse`) — загрузка файла (`multipart/form-data`, опциональное поле `doc_type`).
+  - Проверяет расширение через `parsing.supported_suffixes()` (`.docx`, `.xlsx` → иначе `415 Unsupported Media Type`), непустое имя и содержимое (`400 Bad Request`) и лимит размера `MAX_UPLOAD_FILE_BYTES` (по умолчанию 50 МБ, чтение чанками → `413 Content Too Large`).
+  - Сохраняет байты через `FileStorage.save()`, затем идемпотентно гарантирует существование `Session` и пишет метаданные в `documents`. При сбое записи в БД или отмене запроса файл удаляется из `FileStorage`.
+- **`GET /{session_id}/documents`** (`200 OK`, `DocumentListResponse`) — список метаданных документов сессии в порядке загрузки (`storage_key` в публичный ответ не попадает).
+- **`GET /{session_id}/documents/{doc_id}`** (`200 OK` / `404 Not Found`) — скачивание содержимого файла с `Content-Disposition` (UTF-8) и `media_type`. Если запись есть в БД, а файл отсутствует в `FileStorage`, возвращает `500 Internal Server Error`.
+- **`DELETE /{session_id}/documents/{doc_id}`** (`204 No Content` / `404 Not Found` / `409 Conflict`) — удаляет запись из БД и файл из `FileStorage`. Блокирует строку `Session` (`FOR UPDATE`) и возвращает `409 Conflict`, если в сессии есть активный `Run` (`queued`, `running`, `waiting_for_input`).
 
 ## С4, уровень 3: Компоненты воркера
 
