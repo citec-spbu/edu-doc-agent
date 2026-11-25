@@ -50,7 +50,6 @@ app.include_router(documents_router)
 
 
 @app.get("/", include_in_schema=False)
-@app.get("/", include_in_schema=False)
 def root() -> RedirectResponse:
     """Редирект на интерактивную документацию."""
     return RedirectResponse(url="/docs")
