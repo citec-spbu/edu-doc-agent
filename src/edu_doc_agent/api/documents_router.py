@@ -89,14 +89,15 @@ def _validate_upload_filename(raw_filename: str | None) -> tuple[str, str]:
 
 def _ascii_fallback_filename(filename: str) -> str:
     """Безопасное ASCII-имя для старых клиентов в заголовке Content-Disposition."""
-    cleaned = "".join(
-        ch if 32 <= ord(ch) < 127 and ch not in {'"', "\\", ";"} else "_" for ch in filename
+    path = FilePath(filename)
+    stem = "".join(
+        ch if 32 <= ord(ch) < 127 and ch not in {'"', "\\", ";"} else "_" for ch in path.stem
     ).strip(" ._")
-    if not cleaned:
-        suffix = FilePath(filename).suffix
-        safe_suffix = suffix if suffix.isascii() else ""
-        return f"document{safe_suffix}"
-    return cleaned
+    suffix = (
+        path.suffix if path.suffix.isascii() and not _has_ascii_control_chars(path.suffix) else ""
+    )
+    safe_suffix = "".join(ch for ch in suffix if ch not in {'"', "\\", ";"})
+    return f"{stem or 'document'}{safe_suffix}"
 
 
 async def _await_uninterruptible[T](operation: Coroutine[Any, Any, T]) -> T:
