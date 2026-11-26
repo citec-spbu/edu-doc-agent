@@ -12,7 +12,7 @@ Data Access Layer (DAO).
 """
 
 from edu_doc_agent.dao.models import Base, Run, Session
-from edu_doc_agent.dao.repositories import ActiveRunConflictError, SessionRunDAO
+from edu_doc_agent.dao.repositories import ActiveRunConflictError, ReconciledRun, SessionRunDAO
 from edu_doc_agent.dao.storage import (
     FileStorage,
     FileStorageError,
@@ -32,4 +32,5 @@ __all__ = [
     "Session",
     "SessionRunDAO",
     "StorageFileNotFoundError",
+    "ReconciledRun",
 ]

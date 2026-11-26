@@ -47,6 +47,7 @@ def test_persistence_defaults_foreign_key_and_sql_cascade(schema_database: Datab
                 assert parent.status == "active"
                 assert isinstance(run.id, UUID)
                 assert run.reconcile_attempts == 0
+                assert run.reconcile_pending is False
                 assert run.last_heartbeat_at is None
                 assert parent.created_at.tzinfo is not None
                 assert run.created_at.tzinfo is not None

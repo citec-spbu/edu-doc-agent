@@ -1,5 +1,7 @@
 """Репозиторий для управления каноническим состоянием Session и Run в PostgreSQL."""
 
+from dataclasses import dataclass
+from datetime import timedelta
 from uuid import UUID
 
 from sqlalchemy import select, update
@@ -12,6 +14,16 @@ from edu_doc_agent.dao.database import async_session_maker
 from edu_doc_agent.dao.models import Run, Session
 
 ACTIVE_RUN_CONSTRAINT = "uq_runs_active_session"
+
+
+@dataclass(frozen=True)
+class ReconciledRun:
+    """Запуск, восстановленный Reconciler'ом для повторной постановки в очередь ARQ."""
+
+    run_id: UUID
+    session_id: str
+    reconcile_attempts: int
+    reconcile_pending: bool = False
 
 
 class ActiveRunConflictError(Exception):
@@ -54,7 +66,6 @@ class SessionRunDAO:
         Любые другие ошибки целостности БД пробрасываются как есть.
         """
         async with self._session_factory() as db:
-            # Идемпотентный upsert сессии: два параллельных POST не упадут на PK sessions_pkey
             stmt = (
                 pg_insert(Session)
                 .values(id=session_id, status="active")
@@ -62,7 +73,6 @@ class SessionRunDAO:
             )
             await db.execute(stmt)
 
-            # Создаём запуск со статусом queued
             run = Run(session_id=session_id, status="queued")
             if run_id is not None:
                 run.id = run_id
@@ -80,15 +90,12 @@ class SessionRunDAO:
 
     async def mark_failed_if_queued(self, run_id: UUID) -> bool:
         """Компенсация при сбое постановки в Redis:
-        переводит Run в 'failed', только если он ещё 'queued'.
-
-        Возвращает True, если статус был изменён, или False, если воркер уже успел
-        перехватить задачу (статус 'running' или терминальный).
+        переводит в 'failed' только исходное поколение, ещё находящееся в 'queued'.
         """
         async with self._session_factory() as db:
             stmt = (
                 update(Run)
-                .where(Run.id == run_id, Run.status == "queued")
+                .where(Run.id == run_id, Run.status == "queued", Run.reconcile_attempts == 0)
                 .values(status="failed", updated_at=func.clock_timestamp())
                 .returning(Run.id)
             )
@@ -96,33 +103,77 @@ class SessionRunDAO:
             await db.commit()
             return result.scalar_one_or_none() is not None
 
-    async def claim_run_for_execution(self, run_id: UUID) -> bool:
-        """Атомарный переход 'queued' -> 'running' при старте выполнения задачи в воркере.
+    async def claim_run_for_execution(
+        self,
+        run_id: UUID,
+        *,
+        expected_reconcile_attempts: int = 0,
+    ) -> int | None:
+        """Атомарный переход 'queued' -> 'running'.
 
-        Возвращает True, если переход выполнен и бизнес-логику можно запускать.
-        Возвращает False, если Run уже не в 'queued' (например, отменён компенсацией API).
+        Возвращает захваченное поколение (reconcile_attempts) как fencing token,
+        или None, если Run уже не в 'queued' или поколение задачи устарело.
+        Задачи без явно переданного поколения относятся к исходному поколению 0.
         """
         async with self._session_factory() as db:
             stmt = (
                 update(Run)
-                .where(Run.id == run_id, Run.status == "queued")
+                .where(
+                    Run.id == run_id,
+                    Run.status == "queued",
+                    Run.reconcile_attempts == expected_reconcile_attempts,
+                )
                 .values(
                     status="running",
+                    # Старт job сам подтверждает доставку, даже если cron отменён
+                    # между enqueue и записью подтверждения в PostgreSQL.
+                    reconcile_pending=False,
                     last_heartbeat_at=func.clock_timestamp(),
                     updated_at=func.clock_timestamp(),
                 )
+                .returning(Run.reconcile_attempts)
+            )
+            result = await db.execute(stmt)
+            await db.commit()
+            return result.scalar_one_or_none()
+
+    async def touch_heartbeat(
+        self,
+        run_id: UUID,
+        *,
+        expected_reconcile_attempts: int | None = None,
+    ) -> bool:
+        """Обновляет last_heartbeat_at для 'running' (с проверкой fencing token, если задан)."""
+        conditions = [Run.id == run_id, Run.status == "running"]
+        if expected_reconcile_attempts is not None:
+            conditions.append(Run.reconcile_attempts == expected_reconcile_attempts)
+
+        async with self._session_factory() as db:
+            stmt = (
+                update(Run)
+                .where(*conditions)
+                .values(last_heartbeat_at=func.clock_timestamp(), updated_at=Run.updated_at)
                 .returning(Run.id)
             )
             result = await db.execute(stmt)
             await db.commit()
             return result.scalar_one_or_none() is not None
 
-    async def mark_run_completed(self, run_id: UUID) -> bool:
-        """Переводит выполняющийся Run ('running') в терминальный статус 'completed'."""
+    async def mark_run_completed(
+        self,
+        run_id: UUID,
+        *,
+        expected_reconcile_attempts: int | None = None,
+    ) -> bool:
+        """Переводит 'running' -> 'completed' (с проверкой fencing token, если задан)."""
+        conditions = [Run.id == run_id, Run.status == "running"]
+        if expected_reconcile_attempts is not None:
+            conditions.append(Run.reconcile_attempts == expected_reconcile_attempts)
+
         async with self._session_factory() as db:
             stmt = (
                 update(Run)
-                .where(Run.id == run_id, Run.status == "running")
+                .where(*conditions)
                 .values(status="completed", updated_at=func.clock_timestamp())
                 .returning(Run.id)
             )
@@ -130,12 +181,21 @@ class SessionRunDAO:
             await db.commit()
             return result.scalar_one_or_none() is not None
 
-    async def mark_run_failed(self, run_id: UUID) -> bool:
-        """Переводит активный Run ('queued' или 'running') в терминальный статус 'failed'."""
+    async def mark_run_failed(
+        self,
+        run_id: UUID,
+        *,
+        expected_reconcile_attempts: int | None = None,
+    ) -> bool:
+        """Переводит активный Run ('queued' или 'running') в 'failed'."""
+        conditions = [Run.id == run_id, Run.status.in_(("queued", "running"))]
+        if expected_reconcile_attempts is not None:
+            conditions.append(Run.reconcile_attempts == expected_reconcile_attempts)
+
         async with self._session_factory() as db:
             stmt = (
                 update(Run)
-                .where(Run.id == run_id, Run.status.in_(("queued", "running")))
+                .where(*conditions)
                 .values(status="failed", updated_at=func.clock_timestamp())
                 .returning(Run.id)
             )
@@ -143,16 +203,236 @@ class SessionRunDAO:
             await db.commit()
             return result.scalar_one_or_none() is not None
 
-    async def requeue_running_run(self, run_id: UUID) -> bool:
-        """Возвращает 'running' -> 'queued' при штатной отмене задачи воркера (SIGTERM/retry ARQ)"""
+    async def requeue_running_run(
+        self,
+        run_id: UUID,
+        *,
+        expected_reconcile_attempts: int | None = None,
+    ) -> bool:
+        """Возвращает 'running' -> 'queued' при штатной отмене задачи воркера."""
+        conditions = [Run.id == run_id, Run.status == "running"]
+        if expected_reconcile_attempts is not None:
+            conditions.append(Run.reconcile_attempts == expected_reconcile_attempts)
+
         async with self._session_factory() as db:
             stmt = (
                 update(Run)
-                .where(Run.id == run_id, Run.status == "running")
-                .values(status="queued", updated_at=func.clock_timestamp())
+                .where(*conditions)
+                .values(
+                    status="queued", updated_at=func.clock_timestamp(), last_queue_check_at=None
+                )
                 .returning(Run.id)
             )
             result = await db.execute(stmt)
+            await db.commit()
+            return result.scalar_one_or_none() is not None
+
+    async def fail_exhausted_stale_running_runs(
+        self,
+        *,
+        stale_running_seconds: float,
+        max_reconcile_attempts: int,
+        limit: int = 100,
+    ) -> list[UUID]:
+        """Переводит зависшие 'running', достигшие лимита восстановлений, в 'failed'."""
+        cutoff = func.clock_timestamp() - timedelta(seconds=stale_running_seconds)
+        target_ids = (
+            select(Run.id)
+            .where(
+                Run.status == "running",
+                func.coalesce(Run.last_heartbeat_at, Run.updated_at) < cutoff,
+                Run.reconcile_attempts >= max_reconcile_attempts,
+            )
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )
+        async with self._session_factory() as db:
+            stmt = (
+                update(Run)
+                .where(Run.id.in_(target_ids), Run.status == "running")
+                .values(status="failed", updated_at=func.clock_timestamp())
+                .returning(Run.id)
+            )
+            result = await db.execute(stmt)
+            await db.commit()
+            return list(result.scalars().all())
+
+    async def requeue_stale_running_runs(
+        self,
+        *,
+        stale_running_seconds: float,
+        max_reconcile_attempts: int,
+        limit: int = 100,
+    ) -> list[ReconciledRun]:
+        """Резервирует новое поколение для зависших 'running', ожидающее доставки."""
+        cutoff = func.clock_timestamp() - timedelta(seconds=stale_running_seconds)
+        target_ids = (
+            select(Run.id)
+            .where(
+                Run.status == "running",
+                func.coalesce(Run.last_heartbeat_at, Run.updated_at) < cutoff,
+                Run.reconcile_attempts < max_reconcile_attempts,
+            )
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )
+        async with self._session_factory() as db:
+            stmt = (
+                update(Run)
+                .where(Run.id.in_(target_ids), Run.status == "running")
+                .values(
+                    status="queued",
+                    reconcile_attempts=Run.reconcile_attempts + 1,
+                    reconcile_pending=True,
+                    updated_at=func.clock_timestamp(),
+                    last_queue_check_at=None,
+                )
+                .returning(Run.id, Run.session_id, Run.reconcile_attempts, Run.reconcile_pending)
+            )
+            result = await db.execute(stmt)
+            await db.commit()
+            return [
+                ReconciledRun(
+                    run_id=row.id,
+                    session_id=row.session_id,
+                    reconcile_attempts=row.reconcile_attempts,
+                    reconcile_pending=row.reconcile_pending,
+                )
+                for row in result.all()
+            ]
+
+    async def list_stale_queued_runs(
+        self,
+        *,
+        stale_queued_seconds: float,
+        limit: int = 100,
+    ) -> list[ReconciledRun]:
+        """Возвращает самых давно не проверявшихся 'queued', старше порога.
+
+        После проверки job last_queue_check_at сдвигает её в конец обхода,
+        сохраняя updated_at как время перехода в статус.
+        """
+        cutoff = func.clock_timestamp() - timedelta(seconds=stale_queued_seconds)
+        last_checked = func.coalesce(Run.last_queue_check_at, Run.updated_at)
+        async with self._session_factory() as db:
+            stmt = (
+                select(Run.id, Run.session_id, Run.reconcile_attempts, Run.reconcile_pending)
+                .where(
+                    Run.status == "queued",
+                    last_checked < cutoff,
+                )
+                .order_by(last_checked, Run.id)
+                .limit(limit)
+            )
+            result = await db.execute(stmt)
+            return [
+                ReconciledRun(
+                    run_id=row.id,
+                    session_id=row.session_id,
+                    reconcile_attempts=row.reconcile_attempts,
+                    reconcile_pending=row.reconcile_pending,
+                )
+                for row in result.all()
+            ]
+
+    async def fail_stale_queued_run(
+        self,
+        run_id: UUID,
+        *,
+        expected_reconcile_attempts: int,
+    ) -> bool:
+        """Атомарно переводит потерянный 'queued' run в 'failed' (poison pill)."""
+        async with self._session_factory() as db:
+            stmt = (
+                update(Run)
+                .where(
+                    Run.id == run_id,
+                    Run.status == "queued",
+                    Run.reconcile_attempts == expected_reconcile_attempts,
+                    Run.reconcile_pending.is_(False),
+                )
+                .values(status="failed", updated_at=func.clock_timestamp())
+                .returning(Run.id)
+            )
+            result = await db.execute(stmt)
+            await db.commit()
+            return result.scalar_one_or_none() is not None
+
+    async def bump_stale_queued_run(
+        self,
+        run_id: UUID,
+        *,
+        expected_reconcile_attempts: int,
+    ) -> ReconciledRun | None:
+        """Резервирует новое поколение потерянного 'queued', если нет ожидающей доставки."""
+        async with self._session_factory() as db:
+            stmt = (
+                update(Run)
+                .where(
+                    Run.id == run_id,
+                    Run.status == "queued",
+                    Run.reconcile_attempts == expected_reconcile_attempts,
+                    Run.reconcile_pending.is_(False),
+                )
+                .values(
+                    reconcile_attempts=Run.reconcile_attempts + 1,
+                    reconcile_pending=True,
+                    updated_at=Run.updated_at,
+                    last_queue_check_at=func.clock_timestamp(),
+                )
+                .returning(Run.id, Run.session_id, Run.reconcile_attempts, Run.reconcile_pending)
+            )
+            result = await db.execute(stmt)
+            await db.commit()
+            row = result.one_or_none()
+            if row is None:
+                return None
+            return ReconciledRun(
+                run_id=row.id,
+                session_id=row.session_id,
+                reconcile_attempts=row.reconcile_attempts,
+                reconcile_pending=row.reconcile_pending,
+            )
+
+    async def confirm_reconcile_enqueue(
+        self,
+        run_id: UUID,
+        *,
+        expected_reconcile_attempts: int,
+    ) -> bool:
+        """Подтверждает доставку поколения; повторное подтверждение безопасно."""
+        async with self._session_factory() as db:
+            result = await db.execute(
+                update(Run)
+                .where(
+                    Run.id == run_id,
+                    Run.reconcile_attempts == expected_reconcile_attempts,
+                    Run.reconcile_pending.is_(True),
+                )
+                .values(reconcile_pending=False, updated_at=Run.updated_at)
+                .returning(Run.id)
+            )
+            await db.commit()
+            return result.scalar_one_or_none() is not None
+
+    async def mark_queued_run_checked(
+        self,
+        run_id: UUID,
+        *,
+        expected_reconcile_attempts: int,
+    ) -> bool:
+        """Переносит проверенный queued run в конец обхода, не меняя поколение."""
+        async with self._session_factory() as db:
+            result = await db.execute(
+                update(Run)
+                .where(
+                    Run.id == run_id,
+                    Run.status == "queued",
+                    Run.reconcile_attempts == expected_reconcile_attempts,
+                )
+                .values(last_queue_check_at=func.clock_timestamp(), updated_at=Run.updated_at)
+                .returning(Run.id)
+            )
             await db.commit()
             return result.scalar_one_or_none() is not None
 

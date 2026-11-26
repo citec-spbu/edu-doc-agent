@@ -4,9 +4,13 @@ from functools import lru_cache
 from pathlib import Path
 
 from arq.connections import RedisSettings
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL
+
+# Ограничиваем пороги годом: вычитание из текущего timestamp должно быть
+# безопасно и для PostgreSQL, а не только для Python timedelta.
+MAX_RUN_STALE_SECONDS = 365 * 24 * 60 * 60
 
 
 class Settings(BaseSettings):
@@ -53,6 +57,16 @@ class Settings(BaseSettings):
     # --- Очередь (Redis / ARQ) ---
     redis_url: str = "redis://localhost:6379/0"
 
+    # --- Heartbeat и Reconciler ---
+    run_heartbeat_interval_seconds: float = Field(default=30.0, gt=0, allow_inf_nan=False)
+    run_stale_running_seconds: float = Field(
+        default=120.0, gt=0, le=MAX_RUN_STALE_SECONDS, allow_inf_nan=False
+    )
+    run_stale_queued_seconds: float = Field(
+        default=120.0, gt=0, le=MAX_RUN_STALE_SECONDS, allow_inf_nan=False
+    )
+    run_max_reconcile_attempts: int = Field(default=3, ge=1)
+
     @property
     def arq_redis_settings(self) -> RedisSettings:
         """Настройки подключения для воркера ARQ."""
@@ -91,6 +105,16 @@ class Settings(BaseSettings):
         if isinstance(value, str) and not value.strip():
             return Path("storage")
         return value
+
+    @model_validator(mode="after")
+    def _validate_heartbeat_vs_stale_running(self) -> "Settings":
+        min_stale = 2 * self.run_heartbeat_interval_seconds
+        if self.run_stale_running_seconds < min_stale:
+            raise ValueError(
+                "RUN_STALE_RUNNING_SECONDS must be at least 2x "
+                f"RUN_HEARTBEAT_INTERVAL_SECONDS ({min_stale:g}s)"
+            )
+        return self
 
 
 @lru_cache
