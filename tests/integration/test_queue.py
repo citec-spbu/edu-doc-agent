@@ -965,10 +965,13 @@ def test_arq_timeout_fails_run_and_allows_a_new_post(
                 run_id = first.json()["run_id"]
                 if job_try > 1:
                     await pool.set(retry_key_prefix + run_id, job_try - 1)
+                # Здесь проверяется таймаут одной job; стартовый cron добавляет
+                # отдельную задачу, которая не входит в max_burst_jobs=1.
                 worker = create_worker(
                     settings.WorkerSettings,
                     redis_pool=pool,
                     queue_name=name,
+                    cron_jobs=[],
                     burst=True,
                     max_burst_jobs=1,
                     poll_delay=0.01,
