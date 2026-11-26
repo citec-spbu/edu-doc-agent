@@ -29,7 +29,8 @@ API делает одну попытку постановки на запрос.
 один активный run (`queued`, `running`, `waiting_for_input`) на сессию.
 API создаёт Run до постановки в очередь, worker фиксирует переходы
 `queued → running → completed/failed`. Повторный POST при активном Run даёт `409`;
-сбой постановки переводит ещё не взятый worker запуск в `failed`.
+сбой постановки переводит в `failed` только ещё не взятый worker запуск
+исходного поколения 0. Запоздалая компенсация не меняет восстановленное поколение.
 
 ## Настоящий PostgreSQL 17 и Alembic
 
@@ -117,7 +118,9 @@ TEST_DATABASE_URL=postgresql+psycopg://edu:edu@127.0.0.1:5432/edu \
 В [test_runner_heartbeat.py](unit/worker/test_runner_heartbeat.py) проверяются
 остановка логики по локальному сроку lease при ошибках и зависании БД, продление
 lease подтверждёнными heartbeat, задержка ответа на захват и гонка отмены Runner
-с завершением heartbeat. В [test_runner_failures.py](unit/worker/test_runner_failures.py)
+с завершением heartbeat. Независимый таймер отменяет логику, даже пока очистка
+SQLAlchemy ожидает завершения; задержанное подтверждение захвата вызывает
+первый пульс сразу, если его интервал уже прошёл. В [test_runner_failures.py](unit/worker/test_runner_failures.py)
 проверяется также контракт произвольного `Awaitable`, включая `Future`, его отмену
 и синхронное исключение при вызове бизнес-функции.
 
@@ -130,6 +133,16 @@ lease подтверждёнными heartbeat, задержка ответа н
 [test_session_runs.py](integration/test_session_runs.py); новая миграция признака
 `reconcile_pending` и её откат проверяются в
 [test_migrations.py](integration/dao/test_migrations.py).
+В той же миграции добавлен `last_queue_check_at` для порядка обхода. Интеграции
+проверяют через GET сохранение публичного `updated_at` при heartbeat, проверке
+очереди и резервировании следующего поколения, а также запоздалую компенсацию POST
+после подтверждённой доставки поколения 1. Сохранённая ошибка настоящего ARQ
+подтверждает доставку pending-поколения и позволяет продолжить восстановление.
+
+В [test_worker_config.py](unit/test_worker_config.py) проверяются `NaN`
+и бесконечные значения, предел 365 дней для обоих порогов и значения сразу выше
+него. Максимальный допустимый порог проверяется всеми тремя запросами DAO
+в [test_session_runs.py](integration/test_session_runs.py).
 
 Отдельные unit-сценарии приёмки #47 находятся в
 [test_reconciler.py](unit/worker/test_reconciler.py), а интеграционные с настоящими
@@ -142,6 +155,7 @@ PostgreSQL, Redis и ARQ — в [test_queue.py](integration/test_queue.py):
 | Исчерпание лимита для running и queued | `test_reconciler_exhausted_limit_fails_and_allows_new_http_post` |
 | Возвращение старого владельца после захвата новым worker | `test_reconciler_returning_old_runner_cannot_modify_the_recovered_owner` |
 | Потеря ответа Redis до/после фактической записи | `test_reconciler_unknown_redis_write_outcome_preserves_generation_and_executes_once` |
+| Сохранённая ошибка ARQ после потери ответа Redis и сбоя захвата run | `test_saved_arq_failure_confirms_delivery_and_allows_recovery` |
 
 Каждый интеграционный сценарий проверяет освобождение сессии через HTTP:
 после терминального GET следующий POST получает `202` с новым `run_id`.
@@ -149,13 +163,18 @@ PostgreSQL, Redis и ARQ — в [test_queue.py](integration/test_queue.py):
 включая job ID восстановлений. Целевой запуск (нужны обе тестовые DSN):
 
 ```bash
-uv run --no-sync pytest tests/unit/worker/test_reconciler.py \
-  tests/integration/test_queue.py -k reconciler --run-integration
+uv run --no-sync pytest tests/unit/worker tests/unit/test_worker_config.py \
+  tests/unit/api/test_sessions.py tests/integration/dao \
+  tests/integration/test_session_runs.py tests/integration/test_queue.py \
+  --run-integration
 ```
 
 CI запускает эти тесты существующей командой `pytest --run-integration`.
 Регистрация cron с `run_at_startup=True` проверяется в unit-тесте конфигурации
 worker; это постановка при старте, а не барьер перед обработкой обычных задач.
+В сценариях отдельной job, таймаута и остановки/повтора worker cron отключён
+через `cron_jobs=[]`, чтобы служебная задача не попадала в счётчики и очередь
+проверяемого запуска. В сценариях восстановления Reconciler вызывается явно.
 
 Для сбора покрытия backend указывайте каталоги исходников:
 

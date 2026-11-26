@@ -9,6 +9,90 @@ import pytest
 from tests.fakes import InMemorySessionRunDAO
 
 
+def test_lease_timer_stops_logic_before_heartbeat_cleanup_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = importlib.import_module("edu_doc_agent.worker.runner")
+
+    async def scenario() -> None:
+        dao = InMemorySessionRunDAO()
+        run = await dao.create_queued_run("synthetic-session")
+        cleanup_started, cleanup_release = asyncio.Event(), asyncio.Event()
+        logic_stopped = asyncio.Event()
+        effects = []
+
+        async def heartbeat(*args, **kwargs):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleanup_started.set()
+                # Как shielded rollback/close SQLAlchemy: отмена не завершает очистку.
+                await module._finish_status_update(cleanup_release.wait())
+
+        async def logic(session_id: str) -> None:
+            try:
+                await asyncio.sleep(0.18)
+                effects.append("business effect after lease expiry")
+            finally:
+                logic_stopped.set()
+
+        monkeypatch.setattr(dao, "touch_heartbeat", heartbeat)
+        task = asyncio.create_task(
+            module.SessionRunner(dao, heartbeat_interval=0.01, lease_timeout=0.08).execute(
+                run.session_id, run.id, logic
+            )
+        )
+        try:
+            await cleanup_started.wait()
+            await asyncio.sleep(0.20)
+            assert logic_stopped.is_set()
+            assert effects == []
+            assert not task.done()  # Очистка БД ещё не завершена.
+        finally:
+            cleanup_release.set()
+            result = await task
+        assert result["status"] == "conflict"
+        assert run.status == "running"
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=2))
+
+
+def test_delayed_claim_acknowledgement_gets_an_immediate_first_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner_class = importlib.import_module("edu_doc_agent.worker.runner").SessionRunner
+
+    async def scenario() -> None:
+        dao = InMemorySessionRunDAO()
+        run = await dao.create_queued_run("synthetic-session")
+        claim = dao.claim_run_for_execution
+        pulse = asyncio.Event()
+        touch = dao.touch_heartbeat
+
+        async def delayed_claim(*args, **kwargs):
+            token = await claim(*args, **kwargs)
+            await asyncio.sleep(0.08)
+            return token
+
+        async def heartbeat(*args, **kwargs):
+            updated = await touch(*args, **kwargs)
+            pulse.set()
+            return updated
+
+        async def logic(session_id: str) -> None:
+            await pulse.wait()
+
+        monkeypatch.setattr(dao, "claim_run_for_execution", delayed_claim)
+        monkeypatch.setattr(dao, "touch_heartbeat", AsyncMock(side_effect=heartbeat))
+        result = await runner_class(dao, heartbeat_interval=0.06, lease_timeout=0.12).execute(
+            run.session_id, run.id, logic
+        )
+        assert result["status"] == "completed"
+        dao.touch_heartbeat.assert_awaited_once()
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=2))
+
+
 @pytest.mark.parametrize("failure", ["error", "hang"])
 def test_database_outage_stops_logic_when_local_lease_expires(
     monkeypatch: pytest.MonkeyPatch, failure: str

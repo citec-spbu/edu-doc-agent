@@ -116,7 +116,52 @@ def redis_for_reconcile(queue_name: str = "arq:queue") -> AsyncMock:
     redis.default_queue_name = queue_name
     redis.ping = AsyncMock()
     redis.zscore = AsyncMock(return_value=None)
+    redis.exists = AsyncMock(return_value=0)
     return redis
+
+
+@pytest.mark.parametrize("generation", [1, 3])
+def test_saved_arq_result_confirms_pending_delivery(generation: int) -> None:
+    from arq.constants import result_key_prefix
+
+    reconciler_class = importlib.import_module("edu_doc_agent.worker.reconciler").RunReconciler
+
+    async def scenario() -> None:
+        dao = InMemorySessionRunDAO()
+        run = await dao.create_queued_run("synthetic-session")
+        run.reconcile_attempts = generation
+        run.reconcile_pending = True
+        redis = redis_for_reconcile()
+        redis.enqueue_job.return_value = None
+        redis.exists.return_value = 1
+        reconciler = reconciler_class(dao=dao, redis=redis, stale_queued_seconds=0)
+
+        report = await reconciler.reconcile()
+        assert report.enqueued_count == 1
+        assert not run.reconcile_pending
+        assert run.reconcile_attempts == generation
+        redis.exists.assert_awaited_once_with(f"{result_key_prefix}{run.id}:reconcile:{generation}")
+        redis.enqueue_job.return_value = object()
+        report = await reconciler.reconcile()
+        if generation == 3:
+            assert report.failed_count == 1 and run.status == "failed"
+        else:
+            assert report.enqueued_count == 1 and run.reconcile_attempts == generation + 1
+
+    asyncio.run(scenario())
+
+
+def test_late_post_compensation_cannot_fail_a_delivered_recovery() -> None:
+    async def scenario() -> None:
+        dao = InMemorySessionRunDAO()
+        run = await dao.create_queued_run("synthetic-session")
+        assert await dao.bump_stale_queued_run(run.id, expected_reconcile_attempts=0)
+        assert await dao.confirm_reconcile_enqueue(run.id, expected_reconcile_attempts=1)
+        assert not await dao.mark_failed_if_queued(run.id)
+        assert await dao.claim_run_for_execution(run.id, expected_reconcile_attempts=1) == 1
+        assert await dao.mark_run_completed(run.id, expected_reconcile_attempts=1)
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("pending", [False, True])
@@ -345,7 +390,7 @@ def test_checked_page_does_not_starve_the_101st_lost_run() -> None:
         redis.zscore.side_effect = score
         first = await reconciler_class(dao=dao, redis=redis, stale_queued_seconds=0).reconcile()
         assert first.enqueued_count == 0
-        assert all(r.updated_at > old for r in runs[:100])
+        assert all(r.last_queue_check_at > old and r.updated_at == old for r in runs[:100])
         # Новый экземпляр cron, без сохранённого в памяти курсора.
         second = await reconciler_class(dao=dao, redis=redis, stale_queued_seconds=0).reconcile()
         assert second.enqueued_count == 1

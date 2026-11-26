@@ -86,16 +86,19 @@ class SessionRunner:
         on_lease_lost: Callable[[], None] | None = None,
         *,
         lease_deadline: float,
+        on_lease_renewed: Callable[[float], None],
     ) -> None:
         """Продлевает lease; без подтверждения БД останавливает работу к локальному сроку."""
         loop = asyncio.get_running_loop()
         op_timeout = min(interval, 10.0)
+        next_pulse = lease_deadline - self._lease_timeout + interval
         while True:
             try:
                 # Срок охватывает и ожидание следующего пульса, и запрос БД.
                 async with asyncio.timeout_at(lease_deadline):
-                    await asyncio.sleep(interval)
+                    await asyncio.sleep(max(0, next_pulse - loop.time()))
                     request_started = loop.time()
+                    next_pulse = request_started + interval
                     try:
                         async with asyncio.timeout(op_timeout):
                             updated = await self._dao.touch_heartbeat(
@@ -129,6 +132,7 @@ class SessionRunner:
             # Начало запроса предшествует записи clock_timestamp() в БД.
             # Отсчёт от получения ответа мог бы продлить локальный lease сверх БД.
             lease_deadline = request_started + self._lease_timeout
+            on_lease_renewed(lease_deadline)
 
     async def execute(
         self,
@@ -197,12 +201,26 @@ class SessionRunner:
 
             def _handle_lease_lost() -> None:
                 nonlocal lease_lost
+                if lease_lost:
+                    return
                 lease_lost = True
                 if not logic_task.done():
                     logic_task.cancel()
 
+            lease_timer: asyncio.TimerHandle | None = None
+
+            def _renew_lease_timer(deadline: float) -> None:
+                nonlocal lease_timer
+                if lease_lost:
+                    return
+                if lease_timer is not None:
+                    lease_timer.cancel()
+                # Этот callback не ждёт отмены heartbeat или очистки сессии БД.
+                lease_timer = loop.call_at(deadline, _handle_lease_lost)
+
             heartbeat_task: asyncio.Task[None] | None = None
-            if self._heartbeat_interval is not None and self._heartbeat_interval > 0:
+            if heartbeat_enabled:
+                _renew_lease_timer(lease_deadline)
                 heartbeat_task = asyncio.create_task(
                     self._heartbeat_loop(
                         run_uuid,
@@ -210,6 +228,7 @@ class SessionRunner:
                         lease_token,
                         on_lease_lost=_handle_lease_lost,
                         lease_deadline=lease_deadline,
+                        on_lease_renewed=_renew_lease_timer,
                     )
                 )
 
@@ -247,7 +266,11 @@ class SessionRunner:
                                     run_uuid,
                                 )
                     finally:
-                        await _stop_heartbeat(heartbeat_task)
+                        try:
+                            await _stop_heartbeat(heartbeat_task)
+                        finally:
+                            if lease_timer is not None:
+                                lease_timer.cancel()
             except Exception:
                 if lease_lost:
                     raise

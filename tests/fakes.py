@@ -32,6 +32,7 @@ class InMemorySessionRunDAO:
             status="queued",
             reconcile_attempts=0,
             reconcile_pending=False,
+            last_queue_check_at=None,
             created_at=now,
             updated_at=now,
         )
@@ -54,14 +55,17 @@ class InMemorySessionRunDAO:
             and run.reconcile_attempts != expected_reconcile_attempts
         ):
             return False
+        if run.status != new_status:
+            run.updated_at = datetime.now(UTC)
+            if new_status == "queued":
+                run.last_queue_check_at = None
         run.status = new_status
-        run.updated_at = datetime.now(UTC)
         if new_status == "running":
             run.last_heartbeat_at = run.updated_at
         return True
 
     async def mark_failed_if_queued(self, run_id: UUID) -> bool:
-        return self._transition(run_id, ("queued",), "failed")
+        return self._transition(run_id, ("queued",), "failed", expected_reconcile_attempts=0)
 
     async def claim_run_for_execution(
         self,
@@ -177,8 +181,12 @@ class InMemorySessionRunDAO:
     ) -> list[ReconciledRun]:
         cutoff = datetime.now(UTC) - timedelta(seconds=stale_queued_seconds)
         candidates = sorted(
-            (r for r in self.runs.values() if r.status == "queued" and r.updated_at < cutoff),
-            key=lambda r: (r.updated_at, r.id),
+            (
+                r
+                for r in self.runs.values()
+                if r.status == "queued" and (r.last_queue_check_at or r.updated_at) < cutoff
+            ),
+            key=lambda r: (r.last_queue_check_at or r.updated_at, r.id),
         )[:limit]
         return [self._reconciled(run) for run in candidates]
 
@@ -192,6 +200,7 @@ class InMemorySessionRunDAO:
             return None
         run.reconcile_attempts += 1
         run.reconcile_pending = True
+        run.last_queue_check_at = datetime.now(UTC)
         return self._reconciled(run)
 
     async def fail_stale_queued_run(
@@ -215,6 +224,9 @@ class InMemorySessionRunDAO:
     async def mark_queued_run_checked(
         self, run_id: UUID, *, expected_reconcile_attempts: int
     ) -> bool:
-        return self._transition(
+        updated = self._transition(
             run_id, ("queued",), "queued", expected_reconcile_attempts=expected_reconcile_attempts
         )
+        if updated:
+            self.runs[run_id].last_queue_check_at = datetime.now(UTC)
+        return updated

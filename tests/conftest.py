@@ -87,6 +87,8 @@ def redis_pool() -> AsyncMock:
     pool.default_queue_name = default_queue_name
     # redis.close обёрнут декоратором deprecation: autospec считает его sync.
     pool.close = AsyncMock()
+    # Redis возвращает awaitable; autospec для exists создаёт обычный Mock.
+    pool.exists = AsyncMock(return_value=0)
     pool.enqueue_job.return_value = Mock(spec=Job)
     return pool
 

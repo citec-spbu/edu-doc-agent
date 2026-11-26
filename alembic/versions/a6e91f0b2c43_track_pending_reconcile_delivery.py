@@ -1,4 +1,4 @@
-"""Track reserved recovery generations awaiting delivery.
+"""Track pending recovery deliveries and queue checks.
 
 Revision ID: a6e91f0b2c43
 Revises: 9b4d2c6e8f10
@@ -22,7 +22,11 @@ def upgrade() -> None:
         "runs",
         sa.Column("reconcile_pending", sa.Boolean(), nullable=False, server_default=sa.false()),
     )
+    op.add_column(
+        "runs", sa.Column("last_queue_check_at", sa.DateTime(timezone=True), nullable=True)
+    )
 
 
 def downgrade() -> None:
+    op.drop_column("runs", "last_queue_check_at")
     op.drop_column("runs", "reconcile_pending")

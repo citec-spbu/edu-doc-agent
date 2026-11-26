@@ -28,9 +28,13 @@ def rows(database: Database) -> tuple[list, list]:
             connection.execute(select(Session.__table__).order_by(Session.id)).all(),
             # Сравниваем поля, существующие и до новой миграции, и после downgrade.
             connection.execute(
-                select(*(c for c in Run.__table__.c if c.name != "reconcile_pending")).order_by(
-                    Run.id
-                )
+                select(
+                    *(
+                        c
+                        for c in Run.__table__.c
+                        if c.name not in {"reconcile_pending", "last_queue_check_at"}
+                    )
+                ).order_by(Run.id)
             ).all(),
         )
 
@@ -179,7 +183,10 @@ def test_pending_delivery_migration_preserves_generation_and_can_be_reapplied(
     assert rows(database) == before
     with database.engine.begin() as connection:
         assert connection.scalar(select(Run.reconcile_pending)) is False
-        connection.execute(update(Run).values(reconcile_pending=True))
+        assert connection.scalar(select(Run.last_queue_check_at)) is None
+        connection.execute(
+            update(Run).values(reconcile_pending=True, last_queue_check_at=Run.updated_at)
+        )
     before = rows(database)
     result = database.alembic("downgrade", previous)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -187,3 +194,4 @@ def test_pending_delivery_migration_preserves_generation_and_can_be_reapplied(
     database.migrate()
     with database.engine.connect() as connection:
         assert connection.scalar(select(Run.reconcile_pending)) is False
+        assert connection.scalar(select(Run.last_queue_check_at)) is None

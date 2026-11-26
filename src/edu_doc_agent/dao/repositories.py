@@ -90,12 +90,12 @@ class SessionRunDAO:
 
     async def mark_failed_if_queued(self, run_id: UUID) -> bool:
         """Компенсация при сбое постановки в Redis:
-        переводит Run в 'failed', только если он ещё 'queued'.
+        переводит в 'failed' только исходное поколение, ещё находящееся в 'queued'.
         """
         async with self._session_factory() as db:
             stmt = (
                 update(Run)
-                .where(Run.id == run_id, Run.status == "queued")
+                .where(Run.id == run_id, Run.status == "queued", Run.reconcile_attempts == 0)
                 .values(status="failed", updated_at=func.clock_timestamp())
                 .returning(Run.id)
             )
@@ -152,7 +152,7 @@ class SessionRunDAO:
             stmt = (
                 update(Run)
                 .where(*conditions)
-                .values(last_heartbeat_at=func.clock_timestamp())
+                .values(last_heartbeat_at=func.clock_timestamp(), updated_at=Run.updated_at)
                 .returning(Run.id)
             )
             result = await db.execute(stmt)
@@ -218,7 +218,9 @@ class SessionRunDAO:
             stmt = (
                 update(Run)
                 .where(*conditions)
-                .values(status="queued", updated_at=func.clock_timestamp())
+                .values(
+                    status="queued", updated_at=func.clock_timestamp(), last_queue_check_at=None
+                )
                 .returning(Run.id)
             )
             result = await db.execute(stmt)
@@ -283,6 +285,7 @@ class SessionRunDAO:
                     reconcile_attempts=Run.reconcile_attempts + 1,
                     reconcile_pending=True,
                     updated_at=func.clock_timestamp(),
+                    last_queue_check_at=None,
                 )
                 .returning(Run.id, Run.session_id, Run.reconcile_attempts, Run.reconcile_pending)
             )
@@ -306,18 +309,19 @@ class SessionRunDAO:
     ) -> list[ReconciledRun]:
         """Возвращает самых давно не проверявшихся 'queued', старше порога.
 
-        После проверки существующей job mark_queued_run_checked сдвигает
-        updated_at: следующие проходы доберутся до кандидатов за пределами LIMIT.
+        После проверки job last_queue_check_at сдвигает её в конец обхода,
+        сохраняя updated_at как время перехода в статус.
         """
         cutoff = func.clock_timestamp() - timedelta(seconds=stale_queued_seconds)
+        last_checked = func.coalesce(Run.last_queue_check_at, Run.updated_at)
         async with self._session_factory() as db:
             stmt = (
                 select(Run.id, Run.session_id, Run.reconcile_attempts, Run.reconcile_pending)
                 .where(
                     Run.status == "queued",
-                    Run.updated_at < cutoff,
+                    last_checked < cutoff,
                 )
-                .order_by(Run.updated_at, Run.id)
+                .order_by(last_checked, Run.id)
                 .limit(limit)
             )
             result = await db.execute(stmt)
@@ -373,7 +377,8 @@ class SessionRunDAO:
                 .values(
                     reconcile_attempts=Run.reconcile_attempts + 1,
                     reconcile_pending=True,
-                    updated_at=func.clock_timestamp(),
+                    updated_at=Run.updated_at,
+                    last_queue_check_at=func.clock_timestamp(),
                 )
                 .returning(Run.id, Run.session_id, Run.reconcile_attempts, Run.reconcile_pending)
             )
@@ -425,7 +430,7 @@ class SessionRunDAO:
                     Run.status == "queued",
                     Run.reconcile_attempts == expected_reconcile_attempts,
                 )
-                .values(updated_at=func.clock_timestamp())
+                .values(last_queue_check_at=func.clock_timestamp(), updated_at=Run.updated_at)
                 .returning(Run.id)
             )
             await db.commit()

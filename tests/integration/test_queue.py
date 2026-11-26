@@ -441,6 +441,73 @@ def test_reconciler_unknown_redis_write_outcome_preserves_generation_and_execute
     asyncio.run(asyncio.wait_for(scenario(), timeout=15))
 
 
+def test_saved_arq_failure_confirms_delivery_and_allows_recovery(
+    redis_dsn: str, queue_database: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reconciler_class = importlib.import_module("edu_doc_agent.worker.reconciler").RunReconciler
+    tasks = importlib.import_module("edu_doc_agent.worker.tasks")
+    logic = AsyncMock()
+    monkeypatch.setattr(tasks, "_stub_session_logic", logic)
+
+    async def scenario() -> None:
+        async with queue(redis_dsn, monkeypatch) as (pool, name, identifiers):
+            main.app.state.redis_pool = pool
+            dao = main.app.dependency_overrides[get_session_run_dao]()
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=main.app), base_url="http://test"
+            ) as client:
+                first = await client.post("/api/v1/sessions/saved-failure/process")
+                assert first.status_code == 202
+                run_id = first.json()["run_id"]
+                await pool.zrem(name, run_id)
+                await pool.delete(job_key_prefix + run_id)
+                _age_reconcile_run(queue_database, run_id)
+                recovery_id = f"{run_id}:reconcile:1"
+                identifiers.extend([recovery_id, f"{run_id}:reconcile:2"])
+                enqueue = pool.enqueue_job
+
+                async def lose_response(*args, **kwargs):
+                    assert await enqueue(*args, **kwargs) is not None
+                    raise RedisConnectionError("synthetic lost response")
+
+                reconciler = reconciler_class(dao=dao, redis=pool, stale_queued_seconds=0)
+                with monkeypatch.context() as fault:
+                    fault.setattr(pool, "enqueue_job", lose_response)
+                    await reconciler.reconcile()
+                with monkeypatch.context() as fault:
+                    fault.setattr(
+                        dao,
+                        "claim_run_for_execution",
+                        AsyncMock(side_effect=RuntimeError("synthetic claim failure")),
+                    )
+                    async with _recovery_worker(pool, name, max_jobs=1) as worker:
+                        await asyncio.wait_for(worker.async_run(), timeout=5)
+                        assert worker.jobs_failed == 1
+                result = await Job(recovery_id, pool, _queue_name=name).result_info()
+                assert result is not None and not result.success
+                assert await pool.zscore(name, recovery_id) is None
+                logic.assert_not_awaited()
+                assert (
+                    await enqueue("process_session_task", _job_id=recovery_id, _queue_name=name)
+                    is None
+                )
+
+                report = await reconciler.reconcile()
+                assert report.enqueued_count == 1
+                stored = await dao.get_run("saved-failure", UUID(run_id))
+                assert (stored.reconcile_attempts, stored.reconcile_pending) == (1, False)
+                report = await reconciler.reconcile()
+                assert report.enqueued_count == 1
+                async with _recovery_worker(pool, name, max_jobs=1) as worker:
+                    await asyncio.wait_for(worker.async_run(), timeout=5)
+                logic.assert_awaited_once_with("saved-failure")
+                await _assert_reconciled_session_released(
+                    client, "saved-failure", run_id, "completed"
+                )
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=15))
+
+
 def test_reconciler_returning_old_runner_cannot_modify_the_recovered_owner(
     redis_dsn: str, queue_database: Database, monkeypatch: pytest.MonkeyPatch
 ) -> None:

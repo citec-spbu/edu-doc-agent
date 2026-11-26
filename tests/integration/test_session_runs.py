@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -83,6 +83,140 @@ async def counts(sessions: async_sessionmaker[AsyncSession]) -> tuple[int, int]:
             await db.scalar(select(func.count()).select_from(Session)),
             await db.scalar(select(func.count()).select_from(Run)),
         )
+
+
+@pytest.mark.parametrize("status", ["queued", "running"])
+def test_maintenance_preserves_status_updated_at_through_http(
+    runs_api: httpx.AsyncClient,
+    run_dao: SessionRunDAO,
+    run_sessions: async_sessionmaker[AsyncSession],
+    status: str,
+) -> None:
+    async def scenario() -> None:
+        run = await seed_run(run_sessions, run_dao, status)
+        async with run_sessions() as db:
+            await db.execute(
+                update(Run)
+                .where(Run.id == run.id)
+                .values(updated_at=func.clock_timestamp() - timedelta(minutes=5))
+            )
+            await db.commit()
+        url = f"/api/v1/sessions/{run.session_id}/runs/{run.id}"
+        async with runs_api as client:
+            before = (await client.get(url)).json()
+            if status == "running":
+                assert await run_dao.touch_heartbeat(run.id, expected_reconcile_attempts=0)
+                stored = await read_run(run_sessions, run.id)
+                assert stored.last_heartbeat_at > run.updated_at
+            else:
+                assert await run_dao.mark_queued_run_checked(run.id, expected_reconcile_attempts=0)
+                assert (await client.get(url)).json() == before
+                assert await run_dao.list_stale_queued_runs(stale_queued_seconds=120) == []
+                assert await run_dao.bump_stale_queued_run(run.id, expected_reconcile_attempts=0)
+                assert await run_dao.confirm_reconcile_enqueue(
+                    run.id, expected_reconcile_attempts=1
+                )
+                stored = await read_run(run_sessions, run.id)
+                assert stored.last_queue_check_at is not None
+            assert (await client.get(url)).json() == before
+
+    asyncio.run(scenario())
+
+
+def test_late_http_compensation_preserves_a_delivered_recovery(
+    runs_api: httpx.AsyncClient,
+    run_dao: SessionRunDAO,
+    redis_pool: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        compensation_started, compensation_release = asyncio.Event(), asyncio.Event()
+        compensate = run_dao.mark_failed_if_queued
+
+        async def delayed_compensation(run_id):
+            compensation_started.set()
+            await compensation_release.wait()
+            return await compensate(run_id)
+
+        monkeypatch.setattr(run_dao, "mark_failed_if_queued", delayed_compensation)
+        redis_pool.enqueue_job.side_effect = RedisConnectionError("synthetic outage")
+        async with runs_api as client:
+            request = asyncio.create_task(client.post("/api/v1/sessions/late-compensation/process"))
+            try:
+                await compensation_started.wait()
+                run_id = UUID(redis_pool.enqueue_job.await_args.kwargs["run_id"])
+                assert await run_dao.bump_stale_queued_run(run_id, expected_reconcile_attempts=0)
+                assert await run_dao.confirm_reconcile_enqueue(
+                    run_id, expected_reconcile_attempts=1
+                )
+            finally:
+                compensation_release.set()
+            assert (await request).status_code == 503
+            stored = await run_dao.get_run("late-compensation", run_id)
+            assert (stored.status, stored.reconcile_attempts, stored.reconcile_pending) == (
+                "queued",
+                1,
+                False,
+            )
+            assert await run_dao.claim_run_for_execution(run_id, expected_reconcile_attempts=1) == 1
+            assert await run_dao.mark_run_completed(run_id, expected_reconcile_attempts=1)
+            assert (await client.get(f"/api/v1/sessions/late-compensation/runs/{run_id}")).json()[
+                "status"
+            ] == "completed"
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=10))
+
+
+def test_lease_timer_cancels_business_while_sqlalchemy_cleanup_is_pending(
+    run_dao: SessionRunDAO,
+    run_sessions: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = importlib.import_module("edu_doc_agent.worker.runner")
+
+    async def scenario() -> None:
+        run = await seed_run(run_sessions, run_dao)
+        cleanup_started, cleanup_release, stopped = (
+            asyncio.Event(),
+            asyncio.Event(),
+            asyncio.Event(),
+        )
+        effects = []
+
+        async def slow_heartbeat(*args, **kwargs):
+            async with run_sessions() as db:
+                try:
+                    await db.execute(text("SELECT pg_sleep(10)"))
+                    return False
+                finally:
+                    cleanup_started.set()
+                    await runner._finish_status_update(cleanup_release.wait())
+
+        monkeypatch.setattr(run_dao, "touch_heartbeat", slow_heartbeat)
+
+        async def logic(session_id):
+            try:
+                await asyncio.sleep(0.18)
+                effects.append("business effect after lease expiry")
+            finally:
+                stopped.set()
+
+        task = asyncio.create_task(
+            runner.SessionRunner(run_dao, heartbeat_interval=0.01, lease_timeout=0.08).execute(
+                run.session_id, run.id, logic
+            )
+        )
+        try:
+            await cleanup_started.wait()
+            await asyncio.sleep(0.20)
+            assert stopped.is_set() and effects == []
+            assert not task.done()
+        finally:
+            cleanup_release.set()
+            result = await task
+        assert result["status"] == "conflict"
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5))
 
 
 @pytest.mark.parametrize("extra_days", [-1, 1])

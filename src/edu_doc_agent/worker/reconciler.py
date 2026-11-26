@@ -5,6 +5,7 @@ import logging
 from dataclasses import dataclass
 
 from arq.connections import ArqRedis
+from arq.constants import result_key_prefix
 from redis.exceptions import RedisError
 
 from edu_doc_agent.dao import ReconciledRun, SessionRunDAO
@@ -187,13 +188,17 @@ class RunReconciler:
             return False
 
         if job is None:
+            delivered = False
             try:
                 async with asyncio.timeout(REDIS_OP_TIMEOUT_SECONDS):
                     in_queue = await self._redis.zscore(self._queue_name, job_id)
+                    delivered = in_queue is not None or bool(
+                        await self._redis.exists(result_key_prefix + job_id)
+                    )
             except (RedisError, TimeoutError):
-                in_queue = None
+                pass
 
-            if in_queue is None:
+            if not delivered:
                 logger.warning(
                     "ARQ не подтвердил повторную постановку run "
                     "(возможен конфликт job_id): session_id=%s, run_id=%s",
