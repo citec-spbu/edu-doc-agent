@@ -82,31 +82,29 @@ def _words(stem: str) -> set[str]:
     return {w for w in stem.split() if w not in _STOP}
 
 
-_NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)?")
-
-
-def _polarity(text: str) -> tuple[list[str], int]:
-    """Консервативная защита от инверсии отрицания и границы сравнения."""
+def _meaning_signature(text: str) -> tuple[tuple[str, ...], bool]:
+    """Сохраняет порядок предикатов, отрицаний, сравнений и их числовых границ."""
     text = normalize(text)
-    comparisons = []
     for pattern, operator in (
-        (r"не\s+(?:менее|меньше)|>=|≥", "ge"),
-        (r"не\s+(?:более|больше)|<=|≤", "le"),
-        (r"(?:менее|меньше)|<", "lt"),
-        (r"(?:более|больше)|>", "gt"),
+        (r"!=|≠", "≠"),
+        (r"==", "="),
+        (r"\bне\s+(?:менее|меньше)\b|>=|≥", "≥"),
+        (r"\bне\s+(?:более|больше)\b|<=|≤", "≤"),
+        (r"\b(?:менее|меньше)\b|<", "<"),
+        (r"\b(?:более|больше)\b|>", ">"),
     ):
-        text, count = re.subn(pattern, " ", text)
-        comparisons.extend([operator] * count)
-    negative = len(re.findall(r"\b(?:не|нет|нельзя|невозможно|запрещено)\b", text))
-    return sorted(comparisons), negative
+        text = re.sub(pattern, f" {operator} ", text)
+    sensitive = bool(re.search(r"[\d≥≤<>=≠]|\b(?:не|нет|нельзя|невозможно|запрещено)\b", text))
+    tokens = re.findall(r"[+-]?\d+(?:[.,]\d+)?|[^\W\d_]+|[≥≤<>=≠%]", text)
+    return tuple(t.replace(",", ".") if re.search(r"\d", t) else t[:5] for t in tokens), sensitive
 
 
 def _same_meaning(a: str, b: str) -> bool:
-    """Условие/следствие свободным текстом: те же числа и от половины общих слов (по основам)."""
-    if _polarity(a) != _polarity(b):
-        return False
-    if set(_NUMBER_RE.findall(normalize(a))) != set(_NUMBER_RE.findall(normalize(b))):
-        return False
+    """Для отрицаний/чисел — консервативное совпадение порядка, иначе сходство слов."""
+    signature_a, sensitive_a = _meaning_signature(a)
+    signature_b, sensitive_b = _meaning_signature(b)
+    if sensitive_a or sensitive_b:
+        return bool(signature_a) and signature_a == signature_b
     wa, wb = _words(_stem(a)), _words(_stem(b))
     return bool(wa and wb) and len(wa & wb) / min(len(wa), len(wb)) >= 0.5
 
