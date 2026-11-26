@@ -62,6 +62,7 @@ class WorkerSettings:
     # Функции, которые разрешено выполнять
     functions = [process_session_task]
     cron_jobs = [
+        # Постановка при старте не является барьером перед обычными задачами.
         cron(reconcile_stale_runs_task, second=0, run_at_startup=True, timeout=30),
     ]
 

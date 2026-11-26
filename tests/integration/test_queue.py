@@ -10,10 +10,11 @@ import sys
 import time
 from collections.abc import Iterator
 from contextlib import asynccontextmanager, suppress
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -31,6 +32,7 @@ from arq.worker import create_worker
 from redis.asyncio import Redis
 from redis.asyncio.client import Pipeline
 from redis.exceptions import ConnectionError as RedisConnectionError
+from sqlalchemy import func, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -38,7 +40,7 @@ from edu_doc_agent import main
 from edu_doc_agent.api import router
 from edu_doc_agent.api.dependencies import get_session_run_dao
 from edu_doc_agent.config import Settings
-from edu_doc_agent.dao import SessionRunDAO
+from edu_doc_agent.dao import Run, SessionRunDAO
 from tests.integration.dao.support import Database
 
 pytestmark = pytest.mark.integration
@@ -222,6 +224,297 @@ def test_http_to_redis_to_worker(redis_dsn: str, monkeypatch: pytest.MonkeyPatch
                     await worker.close()
 
     asyncio.run(scenario())
+
+
+def _age_reconcile_run(database: Database, run_id: str, *, attempts: int = 0) -> None:
+    with database.engine.begin() as connection:
+        stale = func.clock_timestamp() - timedelta(minutes=5)
+        connection.execute(
+            update(Run)
+            .where(Run.id == UUID(run_id))
+            .values(
+                updated_at=stale,
+                last_heartbeat_at=stale,
+                reconcile_attempts=attempts,
+                reconcile_pending=False,
+            )
+        )
+
+
+@asynccontextmanager
+async def _recovery_worker(pool, name: str, *, max_jobs: int):
+    settings = importlib.import_module("edu_doc_agent.worker.settings")
+    worker = create_worker(
+        settings.WorkerSettings,
+        redis_pool=pool,
+        queue_name=name,
+        cron_jobs=[],  # Проход Reconciler в этих сценариях вызывается явно.
+        burst=True,
+        max_burst_jobs=max_jobs,
+        poll_delay=0.01,
+        handle_signals=False,
+    )
+    try:
+        yield worker
+    finally:
+        await worker.close()
+
+
+async def _assert_reconciled_session_released(client, session_id: str, run_id: str, status: str):
+    response = await client.get(f"/api/v1/sessions/{session_id}/runs/{run_id}")
+    assert response.status_code == 200
+    assert response.json()["status"] == status
+    accepted = await client.post(f"/api/v1/sessions/{session_id}/process")
+    assert accepted.status_code == 202
+    assert accepted.json()["run_id"] != run_id
+
+
+def test_reconciler_recovers_stale_running_through_real_arq(
+    redis_dsn: str, queue_database: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reconciler_class = importlib.import_module("edu_doc_agent.worker.reconciler").RunReconciler
+    tasks = importlib.import_module("edu_doc_agent.worker.tasks")
+    logic = AsyncMock()
+    monkeypatch.setattr(tasks, "_stub_session_logic", logic)
+
+    async def scenario() -> None:
+        async with queue(redis_dsn, monkeypatch) as (pool, name, identifiers):
+            main.app.state.redis_pool = pool
+            dao = main.app.dependency_overrides[get_session_run_dao]()
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=main.app), base_url="http://test"
+            ) as client:
+                url = "/api/v1/sessions/stale-running/process"
+                first = await client.post(url)
+                assert first.status_code == 202
+                run_id = first.json()["run_id"]
+                assert await dao.claim_run_for_execution(UUID(run_id)) == 0
+                _age_reconcile_run(queue_database, run_id)
+                recovery_id = f"{run_id}:reconcile:1"
+                identifiers.append(recovery_id)
+                report = await reconciler_class(dao=dao, redis=pool).reconcile()
+                assert (report.requeued_count, report.enqueued_count) == (1, 1)
+                assert (await client.post(url)).status_code == 409
+                async with _recovery_worker(pool, name, max_jobs=2) as worker:
+                    await asyncio.wait_for(worker.async_run(), timeout=5)
+                    assert (await Job(run_id, pool, _queue_name=name).result(timeout=1))[
+                        "status"
+                    ] == "skipped"
+                    assert (await Job(recovery_id, pool, _queue_name=name).result(timeout=1))[
+                        "status"
+                    ] == "completed"
+                    logic.assert_awaited_once_with("stale-running")
+                    await _assert_reconciled_session_released(
+                        client, "stale-running", run_id, "completed"
+                    )
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=15))
+
+
+def test_reconciler_recovers_lost_queued_through_real_arq(
+    redis_dsn: str, queue_database: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reconciler_class = importlib.import_module("edu_doc_agent.worker.reconciler").RunReconciler
+    tasks = importlib.import_module("edu_doc_agent.worker.tasks")
+    logic = AsyncMock()
+    monkeypatch.setattr(tasks, "_stub_session_logic", logic)
+
+    async def scenario() -> None:
+        async with queue(redis_dsn, monkeypatch) as (pool, name, identifiers):
+            main.app.state.redis_pool = pool
+            dao = main.app.dependency_overrides[get_session_run_dao]()
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=main.app), base_url="http://test"
+            ) as client:
+                url = "/api/v1/sessions/lost-queued/process"
+                first = await client.post(url)
+                assert first.status_code == 202
+                run_id = first.json()["run_id"]
+                await pool.zrem(name, run_id)
+                await pool.delete(job_key_prefix + run_id)
+                _age_reconcile_run(queue_database, run_id)
+                recovery_id = f"{run_id}:reconcile:1"
+                identifiers.append(recovery_id)
+                assert (await client.post(url)).status_code == 409
+                report = await reconciler_class(dao=dao, redis=pool).reconcile()
+                assert (report.failed_count, report.enqueued_count) == (0, 1)
+                assert await pool.zrange(name, 0, -1) == [recovery_id.encode()]
+                async with _recovery_worker(pool, name, max_jobs=1) as worker:
+                    await asyncio.wait_for(worker.async_run(), timeout=5)
+                    logic.assert_awaited_once_with("lost-queued")
+                    await _assert_reconciled_session_released(
+                        client, "lost-queued", run_id, "completed"
+                    )
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=15))
+
+
+@pytest.mark.parametrize("status", ["running", "queued"])
+def test_reconciler_exhausted_limit_fails_and_allows_new_http_post(
+    redis_dsn: str, queue_database: Database, monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    reconciler_class = importlib.import_module("edu_doc_agent.worker.reconciler").RunReconciler
+
+    async def scenario() -> None:
+        async with queue(redis_dsn, monkeypatch) as (pool, name, _):
+            main.app.state.redis_pool = pool
+            dao = main.app.dependency_overrides[get_session_run_dao]()
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=main.app), base_url="http://test"
+            ) as client:
+                session_id = f"exhausted-{status}"
+                url = f"/api/v1/sessions/{session_id}/process"
+                first = await client.post(url)
+                assert first.status_code == 202
+                run_id = first.json()["run_id"]
+                if status == "running":
+                    assert await dao.claim_run_for_execution(UUID(run_id)) == 0
+                await pool.zrem(name, run_id)
+                await pool.delete(job_key_prefix + run_id)
+                _age_reconcile_run(queue_database, run_id, attempts=3)
+                assert (await client.post(url)).status_code == 409
+                report = await reconciler_class(dao=dao, redis=pool).reconcile()
+                assert (report.failed_count, report.requeued_count, report.enqueued_count) == (
+                    1,
+                    0,
+                    0,
+                )
+                assert await pool.zcard(name) == 0
+                await _assert_reconciled_session_released(client, session_id, run_id, "failed")
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=15))
+
+
+@pytest.mark.parametrize("committed", [False, True])
+def test_reconciler_unknown_redis_write_outcome_preserves_generation_and_executes_once(
+    redis_dsn: str, queue_database: Database, monkeypatch: pytest.MonkeyPatch, committed: bool
+) -> None:
+    reconciler_class = importlib.import_module("edu_doc_agent.worker.reconciler").RunReconciler
+    tasks = importlib.import_module("edu_doc_agent.worker.tasks")
+    logic = AsyncMock()
+    monkeypatch.setattr(tasks, "_stub_session_logic", logic)
+
+    async def scenario() -> None:
+        async with queue(redis_dsn, monkeypatch) as (pool, name, identifiers):
+            main.app.state.redis_pool = pool
+            dao = main.app.dependency_overrides[get_session_run_dao]()
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=main.app), base_url="http://test"
+            ) as client:
+                first = await client.post("/api/v1/sessions/unknown-write/process")
+                assert first.status_code == 202
+                run_id = first.json()["run_id"]
+                await pool.zrem(name, run_id)
+                await pool.delete(job_key_prefix + run_id)
+                _age_reconcile_run(queue_database, run_id)
+                recovery_id = f"{run_id}:reconcile:1"
+                identifiers.append(recovery_id)
+                enqueue = pool.enqueue_job
+
+                async def lose_response(*args, **kwargs):
+                    if committed:
+                        # Запись в настоящем Redis состоялась; её ответ потерян.
+                        assert await enqueue(*args, **kwargs) is not None
+                    raise RedisConnectionError("synthetic lost enqueue response")
+
+                reconciler = reconciler_class(dao=dao, redis=pool, stale_queued_seconds=0)
+                with monkeypatch.context() as fault:
+                    fault.setattr(pool, "enqueue_job", lose_response)
+                    await reconciler.reconcile()
+                pending = await dao.get_run("unknown-write", UUID(run_id))
+                assert pending is not None and pending.reconcile_pending
+                assert (await pool.zscore(name, recovery_id) is not None) == committed
+
+                await reconciler.reconcile()
+                stored = await dao.get_run("unknown-write", UUID(run_id))
+                assert stored is not None
+                assert (stored.reconcile_attempts, stored.reconcile_pending) == (1, False)
+                assert await pool.zrange(name, 0, -1) == [recovery_id.encode()]
+                async with _recovery_worker(pool, name, max_jobs=1) as worker:
+                    await asyncio.wait_for(worker.async_run(), timeout=5)
+                    logic.assert_awaited_once_with("unknown-write")
+                    await _assert_reconciled_session_released(
+                        client, "unknown-write", run_id, "completed"
+                    )
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=15))
+
+
+def test_reconciler_returning_old_runner_cannot_modify_the_recovered_owner(
+    redis_dsn: str, queue_database: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reconciler_class = importlib.import_module("edu_doc_agent.worker.reconciler").RunReconciler
+    runner_class = importlib.import_module("edu_doc_agent.worker.runner").SessionRunner
+    tasks = importlib.import_module("edu_doc_agent.worker.tasks")
+
+    async def scenario() -> None:
+        async with queue(redis_dsn, monkeypatch) as (pool, name, identifiers):
+            main.app.state.redis_pool = pool
+            dao = main.app.dependency_overrides[get_session_run_dao]()
+            old_started, old_resume = asyncio.Event(), asyncio.Event()
+            new_started, new_finish = asyncio.Event(), asyncio.Event()
+
+            async def old_logic(session_id):
+                old_started.set()
+                await old_resume.wait()
+
+            async def new_logic(session_id):
+                new_started.set()
+                await new_finish.wait()
+
+            monkeypatch.setattr(tasks, "_stub_session_logic", new_logic)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=main.app), base_url="http://test"
+            ) as client:
+                url = "/api/v1/sessions/returning-worker/process"
+                first = await client.post(url)
+                assert first.status_code == 202
+                run_id = first.json()["run_id"]
+                # Старый процесс вернётся из паузы с поколением 0 без свежего heartbeat.
+                old_task = asyncio.create_task(
+                    runner_class(dao, heartbeat_interval=None).execute(
+                        "returning-worker", run_id, old_logic
+                    )
+                )
+                try:
+                    await asyncio.wait_for(old_started.wait(), timeout=5)
+                    _age_reconcile_run(queue_database, run_id)
+                    identifiers.append(f"{run_id}:reconcile:1")
+                    await reconciler_class(dao=dao, redis=pool).reconcile()
+                    async with _recovery_worker(pool, name, max_jobs=2) as worker:
+                        current_worker = asyncio.create_task(worker.async_run())
+                        try:
+                            await asyncio.wait_for(new_started.wait(), timeout=5)
+                            old_resume.set()
+                            assert (await asyncio.wait_for(old_task, timeout=5))[
+                                "status"
+                            ] == "conflict"
+                            assert not await dao.touch_heartbeat(
+                                UUID(run_id), expected_reconcile_attempts=0
+                            )
+                            assert not await dao.mark_run_failed(
+                                UUID(run_id), expected_reconcile_attempts=0
+                            )
+                            assert not await dao.requeue_running_run(
+                                UUID(run_id), expected_reconcile_attempts=0
+                            )
+                            current = await dao.get_run("returning-worker", UUID(run_id))
+                            assert current is not None
+                            assert (current.status, current.reconcile_attempts) == ("running", 1)
+                            assert (await client.post(url)).status_code == 409
+                            new_finish.set()
+                            await asyncio.wait_for(current_worker, timeout=5)
+                            await _assert_reconciled_session_released(
+                                client, "returning-worker", run_id, "completed"
+                            )
+                        finally:
+                            current_worker.cancel()
+                            await asyncio.gather(current_worker, return_exceptions=True)
+                finally:
+                    old_task.cancel()
+                    await asyncio.gather(old_task, return_exceptions=True)
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=20))
 
 
 def test_local_api_and_arq_cli_process_a_session(

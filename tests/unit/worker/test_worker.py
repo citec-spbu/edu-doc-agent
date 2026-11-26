@@ -109,6 +109,10 @@ def test_arq_loads_the_registered_task_and_execution_limits(tasks: ModuleType) -
         assert worker.on_startup is module.startup
         assert worker.on_shutdown is module.shutdown
         assert worker.on_job_start is module.job_start
+        assert len(worker.cron_jobs) == 1
+        recovery_cron = worker.cron_jobs[0]
+        assert recovery_cron.coroutine is tasks.reconcile_stale_runs_task
+        assert recovery_cron.run_at_startup is True
 
     asyncio.run(scenario())
     assert package.WorkerSettings is module.WorkerSettings

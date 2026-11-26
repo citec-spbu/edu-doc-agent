@@ -131,6 +131,32 @@ lease подтверждёнными heartbeat, задержка ответа н
 `reconcile_pending` и её откат проверяются в
 [test_migrations.py](integration/dao/test_migrations.py).
 
+Отдельные unit-сценарии приёмки #47 находятся в
+[test_reconciler.py](unit/worker/test_reconciler.py), а интеграционные с настоящими
+PostgreSQL, Redis и ARQ — в [test_queue.py](integration/test_queue.py):
+
+| Сценарий | Интеграционный тест |
+| --- | --- |
+| Устаревший running и одна бизнес-обработка нового поколения | `test_reconciler_recovers_stale_running_through_real_arq` |
+| Потерянный queued и доставка в именованную очередь | `test_reconciler_recovers_lost_queued_through_real_arq` |
+| Исчерпание лимита для running и queued | `test_reconciler_exhausted_limit_fails_and_allows_new_http_post` |
+| Возвращение старого владельца после захвата новым worker | `test_reconciler_returning_old_runner_cannot_modify_the_recovered_owner` |
+| Потеря ответа Redis до/после фактической записи | `test_reconciler_unknown_redis_write_outcome_preserves_generation_and_executes_once` |
+
+Каждый интеграционный сценарий проверяет освобождение сессии через HTTP:
+после терминального GET следующий POST получает `202` с новым `run_id`.
+Изолированные очереди и схемы очищаются только по собственным идентификаторам,
+включая job ID восстановлений. Целевой запуск (нужны обе тестовые DSN):
+
+```bash
+uv run --no-sync pytest tests/unit/worker/test_reconciler.py \
+  tests/integration/test_queue.py -k reconciler --run-integration
+```
+
+CI запускает эти тесты существующей командой `pytest --run-integration`.
+Регистрация cron с `run_at_startup=True` проверяется в unit-тесте конфигурации
+worker; это постановка при старте, а не барьер перед обработкой обычных задач.
+
 Для сбора покрытия backend указывайте каталоги исходников:
 
 ```bash
