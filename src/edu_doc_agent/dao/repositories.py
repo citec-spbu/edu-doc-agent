@@ -23,6 +23,7 @@ class ReconciledRun:
     run_id: UUID
     session_id: str
     reconcile_attempts: int
+    reconcile_pending: bool = False
 
 
 class ActiveRunConflictError(Exception):
@@ -124,6 +125,9 @@ class SessionRunDAO:
                 )
                 .values(
                     status="running",
+                    # Старт job сам подтверждает доставку, даже если cron отменён
+                    # между enqueue и записью подтверждения в PostgreSQL.
+                    reconcile_pending=False,
                     last_heartbeat_at=func.clock_timestamp(),
                     updated_at=func.clock_timestamp(),
                 )
@@ -258,7 +262,7 @@ class SessionRunDAO:
         max_reconcile_attempts: int,
         limit: int = 100,
     ) -> list[ReconciledRun]:
-        """Атомарно переводит зависшие 'running' в 'queued' с инкрементом reconcile_attempts."""
+        """Резервирует новое поколение для зависших 'running', ожидающее доставки."""
         cutoff = func.clock_timestamp() - timedelta(seconds=stale_running_seconds)
         target_ids = (
             select(Run.id)
@@ -277,9 +281,10 @@ class SessionRunDAO:
                 .values(
                     status="queued",
                     reconcile_attempts=Run.reconcile_attempts + 1,
+                    reconcile_pending=True,
                     updated_at=func.clock_timestamp(),
                 )
-                .returning(Run.id, Run.session_id, Run.reconcile_attempts)
+                .returning(Run.id, Run.session_id, Run.reconcile_attempts, Run.reconcile_pending)
             )
             result = await db.execute(stmt)
             await db.commit()
@@ -288,6 +293,7 @@ class SessionRunDAO:
                     run_id=row.id,
                     session_id=row.session_id,
                     reconcile_attempts=row.reconcile_attempts,
+                    reconcile_pending=row.reconcile_pending,
                 )
                 for row in result.all()
             ]
@@ -298,15 +304,20 @@ class SessionRunDAO:
         stale_queued_seconds: float,
         limit: int = 100,
     ) -> list[ReconciledRun]:
-        """Возвращает кандидатов в статусе 'queued' старше порога для проверки в Redis."""
+        """Возвращает самых давно не проверявшихся 'queued', старше порога.
+
+        После проверки существующей job mark_queued_run_checked сдвигает
+        updated_at: следующие проходы доберутся до кандидатов за пределами LIMIT.
+        """
         cutoff = func.clock_timestamp() - timedelta(seconds=stale_queued_seconds)
         async with self._session_factory() as db:
             stmt = (
-                select(Run.id, Run.session_id, Run.reconcile_attempts)
+                select(Run.id, Run.session_id, Run.reconcile_attempts, Run.reconcile_pending)
                 .where(
                     Run.status == "queued",
                     Run.updated_at < cutoff,
                 )
+                .order_by(Run.updated_at, Run.id)
                 .limit(limit)
             )
             result = await db.execute(stmt)
@@ -315,6 +326,7 @@ class SessionRunDAO:
                     run_id=row.id,
                     session_id=row.session_id,
                     reconcile_attempts=row.reconcile_attempts,
+                    reconcile_pending=row.reconcile_pending,
                 )
                 for row in result.all()
             ]
@@ -333,6 +345,7 @@ class SessionRunDAO:
                     Run.id == run_id,
                     Run.status == "queued",
                     Run.reconcile_attempts == expected_reconcile_attempts,
+                    Run.reconcile_pending.is_(False),
                 )
                 .values(status="failed", updated_at=func.clock_timestamp())
                 .returning(Run.id)
@@ -347,7 +360,7 @@ class SessionRunDAO:
         *,
         expected_reconcile_attempts: int,
     ) -> ReconciledRun | None:
-        """Атомарно увеличивает reconcile_attempts у потерянного 'queued' run."""
+        """Резервирует новое поколение потерянного 'queued', если нет ожидающей доставки."""
         async with self._session_factory() as db:
             stmt = (
                 update(Run)
@@ -355,12 +368,14 @@ class SessionRunDAO:
                     Run.id == run_id,
                     Run.status == "queued",
                     Run.reconcile_attempts == expected_reconcile_attempts,
+                    Run.reconcile_pending.is_(False),
                 )
                 .values(
                     reconcile_attempts=Run.reconcile_attempts + 1,
+                    reconcile_pending=True,
                     updated_at=func.clock_timestamp(),
                 )
-                .returning(Run.id, Run.session_id, Run.reconcile_attempts)
+                .returning(Run.id, Run.session_id, Run.reconcile_attempts, Run.reconcile_pending)
             )
             result = await db.execute(stmt)
             await db.commit()
@@ -371,7 +386,50 @@ class SessionRunDAO:
                 run_id=row.id,
                 session_id=row.session_id,
                 reconcile_attempts=row.reconcile_attempts,
+                reconcile_pending=row.reconcile_pending,
             )
+
+    async def confirm_reconcile_enqueue(
+        self,
+        run_id: UUID,
+        *,
+        expected_reconcile_attempts: int,
+    ) -> bool:
+        """Подтверждает доставку поколения; повторное подтверждение безопасно."""
+        async with self._session_factory() as db:
+            result = await db.execute(
+                update(Run)
+                .where(
+                    Run.id == run_id,
+                    Run.reconcile_attempts == expected_reconcile_attempts,
+                    Run.reconcile_pending.is_(True),
+                )
+                .values(reconcile_pending=False, updated_at=Run.updated_at)
+                .returning(Run.id)
+            )
+            await db.commit()
+            return result.scalar_one_or_none() is not None
+
+    async def mark_queued_run_checked(
+        self,
+        run_id: UUID,
+        *,
+        expected_reconcile_attempts: int,
+    ) -> bool:
+        """Переносит проверенный queued run в конец обхода, не меняя поколение."""
+        async with self._session_factory() as db:
+            result = await db.execute(
+                update(Run)
+                .where(
+                    Run.id == run_id,
+                    Run.status == "queued",
+                    Run.reconcile_attempts == expected_reconcile_attempts,
+                )
+                .values(updated_at=func.clock_timestamp())
+                .returning(Run.id)
+            )
+            await db.commit()
+            return result.scalar_one_or_none() is not None
 
     async def get_run(self, session_id: str, run_id: UUID) -> Run | None:
         """Читает Run строго по паре (session_id, run_id)."""

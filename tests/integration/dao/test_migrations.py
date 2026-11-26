@@ -26,7 +26,12 @@ def rows(database: Database) -> tuple[list, list]:
     with database.engine.connect() as connection:
         return (
             connection.execute(select(Session.__table__).order_by(Session.id)).all(),
-            connection.execute(select(Run.__table__).order_by(Run.id)).all(),
+            # Сравниваем поля, существующие и до новой миграции, и после downgrade.
+            connection.execute(
+                select(*(c for c in Run.__table__.c if c.name != "reconcile_pending")).order_by(
+                    Run.id
+                )
+            ).all(),
         )
 
 
@@ -154,3 +159,30 @@ def test_negative_counter_aborts_upgrade_without_data_or_revision_changes(
     assert rows(database) == before
     assert inspect(database.engine).get_check_constraints("runs") == previous_checks
     assert inspect(database.engine).get_indexes("runs") == previous_indexes
+
+
+def test_pending_delivery_migration_preserves_generation_and_can_be_reapplied(
+    database: Database,
+) -> None:
+    previous = "9b4d2c6e8f10"
+    database.migrate(previous)
+    identifier = uuid4()
+    with database.engine.begin() as connection:
+        connection.execute(insert(Session).values(id="session", status="active"))
+        connection.execute(
+            insert(Run).values(
+                id=identifier, session_id="session", status="queued", reconcile_attempts=2
+            )
+        )
+    before = rows(database)
+    database.migrate()
+    assert rows(database) == before
+    with database.engine.begin() as connection:
+        assert connection.scalar(select(Run.reconcile_pending)) is False
+        connection.execute(update(Run).values(reconcile_pending=True))
+    result = database.alembic("downgrade", previous)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert rows(database) == before
+    database.migrate()
+    with database.engine.connect() as connection:
+        assert connection.scalar(select(Run.reconcile_pending)) is False

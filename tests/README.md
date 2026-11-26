@@ -114,6 +114,16 @@ TEST_DATABASE_URL=postgresql+psycopg://edu:edu@127.0.0.1:5432/edu \
 и логирование сбоя обработки отмены. Unit-тест API закрепляет логирование
 неудачной компенсации с сохранением исходного HTTP-ответа на сбой enqueue.
 
+В [test_run_generation.py](unit/worker/test_run_generation.py) проверяются
+недействительность старых поколений, повторные отмены cron до enqueue и после
+принятия job Redis, доставка в именованную очередь и обход 101 queued-запуска
+партиями по 100. Ожидающая доставка повторяет то же поколение без расхода лимита;
+подтверждённые восстановления сохраняют защиту от poison pill.
+Проверки настоящего SQL для резервирования, подтверждения и обхода находятся в
+[test_session_runs.py](integration/test_session_runs.py); новая миграция признака
+`reconcile_pending` и её откат проверяются в
+[test_migrations.py](integration/dao/test_migrations.py).
+
 Для сбора покрытия backend указывайте каталоги исходников:
 
 ```bash

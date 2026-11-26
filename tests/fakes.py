@@ -1,9 +1,9 @@
 """Тестовые двойники для unit-тестов."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
-from edu_doc_agent.dao import ActiveRunConflictError, Run, Session
+from edu_doc_agent.dao import ActiveRunConflictError, ReconciledRun, Run, Session
 
 ACTIVE_STATUSES = {"queued", "running", "waiting_for_input"}
 
@@ -31,6 +31,7 @@ class InMemorySessionRunDAO:
             session_id=session_id,
             status="queued",
             reconcile_attempts=0,
+            reconcile_pending=False,
             created_at=now,
             updated_at=now,
         )
@@ -72,6 +73,7 @@ class InMemorySessionRunDAO:
             run_id, ("queued",), "running", expected_reconcile_attempts=expected_reconcile_attempts
         ):
             return None
+        self.runs[run_id].reconcile_pending = False
         return self.runs[run_id].reconcile_attempts
 
     async def touch_heartbeat(
@@ -133,3 +135,86 @@ class InMemorySessionRunDAO:
     async def get_run(self, session_id: str, run_id: UUID) -> Run | None:
         run = self.runs.get(run_id)
         return run if run is not None and run.session_id == session_id else None
+
+    @staticmethod
+    def _reconciled(run: Run) -> ReconciledRun:
+        return ReconciledRun(run.id, run.session_id, run.reconcile_attempts, run.reconcile_pending)
+
+    async def fail_exhausted_stale_running_runs(
+        self, *, stale_running_seconds: float, max_reconcile_attempts: int, limit: int = 100
+    ) -> list[UUID]:
+        cutoff = datetime.now(UTC) - timedelta(seconds=stale_running_seconds)
+        candidates = [
+            run
+            for run in self.runs.values()
+            if run.status == "running"
+            and (run.last_heartbeat_at or run.updated_at) < cutoff
+            and run.reconcile_attempts >= max_reconcile_attempts
+        ][:limit]
+        for run in candidates:
+            self._transition(run.id, ("running",), "failed")
+        return [run.id for run in candidates]
+
+    async def requeue_stale_running_runs(
+        self, *, stale_running_seconds: float, max_reconcile_attempts: int, limit: int = 100
+    ) -> list[ReconciledRun]:
+        cutoff = datetime.now(UTC) - timedelta(seconds=stale_running_seconds)
+        candidates = [
+            run
+            for run in self.runs.values()
+            if run.status == "running"
+            and (run.last_heartbeat_at or run.updated_at) < cutoff
+            and run.reconcile_attempts < max_reconcile_attempts
+        ][:limit]
+        for run in candidates:
+            self._transition(run.id, ("running",), "queued")
+            run.reconcile_attempts += 1
+            run.reconcile_pending = True
+        return [self._reconciled(run) for run in candidates]
+
+    async def list_stale_queued_runs(
+        self, *, stale_queued_seconds: float, limit: int = 100
+    ) -> list[ReconciledRun]:
+        cutoff = datetime.now(UTC) - timedelta(seconds=stale_queued_seconds)
+        candidates = sorted(
+            (r for r in self.runs.values() if r.status == "queued" and r.updated_at < cutoff),
+            key=lambda r: (r.updated_at, r.id),
+        )[:limit]
+        return [self._reconciled(run) for run in candidates]
+
+    async def bump_stale_queued_run(
+        self, run_id: UUID, *, expected_reconcile_attempts: int
+    ) -> ReconciledRun | None:
+        run = self.runs[run_id]
+        if run.reconcile_pending or not self._transition(
+            run_id, ("queued",), "queued", expected_reconcile_attempts=expected_reconcile_attempts
+        ):
+            return None
+        run.reconcile_attempts += 1
+        run.reconcile_pending = True
+        return self._reconciled(run)
+
+    async def fail_stale_queued_run(
+        self, run_id: UUID, *, expected_reconcile_attempts: int
+    ) -> bool:
+        if self.runs[run_id].reconcile_pending:
+            return False
+        return self._transition(
+            run_id, ("queued",), "failed", expected_reconcile_attempts=expected_reconcile_attempts
+        )
+
+    async def confirm_reconcile_enqueue(
+        self, run_id: UUID, *, expected_reconcile_attempts: int
+    ) -> bool:
+        run = self.runs[run_id]
+        if run.reconcile_attempts != expected_reconcile_attempts or not run.reconcile_pending:
+            return False
+        run.reconcile_pending = False
+        return True
+
+    async def mark_queued_run_checked(
+        self, run_id: UUID, *, expected_reconcile_attempts: int
+    ) -> bool:
+        return self._transition(
+            run_id, ("queued",), "queued", expected_reconcile_attempts=expected_reconcile_attempts
+        )

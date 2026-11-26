@@ -54,6 +54,7 @@ async def reconcile_stale_runs_task(ctx: dict[str, Any]) -> dict[str, int]:
         stale_running_seconds=ctx.get("stale_running_seconds", 120.0),
         stale_queued_seconds=ctx.get("stale_queued_seconds", 120.0),
         max_reconcile_attempts=ctx.get("max_reconcile_attempts", 3),
+        queue_name=ctx.get("queue_name"),
     )
     report = await reconciler.reconcile()
     return {

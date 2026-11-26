@@ -5,7 +5,6 @@ import logging
 from dataclasses import dataclass
 
 from arq.connections import ArqRedis
-from arq.constants import default_queue_name
 from redis.exceptions import RedisError
 
 from edu_doc_agent.dao import ReconciledRun, SessionRunDAO
@@ -44,7 +43,7 @@ class RunReconciler:
         stale_running_seconds: float = 120.0,
         stale_queued_seconds: float = 120.0,
         max_reconcile_attempts: int = 3,
-        queue_name: str = default_queue_name,
+        queue_name: str | None = None,
         batch_limit: int = DEFAULT_BATCH_LIMIT,
     ) -> None:
         self._dao = dao
@@ -52,7 +51,7 @@ class RunReconciler:
         self._stale_running_seconds = stale_running_seconds
         self._stale_queued_seconds = stale_queued_seconds
         self._max_reconcile_attempts = max_reconcile_attempts
-        self._queue_name = queue_name
+        self._queue_name = redis.default_queue_name if queue_name is None else queue_name
         self._batch_limit = batch_limit
 
     async def reconcile(self) -> ReconcileReport:
@@ -76,11 +75,12 @@ class RunReconciler:
                 run_id,
             )
 
-        requeued_runs = await self._dao.requeue_stale_running_runs(
+        reserved_runs = await self._dao.requeue_stale_running_runs(
             stale_running_seconds=self._stale_running_seconds,
             max_reconcile_attempts=self._max_reconcile_attempts,
             limit=self._batch_limit,
         )
+        requeued_runs = {run.run_id: run for run in reserved_runs}
 
         # Проверяем зависшие 'queued': если джоба ещё в очереди Redis — не трогаем.
         queued_candidates = await self._dao.list_stale_queued_runs(
@@ -97,9 +97,23 @@ class RunReconciler:
                 break
 
             if in_queue is not None:
+                if candidate.reconcile_pending:
+                    await self._dao.confirm_reconcile_enqueue(
+                        candidate.run_id,
+                        expected_reconcile_attempts=candidate.reconcile_attempts,
+                    )
+                await self._dao.mark_queued_run_checked(
+                    candidate.run_id,
+                    expected_reconcile_attempts=candidate.reconcile_attempts,
+                )
+                requeued_runs.pop(candidate.run_id, None)
                 continue
 
-            if candidate.reconcile_attempts >= self._max_reconcile_attempts:
+            if candidate.reconcile_pending:
+                # Cron мог завершиться после commit резервирования, но до enqueue.
+                # Повторяем доставку того же поколения, не списывая новую попытку.
+                requeued_runs[candidate.run_id] = candidate
+            elif candidate.reconcile_attempts >= self._max_reconcile_attempts:
                 if await self._dao.fail_stale_queued_run(
                     candidate.run_id,
                     expected_reconcile_attempts=candidate.reconcile_attempts,
@@ -116,12 +130,12 @@ class RunReconciler:
                     expected_reconcile_attempts=candidate.reconcile_attempts,
                 )
                 if bumped is not None:
-                    requeued_runs.append(bumped)
+                    requeued_runs[bumped.run_id] = bumped
 
         enqueued_count = 0
         # Поколение — fencing token: после commit его нельзя уменьшать даже
         # при сбое Redis. Потерянные queued runs подберёт следующий проход.
-        for run in requeued_runs:
+        for run in requeued_runs.values():
             run_id_str = str(run.run_id)
             job_id = f"{run_id_str}:reconcile:{run.reconcile_attempts}"
             try:
@@ -156,6 +170,10 @@ class RunReconciler:
                     in_queue = None
 
                 if in_queue is not None:
+                    await self._dao.confirm_reconcile_enqueue(
+                        run.run_id,
+                        expected_reconcile_attempts=run.reconcile_attempts,
+                    )
                     enqueued_count += 1
                     logger.info(
                         "Run уже присутствует в очереди ARQ: session_id=%s, run_id=%s",
@@ -171,6 +189,10 @@ class RunReconciler:
                     )
                 continue
 
+            await self._dao.confirm_reconcile_enqueue(
+                run.run_id,
+                expected_reconcile_attempts=run.reconcile_attempts,
+            )
             enqueued_count += 1
             logger.info(
                 "Run восстановлен и поставлен в очередь: session_id=%s, run_id=%s (попытка %d/%d)",
