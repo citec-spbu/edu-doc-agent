@@ -198,10 +198,12 @@ class SessionRunner:
                 return await logic_callable(session_id)
 
             logic_task: asyncio.Task[Any] = asyncio.create_task(invoke_logic())
+            completed = False
+            business_succeeded = False
 
             def _handle_lease_lost() -> None:
                 nonlocal lease_lost
-                if lease_lost:
+                if lease_lost or completed:
                     return
                 lease_lost = True
                 if not logic_task.done():
@@ -210,9 +212,10 @@ class SessionRunner:
             lease_timer: asyncio.TimerHandle | None = None
 
             def _renew_lease_timer(deadline: float) -> None:
-                nonlocal lease_timer
-                if lease_lost:
+                nonlocal lease_timer, lease_deadline
+                if lease_lost or completed:
                     return
+                lease_deadline = deadline
                 if lease_timer is not None:
                     lease_timer.cancel()
                 # Этот callback не ждёт отмены heartbeat или очистки сессии БД.
@@ -237,6 +240,29 @@ class SessionRunner:
                     # По умолчанию длительность job ограничивает только ARQ.
                     async with asyncio.timeout(execution_timeout):
                         await logic_task
+                    business_succeeded = True
+                    # Подавленная отмена не даёт права завершить run.
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling():
+                        raise asyncio.CancelledError
+                    if heartbeat_enabled and loop.time() >= lease_deadline:
+                        _handle_lease_lost()
+                    if lease_lost:
+                        return {
+                            "status": "conflict",
+                            "session_id": session_id,
+                            "run_id": str(run_uuid),
+                        }
+                    # Сначала фиксируем успех с проверкой поколения. Медленная
+                    # очистка heartbeat не должна оставить успешный run в running.
+                    completed = await _finish_status_update(
+                        self._dao.mark_run_completed(
+                            run_uuid,
+                            expected_reconcile_attempts=lease_token,
+                        )
+                    )
+                    if completed and lease_timer is not None:
+                        lease_timer.cancel()
                 except asyncio.CancelledError:
                     current = asyncio.current_task()
                     if lease_lost and (current is None or not current.cancelling()):
@@ -272,7 +298,7 @@ class SessionRunner:
                             if lease_timer is not None:
                                 lease_timer.cancel()
             except Exception:
-                if lease_lost:
+                if lease_lost or business_succeeded:
                     raise
                 try:
                     await _finish_status_update(
@@ -295,23 +321,10 @@ class SessionRunner:
                 )
                 raise
 
-            # Бизнес-функция могла подавить отмену, а heartbeat уже завершиться.
+            # Очистка heartbeat могла запросить внешнюю отмену Runner.
             current = asyncio.current_task()
             if current is not None and current.cancelling():
                 raise asyncio.CancelledError
-            if lease_lost:
-                return {
-                    "status": "conflict",
-                    "session_id": session_id,
-                    "run_id": str(run_uuid),
-                }
-
-            completed = await _finish_status_update(
-                self._dao.mark_run_completed(
-                    run_uuid,
-                    expected_reconcile_attempts=lease_token,
-                )
-            )
             if not completed:
                 logger.warning(
                     "mark_run_completed returned False "

@@ -9,6 +9,64 @@ import pytest
 from tests.fakes import InMemorySessionRunDAO
 
 
+@pytest.mark.parametrize("cancel_runner", [False, True])
+def test_completed_business_is_saved_before_slow_heartbeat_cleanup(
+    monkeypatch: pytest.MonkeyPatch, cancel_runner: bool
+) -> None:
+    module = importlib.import_module("edu_doc_agent.worker.runner")
+
+    async def scenario() -> None:
+        dao = InMemorySessionRunDAO()
+        run = await dao.create_queued_run("synthetic-session")
+        pulse_started, cleaning, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        effects = []
+
+        async def heartbeat(*args, **kwargs):
+            pulse_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaning.set()
+                await module._finish_status_update(release.wait())
+
+        async def logic(session_id: str) -> None:
+            await pulse_started.wait()
+            effects.append(session_id)
+
+        monkeypatch.setattr(dao, "touch_heartbeat", heartbeat)
+        runner = module.SessionRunner(dao, heartbeat_interval=0.01, lease_timeout=0.12)
+        task = asyncio.create_task(runner.execute(run.session_id, run.id, logic))
+        cancelled = False
+        try:
+            await cleaning.wait()
+            assert run.status == "completed"
+            await asyncio.sleep(0.15)  # Исходный lease истёк, очистка ещё ждёт.
+            assert not task.done()
+            assert (
+                await dao.requeue_stale_running_runs(
+                    stale_running_seconds=0, max_reconcile_attempts=3
+                )
+                == []
+            )
+            if cancel_runner:
+                task.cancel()
+                cancelled = True
+        finally:
+            release.set()
+            if cancelled:
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                result = await task
+        if not cancelled:
+            assert result["status"] == "completed"
+        assert run.status == "completed"
+        assert (await runner.execute(run.session_id, run.id, logic))["status"] == "skipped"
+        assert effects == [run.session_id]
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=2))
+
+
 def test_lease_timer_stops_logic_before_heartbeat_cleanup_finishes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -265,12 +323,13 @@ def test_runner_cancellation_when_heartbeat_finishes_is_not_swallowed(
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
                 # Отмена Runner и завершение heartbeat происходят в одном обороте loop.
+                assert run.status == "completed"
                 task.cancel()
                 if not heartbeat_returns:
                     raise
 
         monkeypatch.setattr(runner, "_heartbeat_loop", heartbeat)
-        completed = AsyncMock()
+        completed = AsyncMock(wraps=dao.mark_run_completed)
         monkeypatch.setattr(dao, "mark_run_completed", completed)
 
         async def logic(session_id: str) -> None:
@@ -279,8 +338,8 @@ def test_runner_cancellation_when_heartbeat_finishes_is_not_swallowed(
         task = asyncio.create_task(runner.execute(run.session_id, run.id, logic, job_try=job_try))
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert run.status == ("queued" if job_try == 1 else "failed")
-        completed.assert_not_awaited()
+        assert run.status == "completed"
+        completed.assert_awaited_once_with(run.id, expected_reconcile_attempts=0)
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=2))
 

@@ -167,6 +167,57 @@ def test_late_http_compensation_preserves_a_delivered_recovery(
     asyncio.run(asyncio.wait_for(scenario(), timeout=10))
 
 
+def test_completed_run_is_visible_before_heartbeat_cleanup_and_cannot_be_recovered(
+    runs_api: httpx.AsyncClient,
+    run_dao: SessionRunDAO,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = importlib.import_module("edu_doc_agent.worker.runner")
+
+    async def scenario() -> None:
+        run = await run_dao.create_queued_run("completed-before-cleanup")
+        started, cleaning, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        effects = []
+        runner = module.SessionRunner(run_dao, heartbeat_interval=0.01, lease_timeout=0.6)
+
+        async def heartbeat(*args, **kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaning.set()
+                await module._finish_status_update(release.wait())
+
+        async def logic(session_id):
+            await started.wait()
+            effects.append(session_id)
+
+        monkeypatch.setattr(runner, "_heartbeat_loop", heartbeat)
+        task = asyncio.create_task(runner.execute(run.session_id, run.id, logic))
+        try:
+            await cleaning.wait()
+            async with runs_api as client:
+                url = f"/api/v1/sessions/{run.session_id}/runs/{run.id}"
+                response = await client.get(url)
+                assert response.status_code == 200 and response.json()["status"] == "completed"
+                await asyncio.sleep(0.65)
+                assert not task.done()
+                assert (
+                    await run_dao.requeue_stale_running_runs(
+                        stale_running_seconds=0, max_reconcile_attempts=3
+                    )
+                    == []
+                )
+        finally:
+            release.set()
+            result = await task
+        assert result["status"] == "completed"
+        assert (await runner.execute(run.session_id, run.id, logic))["status"] == "skipped"
+        assert effects == [run.session_id]
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5))
+
+
 def test_lease_timer_cancels_business_while_sqlalchemy_cleanup_is_pending(
     run_dao: SessionRunDAO,
     run_sessions: async_sessionmaker[AsyncSession],
