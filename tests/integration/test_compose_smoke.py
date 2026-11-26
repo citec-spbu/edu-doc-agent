@@ -96,6 +96,44 @@ def compose_project(tmp_path: Path) -> Iterator[tuple]:
         compose("down", "--volumes", "--remove-orphans", timeout=60)
 
 
+def test_api_and_worker_share_file_storage(compose_project: tuple) -> None:
+    _, _, compose = compose_project
+    write = dedent("""\
+        import asyncio
+        from edu_doc_agent.api.dependencies import get_file_storage
+
+        async def check():
+            storage = get_file_storage()
+            print(await storage.save(
+                session_id="synthetic-storage",
+                doc_id="report",
+                filename="report.docx",
+                content=b"synthetic report",
+            ))
+
+        asyncio.run(check())
+    """)
+    read = dedent("""\
+        import asyncio
+        import sys
+        from edu_doc_agent.worker.settings import WorkerSettings
+
+        async def check():
+            context = {}
+            await WorkerSettings.on_startup(context)
+            storage = context["storage"]
+            key = sys.argv[1]
+            assert await storage.read(key) == b"synthetic report"
+            assert await storage.delete(key)
+            assert not await storage.exists(key)
+
+        asyncio.run(check())
+    """)
+    run = ("run", "--rm", "--no-deps", "--pull", "never", "--no-TTY")
+    storage_key = compose(*run, "api", "python", "-c", write).strip()
+    compose(*run, "worker", "python", "-c", read, storage_key)
+
+
 def test_compose_stack_processes_a_session(compose_project: tuple, tmp_path: Path) -> None:
     """Использует готовый образ; не собирает и не скачивает зависимости."""
     _, _, compose = compose_project

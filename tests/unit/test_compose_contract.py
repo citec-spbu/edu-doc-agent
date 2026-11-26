@@ -21,6 +21,7 @@ def test_api_and_worker_share_redis_and_storage(services: dict) -> None:
     assert api["environment"]["REDIS_URL"].startswith("redis://redis:6379/")
     for service in (api, worker):
         assert service["depends_on"]["redis"]["condition"] == "service_healthy"
+        assert service["environment"]["STORAGE_DIR"] == "/app/storage"
         assert "./storage:/app/storage" in service["volumes"]
     assert redis["healthcheck"]["test"] == ["CMD", "redis-cli", "ping"]
     assert worker["command"] == ["arq", "edu_doc_agent.worker.settings.WorkerSettings"]

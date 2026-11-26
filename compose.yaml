@@ -34,6 +34,7 @@ services:
       POSTGRES_PORT: "5432"
       # Сбрасывает хостовый DSN из .env, подключение собирается из POSTGRES_*.
       DATABASE_URL: ""
+      STORAGE_DIR: /app/storage
       REDIS_URL: redis://redis:6379/0
     ports:
       - "8000:8000"
