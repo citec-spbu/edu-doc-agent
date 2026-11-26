@@ -15,6 +15,7 @@ from edu_doc_agent.extraction.md_utils import MdTable, clean_text, parse_tables
 from edu_doc_agent.extraction.models import _Model
 from edu_doc_agent.extraction.patterns import COMPETENCE_RE, code_key
 from edu_doc_agent.extraction.source import SourceRef, attach_quotes
+from edu_doc_agent.parsing import ParsedDocument, parse_document
 
 HOURS_PER_CREDIT = 36
 _EPS = 1e-9
@@ -139,7 +140,13 @@ def _split_name(cell: str) -> tuple[str | None, str, str | None]:
 
 
 def _ref(table: MdTable, idx: int, file: str) -> SourceRef:
-    return SourceRef(file=file, section=table.section, line=table.row_lines[idx])
+    return SourceRef(
+        file=file,
+        section=table.section,
+        line=table.row_lines[idx],
+        end_line=table.row_end_lines[idx] if table.row_end_lines else None,
+        quote=table.row_quotes[idx] if table.row_quotes else None,
+    )
 
 
 def _is_context_row(row: list[str]) -> bool:
@@ -151,14 +158,21 @@ def _is_context_row(row: list[str]) -> bool:
 
 
 def _is_competence_table(table: MdTable) -> bool:
-    head = [c.lower() for c in table.rows[0]] if table.rows else []
-    return len(head) >= 2 and "код компетенции" in head[0] and "наименование" in head[1]
+    head = [_one_line(c).lower() for c in table.rows[0]] if table.rows else []
+    return (
+        any(c.startswith("код компетенции") for c in head)
+        and any(c.startswith("наименование") for c in head)
+        and not any(c.startswith("код блока") for c in head)
+    )
 
 
 def _extract_competences(table: MdTable, file: str, plan: CurriculumPlan) -> None:
+    head = [_one_line(c).lower() for c in table.rows[0]]
+    code_col = next(i for i, c in enumerate(head) if c.startswith("код компетенции"))
+    name_col = next(i for i, c in enumerate(head) if c.startswith("наименование"))
     for idx, row in enumerate(table.rows[1:], start=1):
-        codes = _codes(_cell(row, 0))
-        name = _one_line(_cell(row, 1))
+        codes = _codes(_cell(row, code_col))
+        name = _one_line(_cell(row, name_col))
         if codes and name:
             plan.competences.append(
                 PlanCompetence(code=codes[0], name=name, source=_ref(table, idx, file))
@@ -168,22 +182,40 @@ def _extract_competences(table: MdTable, file: str, plan: CurriculumPlan) -> Non
 # --- таблица раздела 2 ----------------------------------------------------------------------
 
 
-def _find_plan_header(table: MdTable) -> tuple[int, dict[int, tuple[str, str]]] | None:
-    """Индекс строки с видами занятий и карта столбец → (группа, название)."""
+def _plan_headers(table: MdTable) -> dict[int, dict[int, tuple[str, str]]]:
+    """Все шапки с видами занятий, включая повторные с новой раскладкой столбцов."""
+    headers = {}
+    previous_groups: dict[int, str] = {}
     for i, row in enumerate(table.rows):
-        low = [clean_text(c).lower() for c in row]
+        low = [_one_line(clean_text(c)).lower() for c in row]
         if "лекции" in low and any("код блока" in c for c in low):
             groups: dict[int, str] = {}
             current = ""
-            above = [clean_text(c).lower() for c in table.rows[i - 1]] if i > 0 else []
+            above = [_one_line(clean_text(c)).lower() for c in table.rows[i - 1]] if i > 0 else []
+            has_groups = any(_group_kind(c) for c in above)
+            if not has_groups:
+                above = []
             for col in range(len(row)):
                 if col < len(above) and above[col]:
                     current = above[col]
-                groups[col] = current
-            return i, {
-                col: (groups[col], _one_line(low[col])) for col in range(len(row)) if low[col]
-            }
-    return None
+                groups[col] = current if has_groups else previous_groups.get(col, "")
+            columns = {}
+            for col in range(len(row)):
+                upper = above[col] if col < len(above) else ""
+                name = low[col] or upper
+                if has_groups and upper.startswith(
+                    ("трудоёмкость", "трудоемкость", "наименование")
+                ):
+                    name = upper
+                if name:
+                    columns[col] = (groups[col], _one_line(name))
+            headers[i] = columns
+            previous_groups = groups
+    return headers
+
+
+def _find_plan_header(table: MdTable) -> tuple[int, dict[int, tuple[str, str]]] | None:
+    return next(iter(_plan_headers(table).items()), None)
 
 
 def _group_kind(group: str) -> str | None:
@@ -194,11 +226,9 @@ def _group_kind(group: str) -> str | None:
     return None
 
 
-def _extract_entries(table: MdTable, file: str, plan: CurriculumPlan) -> bool:
-    found = _find_plan_header(table)
-    if found is None:
-        return False
-    header_idx, columns = found
+def _entry_columns(
+    columns: dict[int, tuple[str, str]],
+) -> tuple[dict[str, int], dict[int, str], dict[int, str]]:
     cols: dict[str, int] = {}
     contact: dict[int, str] = {}
     self_study: dict[int, str] = {}
@@ -219,25 +249,35 @@ def _extract_entries(table: MdTable, file: str, plan: CurriculumPlan) -> bool:
             contact[col] = name
         elif _group_kind(group) == "self":
             self_study[col] = name
-    if "name" not in cols:
+    return cols, contact, self_study
+
+
+def _extract_entries(table: MdTable, file: str, plan: CurriculumPlan) -> bool:
+    headers = _plan_headers(table)
+    if not headers:
         return False
+    cols, contact, self_study = {}, {}, {}
+    width = 0
 
     semester = year = None
     part = group = profile = trajectory = None
     for idx, row in enumerate(table.rows):
-        if idx <= header_idx:
+        if idx in headers:
+            columns = headers[idx]
+            cols, contact, self_study = _entry_columns(columns)
+            width = max(columns, default=-1) + 1
+            if "name" not in cols:
+                return False
+            continue
+        if not cols:
             continue
         first = _one_line(_cell(row, 0))
         if first.lower().startswith("код блока"):  # шапка повторяется на каждой странице
             continue
-        if _is_context_row(row):
+        if _is_context_row(row[:width]):
             low = first.lower()
             if m := _YEAR_RE.match(first):
                 year = int(m.group(1))
-            elif m := _SEMESTER_RE.search(first):
-                semester, part, group, profile, trajectory = int(m.group(1)), None, None, None, None
-            elif "часть" in low or low.startswith("факультатив"):
-                part, group, profile, trajectory = first, None, None, None
             elif low.startswith("блок(и) дисциплин"):
                 group, profile, trajectory = None, None, None
             elif low.startswith("блок дисциплин"):
@@ -246,6 +286,14 @@ def _extract_entries(table: MdTable, file: str, plan: CurriculumPlan) -> bool:
                 profile, trajectory = first, None
             elif low.startswith("траектория"):
                 trajectory = first
+            elif low.startswith(
+                ("базовая часть", "вариативная часть", "обязательная часть", "часть", "факультатив")
+            ):
+                part, group, profile, trajectory = first, None, None, None
+            elif m := _SEMESTER_RE.search(first):
+                # Название группы/профиля может само содержать «Семестр N».
+                # Сначала определяем именованный контекст, затем смену семестра.
+                semester, part, group, profile, trajectory = int(m.group(1)), None, None, None, None
             continue
         code, name, name_en = _split_name(_cell(row, cols["name"]))
         block = _one_line(_cell(row, cols.get("block"))) or None
@@ -385,8 +433,15 @@ def check_plan(plan: CurriculumPlan) -> None:
 # --- точка входа ----------------------------------------------------------------------------
 
 
-def extract_plan(text: str, file: str = "") -> CurriculumPlan:
-    """Учебный план из Markdown (`parse_document(...).to_markdown()`)."""
+def extract_plan(text: str | ParsedDocument, file: str = "") -> CurriculumPlan:
+    """Учебный план из Markdown или ParsedDocument; XLSX сохраняет геометрию и координаты."""
+    if isinstance(text, ParsedDocument):
+        if Path(text.source).suffix.lower() == ".xlsx":
+            from edu_doc_agent.extraction.curriculum_xlsx import extract_xlsx_plan
+
+            return extract_xlsx_plan(text, file or Path(text.source).name)
+        file = file or Path(text.source).name
+        text = text.to_markdown()
     plan = CurriculumPlan(file=file)
     tables = parse_tables(text)
     _extract_title(text, tables, plan)
@@ -409,4 +464,7 @@ def extract_plan(text: str, file: str = "") -> CurriculumPlan:
 
 
 def extract_plan_file(path: Path) -> CurriculumPlan:
+    path = Path(path)
+    if path.suffix.lower() in {".xlsx", ".docx"}:
+        return extract_plan(parse_document(path), file=path.name)
     return extract_plan(path.read_text(encoding="utf-8"), file=path.name)

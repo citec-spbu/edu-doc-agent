@@ -277,6 +277,21 @@ def _extract_outcome_table(table: MdTable, file: str, result: RPDExtraction) -> 
     if header is None:
         return
     header_idx, comp_col, out_col, ind_col = header
+    merged_codes: dict[tuple[int, int], list[str]] = {}
+    for span in table.spans or []:
+        if span.row_span <= 1 or not span.col <= out_col < span.col + span.col_span:
+            continue
+        # При объединении только результатов компетенции могут находиться в разных строках.
+        # Их область принадлежности задаёт весь диапазон ячейки, включая строки ниже якоря.
+        merged_codes[span.row, span.col] = list(
+            dict.fromkeys(
+                code
+                for row in table.rows[span.row : span.row + span.row_span]
+                for code, _ in _parse_competence_cells(
+                    row[comp_col] if comp_col is not None and comp_col < len(row) else ""
+                )
+            )
+        )
 
     for idx, row in enumerate(table.rows):
         if idx <= header_idx:
@@ -347,13 +362,14 @@ def _extract_outcome_table(table: MdTable, file: str, result: RPDExtraction) -> 
         elif out_key:
             group = []
         for kind, code, text in _parse_outcomes(out_cell):
-            owner = _owner(_indicator_of(code), cell_codes, current_code)
+            outcome_codes = merged_codes.get(anchor) or cell_codes
+            owner = _owner(_indicator_of(code), outcome_codes, current_code)
             outcome = LearningOutcome(
                 kind=kind,
                 code=code,
                 indicator_code=_indicator_of(code),
                 competence_codes=(
-                    cell_codes if code is None and cell_codes else [owner] if owner else []
+                    outcome_codes if code is None and outcome_codes else [owner] if owner else []
                 ),
                 text=text,
                 source=ref,
@@ -398,7 +414,7 @@ def _parse_competence_cells(cell: str) -> list[tuple[str, str | None]]:
 
 def _owner(code: str | None, cell_codes: list[str], current: str | None) -> str | None:
     """Компетенция ячейки, которой принадлежит индикатор/результат с кодом `code`."""
-    if code and len(cell_codes) > 1:
+    if code:
         base = code_key(code).rsplit(".", 1)[0]
         for candidate in cell_codes:
             if code_key(candidate) == base:

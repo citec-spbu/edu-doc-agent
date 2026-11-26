@@ -1,7 +1,8 @@
 """P/R/F1 смысловых полей характеристики; эталон фиксируется до вызова модели.
 
-Сопоставление один-к-одному: названия — по основам слов (первые пять букв) и вхождению,
-принципы — по цитате. Дубли ответа считаются FP. Атрибут kind оценивается отдельно.
+Сопоставление один-к-одному: должности — по полному набору основ слов в исходном порядке,
+остальные названия — по основам слов (первые пять букв) и вхождению, принципы — по цитате.
+Дубли ответа считаются FP. Атрибут kind оценивается отдельно.
 Это мягкая метрика сходства, а не автоматическая проверка смысловой эквивалентности.
 
 Офлайн: python -m edu_doc_agent.eval.characteristic_llm_gold --gold GOLD --prediction JSON
@@ -68,6 +69,7 @@ def _pairs(
     expected_kinds: list[str | None] | None = None,
     *,
     require_head: bool = True,
+    require_complete: bool = False,
 ) -> list[tuple[int, int]]:
     """Максимальное паросочетание с минимальной ценой (остаточная сеть).
 
@@ -88,6 +90,8 @@ def _pairs(
     for p, got in enumerate(predicted):
         edge(source, p, 0)
         for g, want in enumerate(expected):
+            if require_complete and _key(got) != _key(want):
+                continue
             if not _similar(got, want):
                 continue
             if require_head and _key(want).split()[0] not in _key(got).split():
@@ -157,6 +161,7 @@ def score_characteristic_llm(doc: CharacteristicLLM, gold: dict) -> Characterist
             [p.kind for p in predicted],
             [g.get("kind") for g in expected],
             require_head=name != "principles",
+            require_complete=name == "positions",
         )
         score = Score(tp=len(pairs), fp=len(predicted) - len(pairs), fn=len(expected) - len(pairs))
         for p, g in pairs:

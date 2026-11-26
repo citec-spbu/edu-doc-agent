@@ -15,21 +15,61 @@ class XlsxParser(BaseParser):
         # data_only: значения формул из кэша Excel; если файл сохранён без кэша — ячейка пустая
         wb = load_workbook(path, data_only=True)
         blocks = []
+        warnings = []
         try:
+            formulas = load_workbook(path, data_only=False)
+            try:
+                for ws in formulas.worksheets:
+                    if ws.sheet_state != "visible":
+                        continue
+                    hidden = _hidden_columns(ws)
+                    for cell in ws._cells.values():
+                        if cell.data_type != "f" or _row_hidden(ws, cell.row):
+                            continue
+                        if cell.column in hidden:
+                            continue
+                        cached = wb[ws.title][cell.coordinate]
+                        if cached.value is None:
+                            warnings.append(
+                                f"{ws.title}!{cell.coordinate}: формула без кэшированного значения"
+                            )
+                        elif cached.data_type == "e":
+                            warnings.append(
+                                f"{ws.title}!{cell.coordinate}: ошибка формулы {cached.value}"
+                            )
+                            cached.value = None
+            finally:
+                formulas.close()
             for ws in wb.worksheets:
                 if ws.sheet_state != "visible":
                     continue
-                table = table_block(_grid(ws))
+                hidden = _hidden_columns(ws)
+                for cell in ws._cells.values():
+                    if cell.data_type != "e":
+                        continue
+                    if not _row_hidden(ws, cell.row) and cell.column not in hidden:
+                        warnings.append(f"{ws.title}!{cell.coordinate}: ошибка Excel {cell.value}")
+                    cell.value = None
+                grid, rows, cols = _sheet_grid(ws)
+                table = table_block(grid)
                 if table is None:
                     continue
+                table.source_rows = [
+                    r for r, line in zip(rows, grid, strict=True) if table_block([line]) is not None
+                ]
+                table.source_columns = cols
                 blocks.append(Block(BlockKind.HEADING, clean_text(ws.title), level=1))
                 blocks.append(table)
         finally:
             wb.close()
-        return ParsedDocument(source=str(path), blocks=blocks)
+        return ParsedDocument(source=str(path), blocks=blocks, warnings=warnings)
 
 
 def _grid(ws: Worksheet) -> list[list[Cell]]:
+    return _sheet_grid(ws)[0]
+
+
+def _sheet_grid(ws: Worksheet) -> tuple[list[list[Cell]], list[int], list[int]]:
     """Сетка видимых ячеек листа: только строки и столбцы, где есть значения.
 
     Ключ ячейки — её координата, у объединённой — координата всего диапазона, а значение
@@ -49,16 +89,21 @@ def _grid(ws: Worksheet) -> list[list[Cell]]:
         for row, col in rng.cells:
             merged[(row, col)] = (rng.coord, text)
 
-    hidden_cols = {
+    hidden_cols = _hidden_columns(ws)
+    positions = values.keys() | merged.keys()
+    rows = sorted({r for r, _ in positions if not _row_hidden(ws, r)})
+    cols = sorted({c for _, c in positions if c not in hidden_cols})
+    grid = [[merged.get((r, c)) or ((r, c), values.get((r, c), "")) for c in cols] for r in rows]
+    return grid, rows, cols
+
+
+def _hidden_columns(ws: Worksheet) -> set[int]:
+    return {
         i
         for dim in ws.column_dimensions.values()
         if dim.hidden and dim.min is not None
         for i in range(dim.min, (dim.max or dim.min) + 1)
     }
-    positions = values.keys() | merged.keys()
-    rows = sorted({r for r, _ in positions if not _row_hidden(ws, r)})
-    cols = sorted({c for _, c in positions if c not in hidden_cols})
-    return [[merged.get((r, c)) or ((r, c), values.get((r, c), "")) for c in cols] for r in rows]
 
 
 def _row_hidden(ws: Worksheet, row: int) -> bool:

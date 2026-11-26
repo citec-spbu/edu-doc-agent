@@ -69,6 +69,34 @@ def test_markdown(matrix: Path) -> None:
     )
 
 
+def test_original_coordinates_survive_compression(matrix: Path) -> None:
+    parsed = parse_document(matrix)
+    table = parsed.tables[0]
+    assert table.source_rows == [1, 2, 3, 5]
+    assert table.source_columns == [1, 2, 3, 4]
+    assert parsed.to_dict()["blocks"][1]["source_rows"] == [1, 2, 3, 5]
+
+
+def test_missing_formula_cache_is_reported_except_in_hidden_cells(tmp_path: Path) -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "План"
+    ws.append(["ЗЕТ", "Скрытый столбец"])
+    ws["A3"] = "=1+1"
+    ws["B3"] = "=1+2"
+    ws["A4"] = "=2+2"
+    ws.column_dimensions["B"].hidden = True
+    ws.row_dimensions[4].hidden = True
+    hidden = wb.create_sheet("Скрытый лист")
+    hidden["A1"] = "=1+1"
+    hidden.sheet_state = "hidden"
+    path = tmp_path / "formulas.xlsx"
+    wb.save(path)
+    parsed = parse_document(path)
+    assert parsed.warnings == ["План!A3: формула без кэшированного значения"]
+    assert parsed.tables[0].rows == [["ЗЕТ"]]
+
+
 def test_value_text() -> None:
     assert _value_text(None) == ""
     assert _value_text(7) == "7"
