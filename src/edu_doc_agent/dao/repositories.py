@@ -102,16 +102,26 @@ class SessionRunDAO:
             await db.commit()
             return result.scalar_one_or_none() is not None
 
-    async def claim_run_for_execution(self, run_id: UUID) -> int | None:
+    async def claim_run_for_execution(
+        self,
+        run_id: UUID,
+        *,
+        expected_reconcile_attempts: int = 0,
+    ) -> int | None:
         """Атомарный переход 'queued' -> 'running'.
 
         Возвращает захваченное поколение (reconcile_attempts) как fencing token,
-        или None, если Run уже не в 'queued'.
+        или None, если Run уже не в 'queued' или поколение задачи устарело.
+        Задачи без явно переданного поколения относятся к исходному поколению 0.
         """
         async with self._session_factory() as db:
             stmt = (
                 update(Run)
-                .where(Run.id == run_id, Run.status == "queued")
+                .where(
+                    Run.id == run_id,
+                    Run.status == "queued",
+                    Run.reconcile_attempts == expected_reconcile_attempts,
+                )
                 .values(
                     status="running",
                     last_heartbeat_at=func.clock_timestamp(),
@@ -362,35 +372,6 @@ class SessionRunDAO:
                 session_id=row.session_id,
                 reconcile_attempts=row.reconcile_attempts,
             )
-
-    async def rollback_reconcile_attempt(
-        self,
-        run_id: UUID,
-        *,
-        expected_reconcile_attempts: int,
-    ) -> bool:
-        """Откатывает инкремент reconcile_attempts, если постановка в Redis не удалась.
-        updated_at не сдвигается повторно (сохраняется время предыдущего шага).
-        """
-        if expected_reconcile_attempts <= 0:
-            return False
-        async with self._session_factory() as db:
-            stmt = (
-                update(Run)
-                .where(
-                    Run.id == run_id,
-                    Run.status == "queued",
-                    Run.reconcile_attempts == expected_reconcile_attempts,
-                )
-                .values(
-                    reconcile_attempts=Run.reconcile_attempts - 1,
-                    updated_at=Run.updated_at,
-                )
-                .returning(Run.id)
-            )
-            result = await db.execute(stmt)
-            await db.commit()
-            return result.scalar_one_or_none() is not None
 
     async def get_run(self, session_id: str, run_id: UUID) -> Run | None:
         """Читает Run строго по паре (session_id, run_id)."""

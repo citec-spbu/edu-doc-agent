@@ -55,20 +55,6 @@ class RunReconciler:
         self._queue_name = queue_name
         self._batch_limit = batch_limit
 
-    async def _rollback_batch(self, runs: list[ReconciledRun]) -> None:
-        """Откатывает инкремент reconcile_attempts для непоставленных в Redis задач."""
-        for run in runs:
-            try:
-                await self._dao.rollback_reconcile_attempt(
-                    run.run_id,
-                    expected_reconcile_attempts=run.reconcile_attempts,
-                )
-            except Exception:
-                logger.exception(
-                    "Не удалось откатить reconcile_attempts для run_id=%s",
-                    run.run_id,
-                )
-
     async def reconcile(self) -> ReconcileReport:
         """Выполняет один проход реконсиляции."""
         try:
@@ -133,7 +119,9 @@ class RunReconciler:
                     requeued_runs.append(bumped)
 
         enqueued_count = 0
-        for idx, run in enumerate(requeued_runs):
+        # Поколение — fencing token: после commit его нельзя уменьшать даже
+        # при сбое Redis. Потерянные queued runs подберёт следующий проход.
+        for run in requeued_runs:
             run_id_str = str(run.run_id)
             job_id = f"{run_id_str}:reconcile:{run.reconcile_attempts}"
             try:
@@ -142,15 +130,15 @@ class RunReconciler:
                         "process_session_task",
                         session_id=run.session_id,
                         run_id=run_id_str,
+                        expected_reconcile_attempts=run.reconcile_attempts,
                         _job_id=job_id,
                         _queue_name=self._queue_name,
                     )
             except (RedisError, TimeoutError):
                 logger.exception(
-                    "Redis недоступен при постановке run, откатываем оставшиеся попытки: run_id=%s",
+                    "Redis недоступен при постановке run; поколения сохранены: run_id=%s",
                     run_id_str,
                 )
-                await self._rollback_batch(requeued_runs[idx:])
                 break
             except Exception:
                 logger.exception(
@@ -158,7 +146,6 @@ class RunReconciler:
                     run.session_id,
                     run_id_str,
                 )
-                await self._rollback_batch([run])
                 continue
 
             if job is None:

@@ -19,7 +19,13 @@ async def _stub_session_logic(session_id: str) -> None:
     logger.info("Бизнес-логика успешно завершена для session_id=%s", session_id)
 
 
-async def process_session_task(ctx: dict[str, Any], session_id: str, run_id: str) -> dict[str, str]:
+async def process_session_task(
+    ctx: dict[str, Any],
+    session_id: str,
+    run_id: str,
+    *,
+    expected_reconcile_attempts: int = 0,
+) -> dict[str, str]:
     """Тонкая точка входа ARQ: делегирует управление статусами в SessionRunner."""
 
     job_try = ctx.get("job_try", 1)
@@ -36,6 +42,7 @@ async def process_session_task(ctx: dict[str, Any], session_id: str, run_id: str
         max_tries=max_tries,
         logic_callable=_stub_session_logic,
         job_deadline=ctx.get("job_deadline"),
+        expected_reconcile_attempts=expected_reconcile_attempts,
     )
 
 

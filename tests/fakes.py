@@ -62,8 +62,15 @@ class InMemorySessionRunDAO:
     async def mark_failed_if_queued(self, run_id: UUID) -> bool:
         return self._transition(run_id, ("queued",), "failed")
 
-    async def claim_run_for_execution(self, run_id: UUID) -> int | None:
-        if not self._transition(run_id, ("queued",), "running"):
+    async def claim_run_for_execution(
+        self,
+        run_id: UUID,
+        *,
+        expected_reconcile_attempts: int = 0,
+    ) -> int | None:
+        if not self._transition(
+            run_id, ("queued",), "running", expected_reconcile_attempts=expected_reconcile_attempts
+        ):
             return None
         return self.runs[run_id].reconcile_attempts
 

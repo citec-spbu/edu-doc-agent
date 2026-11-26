@@ -90,8 +90,8 @@ def test_cancelled_unsuccessful_claim_does_not_requeue_another_execution(
         entered, release = asyncio.Event(), asyncio.Event()
         original = dao.claim_run_for_execution
 
-        async def paused_claim(run_id: UUID) -> int | None:
-            claimed = await original(run_id)
+        async def paused_claim(run_id: UUID, **kwargs: object) -> int | None:
+            claimed = await original(run_id, **kwargs)
             entered.set()
             await release.wait()
             return claimed

@@ -108,6 +108,8 @@ class SessionRunner:
         max_tries: int = 3,
         execution_timeout: float | None = None,
         job_deadline: float | None = None,
+        *,
+        expected_reconcile_attempts: int = 0,
     ) -> dict[str, str]:
         """Атомарно переводит Run в 'running', вызывает бизнес-логику и фиксирует исход."""
         run_uuid = UUID(str(run_id)) if not isinstance(run_id, UUID) else run_id
@@ -117,13 +119,17 @@ class SessionRunner:
 
         async def claim_run() -> None:
             nonlocal lease_token
-            lease_token = await self._dao.claim_run_for_execution(run_uuid)
+            lease_token = await self._dao.claim_run_for_execution(
+                run_uuid,
+                expected_reconcile_attempts=expected_reconcile_attempts,
+            )
 
         try:
             await _finish_status_update(claim_run())
             if lease_token is None:
                 logger.warning(
-                    "Пропуск выполнения: run_id=%s (session_id=%s) не находится в статусе 'queued'",
+                    "Пропуск выполнения: run_id=%s (session_id=%s) "
+                    "не находится в 'queued' или поколение задачи устарело",
                     run_uuid,
                     session_id,
                 )

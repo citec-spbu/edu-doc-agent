@@ -3,7 +3,7 @@
 import asyncio
 import importlib
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
@@ -469,5 +469,96 @@ def test_get_returns_404_for_missing_run_or_wrong_session(
         assert response.status_code == 404
         assert (await read_run(run_sessions, run.id)).status == "queued"
         assert not redis_pool.mock_calls
+
+    asyncio.run(asyncio.wait_for(scenario(), 10))
+
+
+@pytest.mark.parametrize("original_status", ["running", "queued"])
+@pytest.mark.parametrize("failure", ["redis", "timeout", "internal", "none"])
+def test_reconcile_enqueue_failure_keeps_old_worker_fenced(
+    run_dao: SessionRunDAO,
+    run_sessions: async_sessionmaker[AsyncSession],
+    redis_pool: AsyncMock,
+    original_status: str,
+    failure: str,
+) -> None:
+    reconciler_class = importlib.import_module("edu_doc_agent.worker.reconciler").RunReconciler
+
+    async def scenario() -> None:
+        run = await run_dao.create_queued_run("synthetic-session")
+        if original_status == "running":
+            assert await run_dao.claim_run_for_execution(run.id) == 0
+        async with run_sessions() as db:
+            stale = func.clock_timestamp() - timedelta(minutes=5)
+            await db.execute(
+                update(Run)
+                .where(Run.id == run.id)
+                .values(updated_at=stale, last_heartbeat_at=stale)
+            )
+            await db.commit()
+
+        redis_pool.ping = AsyncMock()
+        redis_pool.zscore = AsyncMock(return_value=None)
+        errors = {
+            "redis": RedisConnectionError("synthetic outage"),
+            "timeout": TimeoutError("synthetic timeout"),
+            "internal": RuntimeError("synthetic enqueue failure"),
+        }
+        redis_pool.enqueue_job.side_effect = errors.get(failure)
+        redis_pool.enqueue_job.return_value = None
+        report = await reconciler_class(dao=run_dao, redis=redis_pool).reconcile()
+        recovered = await read_run(run_sessions, run.id)
+        assert (report.requeued_count, report.enqueued_count) == (1, 0)
+        assert (recovered.status, recovered.reconcile_attempts) == ("queued", 1)
+
+        assert not await run_dao.mark_run_failed(run.id, expected_reconcile_attempts=0)
+        assert not await run_dao.requeue_running_run(run.id, expected_reconcile_attempts=0)
+        assert await run_dao.claim_run_for_execution(run.id) is None
+        assert await run_dao.claim_run_for_execution(run.id, expected_reconcile_attempts=1) == 1
+        assert not await run_dao.touch_heartbeat(run.id, expected_reconcile_attempts=0)
+        assert not await run_dao.mark_run_completed(run.id, expected_reconcile_attempts=0)
+        assert not await run_dao.mark_run_failed(run.id, expected_reconcile_attempts=0)
+        assert await run_dao.mark_run_completed(run.id, expected_reconcile_attempts=1)
+
+    asyncio.run(asyncio.wait_for(scenario(), 10))
+
+
+@pytest.mark.parametrize("job_generation", [0, 1])
+def test_old_arq_job_cannot_claim_a_new_generation_on_last_try(
+    run_dao: SessionRunDAO,
+    run_sessions: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    job_generation: int,
+) -> None:
+    tasks = importlib.import_module("edu_doc_agent.worker.tasks")
+
+    async def scenario() -> None:
+        run = await run_dao.create_queued_run("synthetic-session")
+        for generation in range(2):
+            assert (
+                await run_dao.bump_stale_queued_run(run.id, expected_reconcile_attempts=generation)
+                is not None
+            )
+
+        logic = AsyncMock(side_effect=asyncio.CancelledError)
+        monkeypatch.setattr(tasks, "_stub_session_logic", logic)
+        payload = {"expected_reconcile_attempts": job_generation} if job_generation else {}
+        result = await tasks.process_session_task(
+            {"dao": run_dao, "job_try": 3}, run.session_id, str(run.id), **payload
+        )
+        assert result["status"] == "skipped"
+        logic.assert_not_awaited()
+        unchanged = await read_run(run_sessions, run.id)
+        assert (unchanged.status, unchanged.reconcile_attempts) == ("queued", 2)
+
+        logic.side_effect = None
+        result = await tasks.process_session_task(
+            {"dao": run_dao, "job_try": 1},
+            run.session_id,
+            str(run.id),
+            expected_reconcile_attempts=2,
+        )
+        assert result["status"] == "completed"
+        assert (await read_run(run_sessions, run.id)).status == "completed"
 
     asyncio.run(asyncio.wait_for(scenario(), 10))
