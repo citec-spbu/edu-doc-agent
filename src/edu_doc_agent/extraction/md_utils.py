@@ -32,6 +32,7 @@ class MdTable:
     spans: list[CellSpan] | None = None
     grid_widths: list[int] = field(default_factory=list)
     row_quotes: list[str] = field(default_factory=list)  # исходные строки до нормализации XLSX
+    row_end_lines: list[int | None] = field(default_factory=list)
 
 
 def clean_text(text: str) -> str:

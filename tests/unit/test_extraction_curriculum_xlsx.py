@@ -13,7 +13,7 @@ from edu_doc_agent.extraction.__main__ import main
 from edu_doc_agent.extraction.curriculum import extract_plan, extract_plan_file
 from edu_doc_agent.extraction.md_utils import parse_tables
 from edu_doc_agent.parsing import parse_document
-from tests.unit.test_extraction_curriculum import PLAN
+from tests.fixtures.curriculum_plan import PLAN
 
 
 @pytest.fixture
@@ -358,3 +358,330 @@ def test_local_xlsx_has_no_missing_or_duplicate_records(tmp_path: Path) -> None:
     assert len(plan.competences) == 49
     assert len(plan.final_attestation) == 1
     assert plan.warnings == []
+
+
+@pytest.mark.parametrize("load", [None, "#N/A"])
+def test_choice_keeps_uncoded_entry_with_unknown_hours(tmp_path: Path, load: str | None) -> None:
+    path = _small_plan(
+        tmp_path,
+        [
+            ["С02. Семестр 2"],
+            ["Базовая часть периода обучения"],
+            ["Блок.1.дисц", "от 1", "УК-1", "Дисциплины по выбору:", "зачёты:"],
+            ["", "до 2", "", "Проектный практикум. Часть 2", "от 1 до 2"],
+            ["Блок.1.дисц", None, "УК-1", "Китайский язык", "зачёт", load],
+            ["Блок.1.дисц", 1, "УК-1", "[200] Второй курс", "зачёт", 12, 12, 12],
+        ],
+    )
+    if load is not None:
+        _cache_formula(path, "F7", "#N/A")
+    plan = extract_plan_file(path)
+    assert [(e.code, e.name) for e in plan.entries] == [
+        (None, "Китайский язык"),
+        ("200", "Второй курс"),
+    ]
+    first, second = plan.entries
+    assert first.credits is None and first.contact_hours == {} and first.self_study_hours == {}
+    assert first.competences == ["УК-1"] and first.control == ["зачёт"]
+    assert first.source.line == 7
+    for entry in (first, second):
+        assert entry.group == "Блок дисциплин по выбору: Проектный практикум. Часть 2"
+        assert entry.semester == 2 and entry.part == "Базовая часть периода обучения"
+    if load is not None:
+        assert any("Нагрузка!F7: ошибка формулы #N/A" in w for w in plan.warnings)
+
+
+def _cache_formula(path: Path, address: str, value: str) -> None:
+    """Сохранённая Excel формула с ошибкой в кэше, без запуска Excel."""
+    wb = load_workbook(path)
+    wb.active[address] = "=NA()"
+    wb.save(path)
+    with ZipFile(path) as z:
+        parts = {name: z.read(name) for name in z.namelist()}
+    ns = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    sheet = ET.fromstring(parts["xl/worksheets/sheet1.xml"])
+    cell = sheet.find(f'.//s:c[@r="{address}"]', ns)
+    cell.set("t", "e")
+    cell.find("s:v", ns).text = value
+    parts["xl/worksheets/sheet1.xml"] = ET.tostring(sheet)
+    with ZipFile(path, "w") as z:
+        for name, data in parts.items():
+            z.writestr(name, data)
+
+
+@pytest.mark.parametrize("merged_columns", [("A",), ("A", "B", "E")])
+def test_english_course_with_own_fields_is_not_translation(tmp_path: Path, merged_columns) -> None:
+    path = _small_plan(
+        tmp_path,
+        [
+            ["Блок.1.дисц", 1, "УК-1", "[100] Первый курс", "зачёт", 12, 12, 12],
+            ["Блок.1.дисц", 1, "УК-1", "Academic Writing", "зачёт", 12, 12, 12],
+        ],
+    )
+    wb = load_workbook(path)
+    for col in merged_columns:
+        wb.active.merge_cells(f"{col}3:{col}4")
+    wb.save(path)
+    first, second = extract_plan_file(path).entries
+    assert (first.code, first.name_en, first.total_hours) == ("100", None, 36)
+    assert (second.code, second.name, second.name_en, second.total_hours) == (
+        None,
+        "Academic Writing",
+        None,
+        36,
+    )
+    assert second.source.line == 4
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_control_error_is_unknown_and_located(tmp_path: Path, cached: bool) -> None:
+    path = _small_plan(tmp_path, [["Блок.1.дисц", 1, "УК-1", "[100] Курс", "#N/A", 12, 12, 12]])
+    if cached:
+        _cache_formula(path, "E3", "#N/A")
+    plan = extract_plan_file(path)
+    assert plan.entries[0].control == []
+    assert plan.entries[0].total_hours == 36
+    assert any("Нагрузка!E3" in w and "#N/A" in w for w in plan.warnings)
+    assert "#N/A" not in plan.entries[0].source.quote
+
+
+def test_repeated_header_refreshes_fields_and_hours_with_context(tmp_path: Path) -> None:
+    path = _small_plan(
+        tmp_path,
+        [
+            ["С02. Семестр 2"],
+            ["Базовая часть периода обучения"],
+            ["Блок.1.дисц", 1, "УК-1", "[100] Первый курс", "зачёт", 12, 12, 12],
+        ],
+    )
+    wb = load_workbook(path)
+    ws = wb.active
+    # Во второй шапке переставлены название/контроль и две группы часов.
+    for original in (1, 2):
+        row = [ws.cell(original, col).value for col in range(1, 9)]
+        row[3], row[4] = row[4], row[3]
+        if original == 1:
+            row[5], row[7] = "Самостоятельная работа", "Аудиторная работа"
+        ws.append(row)
+    ws.append(["Блок.1.дисц", 1, "УК-1", "экзамен", "[200] Второй курс", 10, 14, 12])
+    ws.append(["", "", "", "экзамен", "Second Course"])
+    for col in ("A", "B", "C", "D"):
+        ws.merge_cells(f"{col}8:{col}9")
+    wb.save(path)
+    first, second = extract_plan_file(path).entries
+    assert (
+        second.code == "200" and second.name == "Второй курс" and second.name_en == "Second Course"
+    )
+    assert second.control == ["экзамен"]
+    assert second.contact_hours == {"текущий контроль": 12}
+    assert second.self_study_hours == {"лекции": 10, "практические занятия": 14}
+    assert (first.semester, second.semester) == (2, 2)
+    assert first.part == second.part == "Базовая часть периода обучения"
+    assert (second.source.line, second.source.end_line) == (8, 9)
+    assert "Second Course" in second.source.quote
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        "[990001] Сверить список компетенций для итоговой аттестации",
+        "Код компетенции: уточнить наименование",
+    ],
+)
+def test_note_does_not_start_semantic_section(plan_xlsx: Path, note: str) -> None:
+    before = _without_sources(extract_plan_file(plan_xlsx).model_dump())
+    wb = load_workbook(plan_xlsx)
+    ws = wb.active
+    row = next(c.row for c in ws["D"] if c.value and "[700000]" in c.value)
+    ws.cell(row, 21, note)
+    wb.save(plan_xlsx)
+    assert _without_sources(extract_plan_file(plan_xlsx).model_dump()) == before
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "С02. Семестр 2",
+        "Вариативная часть периода обучения",
+        "Блок дисциплин Практикум. Часть 2",
+        "Профиль 2",
+        "Траектория 2",
+    ],
+)
+def test_note_outside_table_does_not_cancel_context(plan_xlsx: Path, label: str) -> None:
+    wb = load_workbook(plan_xlsx)
+    ws = wb.active
+    row = (
+        next(c.row for c in ws["A"] if c.value == label)
+        if label == "С02. Семестр 2"
+        else next(c.row for c in ws["A"] if c.value == "Базовая часть периода обучения")
+    )
+    ws.cell(row, 1, label)
+    wb.save(plan_xlsx)
+    before = _without_sources(extract_plan_file(plan_xlsx).model_dump())
+    ws.cell(row, 21, "Уточнить даты")
+    wb.save(plan_xlsx)
+    assert _without_sources(extract_plan_file(plan_xlsx).model_dump()) == before
+    if label == "С02. Семестр 2":
+        assert extract_plan_file(plan_xlsx).entries[2].semester == 2
+
+
+@pytest.mark.parametrize("separator", ["\n", "\r\n", "\u00a0\n"])
+def test_header_line_break_keeps_entries_and_named_hours(plan_xlsx: Path, separator: str) -> None:
+    before = _without_sources(extract_plan_file(plan_xlsx).model_dump())
+    wb = load_workbook(plan_xlsx)
+    for cell in list(wb.active._cells.values()):
+        if cell.value in {"Аудиторная работа", "Самостоятельная работа"}:
+            cell.value = cell.value.replace(" ", separator)
+    wb.save(plan_xlsx)
+    assert _without_sources(extract_plan_file(plan_xlsx).model_dump()) == before
+
+
+def test_competence_text_uses_named_column(plan_xlsx: Path) -> None:
+    wb = load_workbook(plan_xlsx)
+    ws = wb.create_sheet("Согласование")
+    ws.append(["Статус", "Код\nкомпетенции", "Наименование"])
+    ws.append(["Согласовано", "УК-999", "Умеет выполнять расчёты"])
+    wb.save(plan_xlsx)
+    competence = extract_plan_file(plan_xlsx).competences[-1]
+    assert (competence.code, competence.name) == ("УК-999", "Умеет выполнять расчёты")
+    assert (competence.source.section, competence.source.line) == ("Согласование", 2)
+
+
+def test_duplicate_visible_sections_warn_with_both_sheet_names(plan_xlsx: Path) -> None:
+    before = extract_plan_file(plan_xlsx)
+    wb = load_workbook(plan_xlsx)
+    wb.copy_worksheet(wb.active).title = "Рабочая копия"
+    wb.save(plan_xlsx)
+    after = extract_plan_file(plan_xlsx)
+    assert len(after.entries) == 2 * len(before.entries)
+    assert len(after.competences) == 2 * len(before.competences)
+    assert len(after.final_attestation) == 2 * len(before.final_attestation)
+    duplicates = [w for w in after.warnings if "полностью совпадает" in w]
+    assert len(duplicates) == 3
+    assert all("Учебный план" in w and "Рабочая копия" in w for w in duplicates)
+
+
+def test_translation_source_includes_both_rows_for_entry_and_attestation(plan_xlsx: Path) -> None:
+    _save_bilingual(plan_xlsx)
+    wb = load_workbook(plan_xlsx)
+    ws = wb.active
+    row = next(c.row for c in ws["C"] if c.value and "Thesis Defense" in c.value)
+    ws.cell(row, 3, "Защита ВКР")
+    ws.cell(row + 1, 3, "Thesis Defense")
+    for col in ("A", "B", "K"):
+        ws.merge_cells(f"{col}{row}:{col}{row + 1}")
+    wb.save(plan_xlsx)
+    plan = extract_plan_file(plan_xlsx)
+    for entity, english in (
+        (plan.entries[0], "Algebra"),
+        (plan.final_attestation[0], "Thesis Defense"),
+    ):
+        assert entity.name_en == english
+        assert entity.source.end_line == entity.source.line + 1
+        assert entity.name in entity.source.quote and english in entity.source.quote
+
+
+def test_synthetic_test_import_does_not_read_real_corpus() -> None:
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.modules['tests.real_data'] = None; "
+            "import tests.unit.test_extraction_curriculum_xlsx",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.fixture
+def local_plan_xlsx(tmp_path: Path) -> Path:
+    """Локальный XLSX читается только при выполнении выбранного теста."""
+    import os
+
+    from edu_doc_agent.eval.xlsx_documents import _member
+
+    data_dir = Path(os.environ.get("DATA_DIR") or Path(__file__).resolve().parents[2] / "data")
+    try:
+        source, _ = _member(data_dir, "Учебный план.zip")
+    except FileNotFoundError:
+        pytest.skip("нет локального архива учебного плана")
+    path = tmp_path / "local-plan.xlsx"
+    path.write_bytes(source)
+    return path
+
+
+@pytest.mark.parametrize(
+    "address,value",
+    [
+        ("U91", "[990001] Сверить список компетенций для итоговой аттестации"),
+        ("U168", "Уточнить даты"),
+        ("D139", "Проектный практикум. Часть 2"),
+        ("F84", "Аудиторная\nработа"),
+    ],
+)
+def test_local_excel_edit_preserves_plan(local_plan_xlsx: Path, address: str, value: str) -> None:
+    before = extract_plan_file(local_plan_xlsx)
+    assert len(before.entries) == 222 and len(before.final_attestation) == 1
+    # Меняем одну ячейку в OOXML: openpyxl при сохранении удаляет кэш всех формул.
+    with ZipFile(local_plan_xlsx) as z:
+        parts = {name: z.read(name) for name in z.namelist()}
+    ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    sheet = ET.fromstring(parts["xl/worksheets/sheet1.xml"])
+    row_number = re.search(r"\d+$", address)[0]
+    row = sheet.find(f'.//{{{ns}}}row[@r="{row_number}"]')
+    cell = row.find(f'{{{ns}}}c[@r="{address}"]')
+    if cell is None:
+        cell = ET.SubElement(row, f"{{{ns}}}c", r=address)
+    cell.clear()
+    cell.attrib.update(r=address, t="inlineStr")
+    ET.SubElement(ET.SubElement(cell, f"{{{ns}}}is"), f"{{{ns}}}t").text = value
+    parts["xl/worksheets/sheet1.xml"] = ET.tostring(sheet)
+    with ZipFile(local_plan_xlsx, "w") as z:
+        for name, data in parts.items():
+            z.writestr(name, data)
+    after = extract_plan_file(local_plan_xlsx)
+    assert len(after.entries) == 222 and len(after.final_attestation) == 1
+    assert after.warnings == before.warnings == []
+    expected = _without_sources(before.model_dump())
+    if address == "D139":
+        old_group = before.entries[
+            next(i for i, e in enumerate(before.entries) if e.source.line == 143)
+        ].group
+        changed = 0
+        for entry in expected["entries"]:
+            if entry["group"] == old_group and entry["semester"] == 1:
+                entry["group"] = "Блок дисциплин по выбору: " + value
+                changed += 1
+        assert changed > 0
+    assert _without_sources(after.model_dump()) == expected
+    for entity in [*after.entries, *after.final_attestation]:
+        if entity.name_en is not None:
+            assert entity.name_en in entity.source.quote
+            # Перевод может уже находиться в основной ячейке.
+            if entity.source.end_line is not None:
+                assert entity.source.end_line == entity.source.line + 1
+
+
+def test_choice_group_translation_does_not_change_group_name(tmp_path: Path) -> None:
+    path = _small_plan(
+        tmp_path,
+        [
+            ["Блок.1.дисц", "от 1", "УК-1", "Дисциплины по выбору:", "зачёты:"],
+            ["", "до 2", "", "Иностранный язык", "от 1 до 2"],
+            ["", "", "", "Foreign Language"],
+            ["", "", "", "(выбрать от 1 до 2 дисц.)"],
+            ["Блок.1.дисц", 1, "УК-1", "[200] Китайский язык", "зачёт", 0, 36, 0],
+        ],
+    )
+    wb = load_workbook(path)
+    wb.active.merge_cells("A3:A6")
+    wb.save(path)
+    entry = extract_plan_file(path).entries[0]
+    assert entry.group == "Блок дисциплин по выбору: Иностранный язык"

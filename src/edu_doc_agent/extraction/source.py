@@ -11,6 +11,7 @@ class SourceRef(BaseModel):
     file: str
     section: str | None = None
     line: int | None = Field(default=None, description="Номер строки Markdown или листа XLSX, с 1")
+    end_line: int | None = Field(default=None, description="Последняя строка составного источника")
     quote: str | None = Field(default=None, description="Исходная строка Markdown или ячейка XLSX")
 
 

@@ -37,11 +37,19 @@ class XlsxParser(BaseParser):
                             warnings.append(
                                 f"{ws.title}!{cell.coordinate}: ошибка формулы {cached.value}"
                             )
+                            cached.value = None
             finally:
                 formulas.close()
             for ws in wb.worksheets:
                 if ws.sheet_state != "visible":
                     continue
+                hidden = _hidden_columns(ws)
+                for cell in ws._cells.values():
+                    if cell.data_type != "e":
+                        continue
+                    if not _row_hidden(ws, cell.row) and cell.column not in hidden:
+                        warnings.append(f"{ws.title}!{cell.coordinate}: ошибка Excel {cell.value}")
+                    cell.value = None
                 grid, rows, cols = _sheet_grid(ws)
                 table = table_block(grid)
                 if table is None:
