@@ -176,7 +176,11 @@ def test_default_runner_allows_work_beyond_570_seconds(monkeypatch: pytest.Monke
             await asyncio.sleep(0)
             await asyncio.sleep(0)
 
-        result = await runner_module.SessionRunner(dao).execute(run.session_id, run.id, logic)
+        # Здесь проверяется отсутствие внутреннего лимита исполнения 570 с.
+        # Прыжок часов без heartbeat отдельно означал бы истечение lease.
+        result = await runner_module.SessionRunner(dao, heartbeat_interval=None).execute(
+            run.session_id, run.id, logic
+        )
         assert result["status"] == "completed"
         assert run.status == "completed"
 

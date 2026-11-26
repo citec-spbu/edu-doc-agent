@@ -114,6 +114,13 @@ TEST_DATABASE_URL=postgresql+psycopg://edu:edu@127.0.0.1:5432/edu \
 и логирование сбоя обработки отмены. Unit-тест API закрепляет логирование
 неудачной компенсации с сохранением исходного HTTP-ответа на сбой enqueue.
 
+В [test_runner_heartbeat.py](unit/worker/test_runner_heartbeat.py) проверяются
+остановка логики по локальному сроку lease при ошибках и зависании БД, продление
+lease подтверждёнными heartbeat, задержка ответа на захват и гонка отмены Runner
+с завершением heartbeat. В [test_runner_failures.py](unit/worker/test_runner_failures.py)
+проверяется также контракт произвольного `Awaitable`, включая `Future`, его отмену
+и синхронное исключение при вызове бизнес-функции.
+
 В [test_run_generation.py](unit/worker/test_run_generation.py) проверяются
 недействительность старых поколений, повторные отмены cron до enqueue и после
 принятия job Redis, доставка в именованную очередь и обход 101 queued-запуска

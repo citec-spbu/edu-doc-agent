@@ -34,6 +34,7 @@ async def process_session_task(
     runner = SessionRunner(
         dao=ctx["dao"],
         heartbeat_interval=ctx.get("heartbeat_interval", 30.0),
+        lease_timeout=ctx.get("stale_running_seconds", 120.0),
     )
     return await runner.execute(
         session_id=session_id,

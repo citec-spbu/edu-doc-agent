@@ -42,26 +42,41 @@ async def _stop_heartbeat(task: asyncio.Task[None] | None) -> None:
     if task is None:
         return
     task.cancel()
+    current = asyncio.current_task()
     cancellation: asyncio.CancelledError | None = None
     while not task.done():
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError as exc:
+            # shield может завершиться одновременно с heartbeat. Сначала
+            # сохраняем отмену самого Runner, затем проверяем дочернюю задачу.
+            if current is not None and current.cancelling():
+                cancellation = exc
             if task.done():
                 break
-            cancellation = exc
-    with suppress(asyncio.CancelledError):
-        task.result()
-    if cancellation is not None:
-        raise cancellation
+    try:
+        with suppress(asyncio.CancelledError):
+            task.result()
+    finally:
+        if cancellation is not None:
+            raise cancellation
 
 
 class SessionRunner:
     """Управляет жизненным циклом Run вокруг вызова бизнес-логики."""
 
-    def __init__(self, dao: SessionRunDAO, heartbeat_interval: float | None = 30.0) -> None:
+    def __init__(
+        self,
+        dao: SessionRunDAO,
+        heartbeat_interval: float | None = 30.0,
+        *,
+        lease_timeout: float = 120.0,
+    ) -> None:
+        if lease_timeout <= 0:
+            raise ValueError("lease_timeout must be positive")
         self._dao = dao
         self._heartbeat_interval = heartbeat_interval
+        self._lease_timeout = lease_timeout
 
     async def _heartbeat_loop(
         self,
@@ -69,28 +84,41 @@ class SessionRunner:
         interval: float,
         expected_reconcile_attempts: int | None,
         on_lease_lost: Callable[[], None] | None = None,
+        *,
+        lease_deadline: float,
     ) -> None:
-        """Периодически обновляет last_heartbeat_at, пока задача выполняется."""
+        """Продлевает lease; без подтверждения БД останавливает работу к локальному сроку."""
+        loop = asyncio.get_running_loop()
         op_timeout = min(interval, 10.0)
         while True:
-            await asyncio.sleep(interval)
             try:
-                async with asyncio.timeout(op_timeout):
-                    updated = await self._dao.touch_heartbeat(
-                        run_id,
-                        expected_reconcile_attempts=expected_reconcile_attempts,
-                    )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
+                # Срок охватывает и ожидание следующего пульса, и запрос БД.
+                async with asyncio.timeout_at(lease_deadline):
+                    await asyncio.sleep(interval)
+                    request_started = loop.time()
+                    try:
+                        async with asyncio.timeout(op_timeout):
+                            updated = await self._dao.touch_heartbeat(
+                                run_id,
+                                expected_reconcile_attempts=expected_reconcile_attempts,
+                            )
+                    except Exception:
+                        logger.warning(
+                            "Не удалось обновить heartbeat для run_id=%s",
+                            run_id,
+                            exc_info=True,
+                        )
+                        continue
+            except TimeoutError:
                 logger.warning(
-                    "Не удалось обновить heartbeat для run_id=%s",
+                    "Локальный lease истёк без подтверждения heartbeat: run_id=%s",
                     run_id,
-                    exc_info=True,
                 )
-                continue
+                if on_lease_lost is not None:
+                    on_lease_lost()
+                return
 
-            if not updated:
+            if not updated or loop.time() >= lease_deadline:
                 logger.warning(
                     "Остановка heartbeat: lease потерян или run_id=%s больше не в 'running'",
                     run_id,
@@ -98,6 +126,9 @@ class SessionRunner:
                 if on_lease_lost is not None:
                     on_lease_lost()
                 return
+            # Начало запроса предшествует записи clock_timestamp() в БД.
+            # Отсчёт от получения ответа мог бы продлить локальный lease сверх БД.
+            lease_deadline = request_started + self._lease_timeout
 
     async def execute(
         self,
@@ -115,10 +146,15 @@ class SessionRunner:
         run_uuid = UUID(str(run_id)) if not isinstance(run_id, UUID) else run_id
 
         lease_token: int | None = None
+        lease_lost = False
+        loop = asyncio.get_running_loop()
+        lease_deadline = loop.time()
+        heartbeat_enabled = self._heartbeat_interval is not None and self._heartbeat_interval > 0
         is_last_try = job_try >= max_tries
 
         async def claim_run() -> None:
-            nonlocal lease_token
+            nonlocal lease_token, lease_deadline
+            lease_deadline = loop.time() + self._lease_timeout
             lease_token = await self._dao.claim_run_for_execution(
                 run_uuid,
                 expected_reconcile_attempts=expected_reconcile_attempts,
@@ -147,8 +183,17 @@ class SessionRunner:
                 max_tries,
             )
 
-            lease_lost = False
-            logic_task: asyncio.Task[Any] = asyncio.create_task(logic_callable(session_id))
+            if heartbeat_enabled and loop.time() >= lease_deadline:
+                return {
+                    "status": "conflict",
+                    "session_id": session_id,
+                    "run_id": str(run_uuid),
+                }
+
+            async def invoke_logic() -> Any:
+                return await logic_callable(session_id)
+
+            logic_task: asyncio.Task[Any] = asyncio.create_task(invoke_logic())
 
             def _handle_lease_lost() -> None:
                 nonlocal lease_lost
@@ -164,6 +209,7 @@ class SessionRunner:
                         self._heartbeat_interval,
                         lease_token,
                         on_lease_lost=_handle_lease_lost,
+                        lease_deadline=lease_deadline,
                     )
                 )
 
@@ -173,7 +219,8 @@ class SessionRunner:
                     async with asyncio.timeout(execution_timeout):
                         await logic_task
                 except asyncio.CancelledError:
-                    if lease_lost:
+                    current = asyncio.current_task()
+                    if lease_lost and (current is None or not current.cancelling()):
                         logger.warning(
                             "Выполнение прервано из-за потери lease: session_id=%s, run_id=%s",
                             session_id,
@@ -202,6 +249,8 @@ class SessionRunner:
                     finally:
                         await _stop_heartbeat(heartbeat_task)
             except Exception:
+                if lease_lost:
+                    raise
                 try:
                     await _finish_status_update(
                         self._dao.mark_run_failed(
@@ -222,6 +271,17 @@ class SessionRunner:
                     run_uuid,
                 )
                 raise
+
+            # Бизнес-функция могла подавить отмену, а heartbeat уже завершиться.
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise asyncio.CancelledError
+            if lease_lost:
+                return {
+                    "status": "conflict",
+                    "session_id": session_id,
+                    "run_id": str(run_uuid),
+                }
 
             completed = await _finish_status_update(
                 self._dao.mark_run_completed(
@@ -244,7 +304,7 @@ class SessionRunner:
                 }
 
         except asyncio.CancelledError:
-            if lease_token is None:
+            if lease_token is None or lease_lost:
                 raise
             deadline_expired = (
                 job_deadline is not None and asyncio.get_running_loop().time() >= job_deadline
