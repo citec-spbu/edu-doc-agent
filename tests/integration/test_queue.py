@@ -198,6 +198,7 @@ def test_http_to_redis_to_worker(redis_dsn: str, monkeypatch: pytest.MonkeyPatch
                     settings.WorkerSettings,
                     redis_pool=pool,
                     queue_name=name,
+                    cron_jobs=[],
                     burst=True,
                     max_burst_jobs=1,
                     poll_delay=0.01,
@@ -1025,10 +1026,13 @@ def test_worker_shutdown_leaves_job_queued_for_retry(
                 assert first.status_code == 202
                 run_id = first.json()["run_id"]
                 job = Job(run_id, pool, _queue_name=name)
+                # Счётчики и очередь должны отражать только эту job,
+                # без фонового cron при остановке и повторном запуске.
                 worker = create_worker(
                     settings.WorkerSettings,
                     redis_pool=pool,
                     queue_name=name,
+                    cron_jobs=[],
                     poll_delay=0.01,
                     handle_signals=False,
                 )
@@ -1054,6 +1058,7 @@ def test_worker_shutdown_leaves_job_queued_for_retry(
                         settings.WorkerSettings,
                         redis_pool=pool,
                         queue_name=name,
+                        cron_jobs=[],
                         burst=True,
                         max_burst_jobs=1,
                         poll_delay=0.01,
