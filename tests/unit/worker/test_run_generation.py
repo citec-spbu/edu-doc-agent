@@ -119,7 +119,82 @@ def redis_for_reconcile(queue_name: str = "arq:queue") -> AsyncMock:
     return redis
 
 
-def test_repeated_cron_cancellation_before_enqueue_does_not_exhaust_budget(
+@pytest.mark.parametrize("pending", [False, True])
+def test_cron_delivers_queued_candidates_before_page_scan_times_out(pending: bool) -> None:
+    reconciler_class = importlib.import_module("edu_doc_agent.worker.reconciler").RunReconciler
+
+    async def scenario() -> None:
+        dao = InMemorySessionRunDAO()
+        runs = []
+        for i in range(100):
+            run = await dao.create_queued_run(f"synthetic-{i}", run_id=UUID(int=i + 1))
+            run.updated_at = datetime.now(UTC) - timedelta(minutes=5)
+            run.reconcile_attempts = 1 if pending else 0
+            run.reconcile_pending = pending
+            runs.append(run)
+        redis = redis_for_reconcile()
+        queue = set()
+
+        async def enqueue(*args, **kwargs):
+            queue.add(kwargs["_job_id"])
+            return object()
+
+        redis.enqueue_job.side_effect = enqueue
+        for _ in range(3):
+            checks = 0
+            with pytest.raises(TimeoutError):
+                async with asyncio.timeout(None) as cron_deadline:
+
+                    async def score(queue_name, job_id):
+                        nonlocal checks
+                        checks += 1
+                        if checks == 6:
+                            # Медленный ZSCORE исчерпал срок cron до конца страницы.
+                            # Управляем сроком явно, без зависимости от скорости CI.
+                            cron_deadline.reschedule(asyncio.get_running_loop().time())
+                            await asyncio.sleep(0)
+                        return 1 if job_id in queue else None
+
+                    redis.zscore.side_effect = score
+                    await reconciler_class(dao=dao, redis=redis).reconcile()
+            assert queue, "Cron должен доставить задачи до окончания обхода страницы"
+        assert len(queue) >= 10
+        assert all(run.status == "queued" and run.reconcile_attempts <= 1 for run in runs)
+        assert all(not run.reconcile_pending for run in runs if f"{run.id}:reconcile:1" in queue)
+
+    asyncio.run(scenario())
+
+
+def test_repeated_cron_cancellation_before_enqueue_does_not_exhaust_budget() -> None:
+    reconciler_class = importlib.import_module("edu_doc_agent.worker.reconciler").RunReconciler
+
+    async def scenario() -> None:
+        dao = InMemorySessionRunDAO()
+        run = await dao.create_queued_run("synthetic-session")
+        await dao.claim_run_for_execution(run.id)
+        run.last_heartbeat_at = datetime.now(UTC) - timedelta(minutes=5)
+        # Cron отменён после commit партии, до первого enqueue, три раза подряд.
+        redis = redis_for_reconcile()
+        redis.enqueue_job.side_effect = asyncio.CancelledError
+        for _ in range(3):
+            with pytest.raises(asyncio.CancelledError):
+                await reconciler_class(dao=dao, redis=redis, stale_queued_seconds=0).reconcile()
+            assert (run.status, run.reconcile_attempts, run.reconcile_pending) == (
+                "queued",
+                1,
+                True,
+            )
+        assert redis.enqueue_job.await_count == 3
+
+        redis.enqueue_job.side_effect = None
+        report = await reconciler_class(dao=dao, redis=redis, stale_queued_seconds=0).reconcile()
+        assert report.enqueued_count == 1
+        assert (run.reconcile_attempts, run.reconcile_pending) == (1, False)
+
+    asyncio.run(scenario())
+
+
+def test_reserved_running_is_delivered_before_queued_page_lookup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     reconciler_class = importlib.import_module("edu_doc_agent.worker.reconciler").RunReconciler
@@ -129,26 +204,20 @@ def test_repeated_cron_cancellation_before_enqueue_does_not_exhaust_budget(
         run = await dao.create_queued_run("synthetic-session")
         await dao.claim_run_for_execution(run.id)
         run.last_heartbeat_at = datetime.now(UTC) - timedelta(minutes=5)
-        original_list = dao.list_stale_queued_runs
-        # Cron отменён после commit партии, до первого enqueue, три раза подряд.
+        redis = redis_for_reconcile()
+        # Даже если последующая выборка queued не успела завершиться,
+        # зарезервированный running уже должен быть доставлен.
         monkeypatch.setattr(
             dao, "list_stale_queued_runs", AsyncMock(side_effect=asyncio.CancelledError)
         )
-        redis = redis_for_reconcile()
-        for _ in range(3):
-            with pytest.raises(asyncio.CancelledError):
-                await reconciler_class(dao=dao, redis=redis, stale_queued_seconds=0).reconcile()
-            assert (run.status, run.reconcile_attempts, run.reconcile_pending) == (
-                "queued",
-                1,
-                True,
-            )
-        redis.enqueue_job.assert_not_awaited()
-
-        monkeypatch.setattr(dao, "list_stale_queued_runs", original_list)
-        report = await reconciler_class(dao=dao, redis=redis, stale_queued_seconds=0).reconcile()
-        assert report.enqueued_count == 1
-        assert (run.reconcile_attempts, run.reconcile_pending) == (1, False)
+        with pytest.raises(asyncio.CancelledError):
+            await reconciler_class(dao=dao, redis=redis).reconcile()
+        redis.enqueue_job.assert_awaited_once()
+        assert (run.status, run.reconcile_attempts, run.reconcile_pending) == (
+            "queued",
+            1,
+            False,
+        )
 
     asyncio.run(scenario())
 

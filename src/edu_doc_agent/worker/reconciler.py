@@ -80,7 +80,16 @@ class RunReconciler:
             max_reconcile_attempts=self._max_reconcile_attempts,
             limit=self._batch_limit,
         )
-        requeued_runs = {run.run_id: run for run in reserved_runs}
+        reserved_generations = {(run.run_id, run.reconcile_attempts) for run in reserved_runs}
+        requeued_count = len(reserved_runs)
+        enqueued_count = 0
+        # Доставляем сразу после резервирования: обход queued-страницы может
+        # занять весь срок cron. При отмене оставшиеся поколения сохраняют pending.
+        for run in reserved_runs:
+            try:
+                enqueued_count += await self._enqueue_run(run)
+            except (RedisError, TimeoutError):
+                return ReconcileReport(len(failed_ids), requeued_count, enqueued_count)
 
         # Проверяем зависшие 'queued': если джоба ещё в очереди Redis — не трогаем.
         queued_candidates = await self._dao.list_stale_queued_runs(
@@ -88,6 +97,8 @@ class RunReconciler:
             limit=self._batch_limit,
         )
         for candidate in queued_candidates:
+            if (candidate.run_id, candidate.reconcile_attempts) in reserved_generations:
+                continue
             job_id = _current_job_id(candidate)
             try:
                 async with asyncio.timeout(REDIS_OP_TIMEOUT_SECONDS):
@@ -106,13 +117,12 @@ class RunReconciler:
                     candidate.run_id,
                     expected_reconcile_attempts=candidate.reconcile_attempts,
                 )
-                requeued_runs.pop(candidate.run_id, None)
                 continue
 
             if candidate.reconcile_pending:
                 # Cron мог завершиться после commit резервирования, но до enqueue.
                 # Повторяем доставку того же поколения, не списывая новую попытку.
-                requeued_runs[candidate.run_id] = candidate
+                run = candidate
             elif candidate.reconcile_attempts >= self._max_reconcile_attempts:
                 if await self._dao.fail_stale_queued_run(
                     candidate.run_id,
@@ -124,86 +134,84 @@ class RunReconciler:
                         self._max_reconcile_attempts,
                         candidate.run_id,
                     )
+                continue
             else:
                 bumped = await self._dao.bump_stale_queued_run(
                     candidate.run_id,
                     expected_reconcile_attempts=candidate.reconcile_attempts,
                 )
-                if bumped is not None:
-                    requeued_runs[bumped.run_id] = bumped
+                if bumped is None:
+                    continue
+                run = bumped
 
-        enqueued_count = 0
-        # Поколение — fencing token: после commit его нельзя уменьшать даже
-        # при сбое Redis. Потерянные queued runs подберёт следующий проход.
-        for run in requeued_runs.values():
-            run_id_str = str(run.run_id)
-            job_id = f"{run_id_str}:reconcile:{run.reconcile_attempts}"
+            requeued_count += 1
             try:
-                async with asyncio.timeout(REDIS_OP_TIMEOUT_SECONDS):
-                    job = await self._redis.enqueue_job(
-                        "process_session_task",
-                        session_id=run.session_id,
-                        run_id=run_id_str,
-                        expected_reconcile_attempts=run.reconcile_attempts,
-                        _job_id=job_id,
-                        _queue_name=self._queue_name,
-                    )
+                enqueued_count += await self._enqueue_run(run)
             except (RedisError, TimeoutError):
-                logger.exception(
-                    "Redis недоступен при постановке run; поколения сохранены: run_id=%s",
-                    run_id_str,
-                )
                 break
-            except Exception:
-                logger.exception(
-                    "Не удалось повторно поставить run в очередь ARQ: session_id=%s, run_id=%s",
-                    run.session_id,
-                    run_id_str,
-                )
-                continue
-
-            if job is None:
-                try:
-                    async with asyncio.timeout(REDIS_OP_TIMEOUT_SECONDS):
-                        in_queue = await self._redis.zscore(self._queue_name, job_id)
-                except (RedisError, TimeoutError):
-                    in_queue = None
-
-                if in_queue is not None:
-                    await self._dao.confirm_reconcile_enqueue(
-                        run.run_id,
-                        expected_reconcile_attempts=run.reconcile_attempts,
-                    )
-                    enqueued_count += 1
-                    logger.info(
-                        "Run уже присутствует в очереди ARQ: session_id=%s, run_id=%s",
-                        run.session_id,
-                        run_id_str,
-                    )
-                else:
-                    logger.warning(
-                        "ARQ не подтвердил повторную постановку run "
-                        "(возможен конфликт job_id): session_id=%s, run_id=%s",
-                        run.session_id,
-                        run_id_str,
-                    )
-                continue
-
-            await self._dao.confirm_reconcile_enqueue(
-                run.run_id,
-                expected_reconcile_attempts=run.reconcile_attempts,
-            )
-            enqueued_count += 1
-            logger.info(
-                "Run восстановлен и поставлен в очередь: session_id=%s, run_id=%s (попытка %d/%d)",
-                run.session_id,
-                run_id_str,
-                run.reconcile_attempts,
-                self._max_reconcile_attempts,
-            )
 
         return ReconcileReport(
             failed_count=len(failed_ids),
-            requeued_count=len(requeued_runs),
+            requeued_count=requeued_count,
             enqueued_count=enqueued_count,
         )
+
+    async def _enqueue_run(self, run: ReconciledRun) -> bool:
+        """Доставляет одно поколение; при неизвестном исходе оставляет pending."""
+        run_id_str = str(run.run_id)
+        job_id = _current_job_id(run)
+        # Поколение — fencing token: после commit его нельзя уменьшать даже
+        # при сбое Redis. Потерянные queued runs подберёт следующий проход.
+        try:
+            async with asyncio.timeout(REDIS_OP_TIMEOUT_SECONDS):
+                job = await self._redis.enqueue_job(
+                    "process_session_task",
+                    session_id=run.session_id,
+                    run_id=run_id_str,
+                    expected_reconcile_attempts=run.reconcile_attempts,
+                    _job_id=job_id,
+                    _queue_name=self._queue_name,
+                )
+        except (RedisError, TimeoutError):
+            logger.exception(
+                "Redis недоступен при постановке run; поколения сохранены: run_id=%s",
+                run_id_str,
+            )
+            raise
+        except Exception:
+            logger.exception(
+                "Не удалось повторно поставить run в очередь ARQ: session_id=%s, run_id=%s",
+                run.session_id,
+                run_id_str,
+            )
+            return False
+
+        if job is None:
+            try:
+                async with asyncio.timeout(REDIS_OP_TIMEOUT_SECONDS):
+                    in_queue = await self._redis.zscore(self._queue_name, job_id)
+            except (RedisError, TimeoutError):
+                in_queue = None
+
+            if in_queue is None:
+                logger.warning(
+                    "ARQ не подтвердил повторную постановку run "
+                    "(возможен конфликт job_id): session_id=%s, run_id=%s",
+                    run.session_id,
+                    run_id_str,
+                )
+                return False
+
+        await self._dao.confirm_reconcile_enqueue(
+            run.run_id,
+            expected_reconcile_attempts=run.reconcile_attempts,
+        )
+        logger.info(
+            "Run восстановлен или уже присутствует в очереди: "
+            "session_id=%s, run_id=%s (попытка %d/%d)",
+            run.session_id,
+            run_id_str,
+            run.reconcile_attempts,
+            self._max_reconcile_attempts,
+        )
+        return True

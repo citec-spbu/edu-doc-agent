@@ -180,6 +180,7 @@ def test_pending_delivery_migration_preserves_generation_and_can_be_reapplied(
     with database.engine.begin() as connection:
         assert connection.scalar(select(Run.reconcile_pending)) is False
         connection.execute(update(Run).values(reconcile_pending=True))
+    before = rows(database)
     result = database.alembic("downgrade", previous)
     assert result.returncode == 0, result.stdout + result.stderr
     assert rows(database) == before

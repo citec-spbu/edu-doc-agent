@@ -16,6 +16,7 @@ from sqlalchemy.pool import NullPool
 
 from edu_doc_agent.api import router
 from edu_doc_agent.api.dependencies import get_arq_pool, get_session_run_dao
+from edu_doc_agent.config import MAX_RUN_STALE_SECONDS, Settings
 from edu_doc_agent.dao import Run, Session, SessionRunDAO
 from edu_doc_agent.main import app
 from tests.integration.dao.support import ACTIVE_STATUSES, TERMINAL_STATUSES, Database
@@ -82,6 +83,59 @@ async def counts(sessions: async_sessionmaker[AsyncSession]) -> tuple[int, int]:
             await db.scalar(select(func.count()).select_from(Session)),
             await db.scalar(select(func.count()).select_from(Run)),
         )
+
+
+@pytest.mark.parametrize("extra_days", [-1, 1])
+def test_reconcile_maximum_stale_threshold_is_safe_in_postgres(
+    run_dao: SessionRunDAO,
+    run_sessions: async_sessionmaker[AsyncSession],
+    extra_days: int,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        run_stale_running_seconds=MAX_RUN_STALE_SECONDS,
+        run_stale_queued_seconds=MAX_RUN_STALE_SECONDS,
+    )
+
+    async def scenario() -> None:
+        recoverable = await seed_run(run_sessions, run_dao, "running", "recoverable")
+        exhausted = await seed_run(run_sessions, run_dao, "running", "exhausted")
+        queued = await seed_run(run_sessions, run_dao, "queued", "queued")
+        age = timedelta(seconds=MAX_RUN_STALE_SECONDS, days=extra_days)
+        async with run_sessions() as db:
+            await db.execute(
+                update(Run)
+                .where(Run.id.in_([recoverable.id, exhausted.id, queued.id]))
+                .values(
+                    updated_at=func.clock_timestamp() - age,
+                    last_heartbeat_at=func.clock_timestamp() - age,
+                )
+            )
+            await db.execute(
+                update(Run)
+                .where(Run.id == exhausted.id)
+                .values(reconcile_attempts=settings.run_max_reconcile_attempts)
+            )
+            await db.commit()
+
+        queued_runs = await run_dao.list_stale_queued_runs(
+            stale_queued_seconds=settings.run_stale_queued_seconds,
+        )
+        failed_ids = await run_dao.fail_exhausted_stale_running_runs(
+            stale_running_seconds=settings.run_stale_running_seconds,
+            max_reconcile_attempts=settings.run_max_reconcile_attempts,
+        )
+        recovered_runs = await run_dao.requeue_stale_running_runs(
+            stale_running_seconds=settings.run_stale_running_seconds,
+            max_reconcile_attempts=settings.run_max_reconcile_attempts,
+        )
+        assert [run.run_id for run in queued_runs] == ([queued.id] if extra_days > 0 else [])
+        assert failed_ids == ([exhausted.id] if extra_days > 0 else [])
+        assert [run.run_id for run in recovered_runs] == (
+            [recoverable.id] if extra_days > 0 else []
+        )
+
+    asyncio.run(scenario())
 
 
 def test_post_commits_session_and_run_before_enqueue(
@@ -573,7 +627,6 @@ def test_cancelled_cron_preserves_pending_delivery_without_exhausting_budget(
     run_dao: SessionRunDAO,
     run_sessions: async_sessionmaker[AsyncSession],
     redis_pool: AsyncMock,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     reconciler_class = importlib.import_module("edu_doc_agent.worker.reconciler").RunReconciler
 
@@ -588,21 +641,20 @@ def test_cancelled_cron_preserves_pending_delivery_without_exhausting_budget(
             await db.commit()
         redis_pool.ping = AsyncMock()
         redis_pool.zscore = AsyncMock(return_value=None)
-        original = run_dao.list_stale_queued_runs
-        monkeypatch.setattr(
-            run_dao, "list_stale_queued_runs", AsyncMock(side_effect=asyncio.CancelledError)
-        )
+        redis_pool.enqueue_job.side_effect = asyncio.CancelledError
         for _ in range(3):
             with pytest.raises(asyncio.CancelledError):
-                await reconciler_class(dao=run_dao, redis=redis_pool).reconcile()
+                await reconciler_class(
+                    dao=run_dao, redis=redis_pool, stale_queued_seconds=0
+                ).reconcile()
             stored = await read_run(run_sessions, run.id)
             assert (stored.status, stored.reconcile_attempts, stored.reconcile_pending) == (
                 "queued",
                 1,
                 True,
             )
-        redis_pool.enqueue_job.assert_not_awaited()
-        monkeypatch.setattr(run_dao, "list_stale_queued_runs", original)
+        assert redis_pool.enqueue_job.await_count == 3
+        redis_pool.enqueue_job.side_effect = None
         report = await reconciler_class(
             dao=run_dao, redis=redis_pool, stale_queued_seconds=0
         ).reconcile()
