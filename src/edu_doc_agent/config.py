@@ -54,9 +54,9 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
 
     # --- Heartbeat и Reconciler ---
-    run_heartbeat_interval_seconds: float = Field(default=30.0, gt=0)
-    run_stale_running_seconds: float = Field(default=120.0, gt=0)
-    run_stale_queued_seconds: float = Field(default=120.0, gt=0)
+    run_heartbeat_interval_seconds: float = Field(default=30.0, gt=0, allow_inf_nan=False)
+    run_stale_running_seconds: float = Field(default=120.0, gt=0, allow_inf_nan=False)
+    run_stale_queued_seconds: float = Field(default=120.0, gt=0, allow_inf_nan=False)
     run_max_reconcile_attempts: int = Field(default=3, ge=1)
 
     @property
