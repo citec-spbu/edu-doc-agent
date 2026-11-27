@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import select
@@ -58,12 +59,18 @@ async def cli_process(database: Database, directory: Path, storage_dir: Path):
     )
 
 
+@pytest.mark.parametrize(
+    "filename",
+    ["synthetic.pdf", "Учебная программа ё" * 40 + ".pdf"],
+    ids=["short", "long-unicode"],
+)
 def test_confirmed_rollback_and_once_failed_compensation_are_cleaned_by_new_cli_process(
     document_sessions,
     document_storage,
     migrated_database,
     tmp_path,
     monkeypatch,
+    filename,
 ):
     rollbacks, commits, failed_unlinks = [], [], []
 
@@ -86,7 +93,7 @@ def test_confirmed_rollback_and_once_failed_compensation_are_cleaned_by_new_cli_
     real_unlink = storage_module.os.unlink
 
     def fail_content_unlink_once(name, *, dir_fd=None):
-        if str(name).endswith("synthetic.pdf") and dir_fd is not None and not failed_unlinks:
+        if str(name).endswith(".pdf") and dir_fd is not None and not failed_unlinks:
             failed_unlinks.append(name)
             raise OSError(errno.EIO, "synthetic one-time compensation unlink failure")
         return real_unlink(name, dir_fd=dir_fd)
@@ -95,7 +102,7 @@ def test_confirmed_rollback_and_once_failed_compensation_are_cleaned_by_new_cli_
         with monkeypatch.context() as boundary:
             boundary.setattr(storage_module.os, "unlink", fail_content_unlink_once)
             async with documents_client(DocumentDAO(failing_sessions), document_storage) as api:
-                response = await api.post(URL, files={"file": ("synthetic.pdf", CONTENT)})
+                response = await api.post(URL, files={"file": (filename, CONTENT)})
                 assert response.status_code == 500, response.text
         assert rollbacks == [True]
         assert commits == []
@@ -106,9 +113,10 @@ def test_confirmed_rollback_and_once_failed_compensation_are_cleaned_by_new_cli_
         assert len(markers) == 1
         marker = json.loads(await document_storage.read(markers[0]))
         assert marker["outcome"] == "rolled_back"
+        assert marker["filename"] == filename
         assert len(stored_files(document_storage)) == 2
         original_path = next(
-            path for path in stored_files(document_storage) if path.name.endswith("synthetic.pdf")
+            path for path in stored_files(document_storage) if path.name.endswith(".pdf")
         )
         assert original_path.read_bytes() == CONTENT
 
@@ -128,6 +136,116 @@ def test_confirmed_rollback_and_once_failed_compensation_are_cleaned_by_new_cli_
         assert stored_files(document_storage) == []
         async with document_sessions() as db:
             assert (await db.scalars(select(Document))).all() == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("marker_kind", ["foreign-key", "legacy"])
+def test_rollback_cli_retains_unverified_content(
+    document_sessions, document_storage, migrated_database, tmp_path, marker_kind
+):
+    from edu_doc_agent.reconcile_uploads import INTENT_FILENAME, record_upload_rollback
+
+    async def scenario():
+        dao = DocumentDAO(document_sessions)
+        async with documents_client(dao, document_storage) as api:
+            response = await api.post(URL, files={"file": ("active.pdf", CONTENT)})
+            assert response.status_code == 201
+            active = await read_document(document_sessions, response.json()["id"])
+            doc_id = uuid4()
+            key = await document_storage.save(
+                session_id=SESSION_ID, doc_id=doc_id, filename="rollback.pdf", content=b"rollback"
+            )
+            marker_key = await record_upload_rollback(
+                document_storage,
+                session_id=SESSION_ID,
+                doc_id=doc_id,
+                filename="rollback.pdf",
+                storage_key=key,
+            )
+            marker = json.loads(await document_storage.read(marker_key))
+            if marker_kind == "foreign-key":
+                marker["storage_key"] = active.storage_key
+            else:
+                del marker["filename"]
+            marker_bytes = json.dumps(marker).encode()
+            await document_storage.save(
+                session_id=SESSION_ID,
+                doc_id=doc_id,
+                filename=INTENT_FILENAME,
+                content=marker_bytes,
+            )
+            for _ in range(2):
+                result = await cli_process(migrated_database, tmp_path, document_storage.base_dir)
+                assert result.returncode == 1, result.stdout + result.stderr
+                expected = "mismatch" if marker_kind == "foreign-key" else "unresolved"
+                assert json.loads(result.stdout) == {expected: 1}
+                assert await document_storage.read(marker_key) == marker_bytes
+                assert await document_storage.read(key) == b"rollback"
+                download = await api.get(f"{URL}/{active.id}")
+                assert download.status_code == 200 and download.content == CONTENT
+                async with document_sessions() as db:
+                    assert [row.id for row in (await db.scalars(select(Document))).all()] == [
+                        active.id
+                    ]
+                assert len(stored_files(document_storage)) == 3
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("delete_fails", [False, True])
+def test_real_rollback_with_enospc_confirmation_compensates_when_possible(
+    document_sessions, document_storage, monkeypatch, caplog, delete_fails
+):
+    class FailBeforeCommit(AsyncSession):
+        async def flush(self, objects=None):
+            await super().flush(objects)
+            raise RuntimeError("synthetic failure before COMMIT")
+
+    dao = DocumentDAO(
+        async_sessionmaker(
+            document_sessions.kw["bind"], class_=FailBeforeCommit, expire_on_commit=False
+        )
+    )
+    replace = storage_module.os.replace
+    real_delete = document_storage.delete
+    replacements, deletions = [], []
+
+    def enospc_on_confirmation(source, destination, **kwargs):
+        if str(destination).endswith("upload-reconciliation.json"):
+            replacements.append(destination)
+            if len(replacements) == 2:
+                raise OSError(errno.ENOSPC, "synthetic full disk on marker replacement")
+        return replace(source, destination, **kwargs)
+
+    async def delete(key):
+        deletions.append(key)
+        if delete_fails:
+            raise OSError(errno.EIO, "synthetic content deletion failure")
+        return await real_delete(key)
+
+    monkeypatch.setattr(storage_module.os, "replace", enospc_on_confirmation)
+    monkeypatch.setattr(document_storage, "delete", delete)
+
+    async def scenario():
+        async with documents_client(dao, document_storage) as api:
+            response = await api.post(URL, files={"file": ("synthetic.pdf", CONTENT)})
+            assert response.status_code == 500
+            assert len(replacements) == 2
+            assert len(deletions) == (1 if delete_fails else 2)
+            async with document_sessions() as db:
+                assert (await db.scalars(select(Document))).all() == []
+            assert await document_storage.exists(deletions[0]) == delete_fails
+            markers = await document_storage.list_upload_intents()
+            assert len(markers) == int(delete_fails)
+            assert len(stored_files(document_storage)) == (2 if delete_fails else 0)
+            assert deletions[0] in caplog.text
+            assert "doc_id=" in caplog.text and "intent_key=" in caplog.text
+            if delete_fails:
+                assert await document_storage.read(deletions[0]) == CONTENT
+                marker = json.loads(await document_storage.read(markers[0]))
+                assert marker.get("outcome", "unknown") == "unknown"
+                assert marker["storage_key"] == deletions[0]
 
     asyncio.run(scenario())
 

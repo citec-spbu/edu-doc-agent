@@ -1,6 +1,7 @@
 """Завершение записи, компенсация и неопределённый исход загрузки #52."""
 
 import asyncio
+import errno
 import json
 import threading
 from datetime import UTC, datetime
@@ -65,6 +66,53 @@ def test_cancellation_during_replace_finishes_metadata(tmp_path, monkeypatch):
         values = dao.create_document.call_args.kwargs
         assert await storage.read(values["storage_key"]) == CONTENT
         assert len(list(tmp_path.rglob("*.*"))) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cleanup", ["delete", "already-absent", "failure"])
+def test_rollback_marker_enospc_still_attempts_compensation(tmp_path, monkeypatch, caplog, cleanup):
+    delete_fails = cleanup == "failure"
+    storage = LocalFileStorage(tmp_path)
+    dao = SimpleNamespace(
+        create_document=AsyncMock(side_effect=DocumentCreateRolledBackError("confirmed rollback"))
+    )
+    real_save, real_delete = storage.save, storage.delete
+    deleted = []
+
+    async def fail_confirmation(**kwargs):
+        if kwargs["filename"] == "upload-reconciliation.json":
+            if json.loads(kwargs["content"]).get("outcome") == "rolled_back":
+                if cleanup == "already-absent":
+                    values = dao.create_document.call_args.kwargs
+                    await real_delete(values["storage_key"])
+                raise OSError(errno.ENOSPC, "synthetic full disk")
+        return await real_save(**kwargs)
+
+    async def delete(key):
+        deleted.append(key)
+        if delete_fails:
+            raise OSError(errno.EIO, "synthetic unlink failure")
+        return await real_delete(key)
+
+    monkeypatch.setattr(storage, "save", fail_confirmation)
+    monkeypatch.setattr(storage, "delete", delete)
+
+    async def scenario():
+        with pytest.raises(DocumentCreateRolledBackError):
+            await upload(dao, storage)
+        values = dao.create_document.call_args.kwargs
+        key = values["storage_key"]
+        assert deleted[0] == key
+        assert await storage.exists(key) == delete_fails
+        markers = await storage.list_upload_intents()
+        assert len(markers) == int(delete_fails)
+        assert len(deleted) == (1 if delete_fails else 2)
+        assert str(values["doc_id"]) in caplog.text
+        assert key in caplog.text
+        if delete_fails:
+            assert await storage.read(key) == CONTENT
+            assert json.loads(await storage.read(markers[0])).get("outcome", "unknown") == "unknown"
 
     asyncio.run(scenario())
 

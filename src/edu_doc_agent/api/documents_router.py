@@ -246,9 +246,25 @@ async def upload_document(
         except DocumentCreateRolledBackError:
             # Свидетельство rollback должно пережить сбой удаления файла
             # и перезапуск API. Обычного намерения и пустого SELECT недостаточно.
-            intent_key = await record_upload_rollback(
-                storage, session_id=session_id, doc_id=doc_id, storage_key=storage_key
-            )
+            try:
+                await record_upload_rollback(
+                    storage,
+                    session_id=session_id,
+                    doc_id=doc_id,
+                    storage_key=storage_key,
+                    filename=filename,
+                )
+            except Exception:
+                # Текущий вызов знает rollback и ключ прямо из save, даже
+                # если сохранить это свидетельство для нового процесса нельзя.
+                logger.exception(
+                    "Не удалось записать подтверждение rollback: "
+                    "session_id=%s doc_id=%s storage_key=%s intent_key=%s",
+                    session_id,
+                    doc_id,
+                    storage_key,
+                    intent_key,
+                )
             if await _cleanup_storage(storage, storage_key):
                 await _cleanup_storage(storage, intent_key)
             raise

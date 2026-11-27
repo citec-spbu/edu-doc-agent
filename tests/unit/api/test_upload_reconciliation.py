@@ -100,16 +100,23 @@ def test_invalid_marker_retained_without_querying_database(tmp_path):
 
 
 @pytest.mark.parametrize("failure_at", ["content", "marker"])
+@pytest.mark.parametrize(
+    "filename", ["test.docx", "Учебная программа ё" * 40 + ".docx"], ids=["short", "long-unicode"]
+)
 def test_cli_rollback_cleanup_is_repeatable_after_another_disk_failure(
-    tmp_path, monkeypatch, failure_at
+    tmp_path, monkeypatch, failure_at, filename
 ):
     from edu_doc_agent.reconcile_uploads import record_upload_rollback
 
     async def scenario():
         storage = LocalFileStorage(tmp_path)
         doc_id, key, marker = await seed(storage)
+        await storage.delete(key)
+        key = await storage.save(
+            session_id="synthetic", doc_id=doc_id, filename=filename, content=b"synthetic bytes"
+        )
         await record_upload_rollback(
-            storage, session_id="synthetic", doc_id=doc_id, storage_key=key
+            storage, session_id="synthetic", doc_id=doc_id, storage_key=key, filename=filename
         )
         real_delete = storage.delete
 
@@ -140,7 +147,7 @@ def test_rollback_evidence_does_not_override_contradiction_or_database_outage(tm
         storage = LocalFileStorage(tmp_path)
         doc_id, key, marker = await seed(storage)
         await record_upload_rollback(
-            storage, session_id="synthetic", doc_id=doc_id, storage_key=key
+            storage, session_id="synthetic", doc_id=doc_id, storage_key=key, filename="test.docx"
         )
         lookup = AsyncMock(
             return_value=SimpleNamespace(session_id="synthetic", id=doc_id, storage_key=key)

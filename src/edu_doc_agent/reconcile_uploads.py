@@ -29,22 +29,25 @@ class UploadIntent(BaseModel):
     session_id: str = Field(min_length=1)
     doc_id: UUID
     storage_key: str = Field(min_length=1)
+    filename: str | None = Field(default=None, min_length=1)
     outcome: Literal["unknown", "rolled_back"] = "unknown"
 
 
 async def record_upload_rollback(
-    storage: FileStorage, *, session_id: str, doc_id: UUID, storage_key: str
+    storage: FileStorage, *, session_id: str, doc_id: UUID, storage_key: str, filename: str
 ) -> str:
-    """Сохраняет подтверждение DAO до любой попытки удалить исходные байты.
+    """Сохраняет подтверждение DAO для компенсации после перезапуска.
 
     Вызывать только после DocumentCreateRolledBackError: исключения COMMIT
     и пустой SELECT такого свидетельства не дают. save заменяет маркер атомарно.
+    filename — исходное имя из save, до нормализации и сокращения пути.
     """
     intent = UploadIntent(
         version=1,
         session_id=session_id,
         doc_id=doc_id,
         storage_key=storage_key,
+        filename=filename,
         outcome="rolled_back",
     )
     return await storage.save(
@@ -107,6 +110,21 @@ async def reconcile_uploads(dao: DocumentDAO, storage: LocalFileStorage) -> dict
             break
         if doc is None:
             if intent.outcome == "rolled_back":
+                # Старые подтверждения не содержат исходного имени. Ключ из
+                # JSON сам по себе не доказывает принадлежность байтов.
+                if intent.filename is None:
+                    counts["unresolved"] += 1
+                    continue
+                try:
+                    expected_key = storage.key_for(
+                        intent.session_id, intent.doc_id, intent.filename
+                    )
+                except (ValueError, FileStorageError):
+                    counts["invalid"] += 1
+                    continue
+                if expected_key != intent.storage_key:
+                    counts["mismatch"] += 1
+                    continue
                 try:
                     # Маркер удаляется последним: сбой между двумя delete
                     # оставляет свидетельство для нового процесса. Отсутствие
