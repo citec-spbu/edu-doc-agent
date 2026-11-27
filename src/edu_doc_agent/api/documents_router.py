@@ -280,9 +280,9 @@ async def delete_document(
     dao: Annotated[DocumentDAO, Depends(get_document_dao)],
     storage: Annotated[FileStorage, Depends(get_file_storage)],
 ) -> Response:
-    """Удаляет документ из БД и файлового хранилища (запрещено при активном запуске)."""
+    """Повторяемо удаляет файл и метаданные (запрещено при активном запуске)."""
     try:
-        storage_key = await dao.delete_document(session_id=session_id, doc_id=doc_id)
+        storage_key = await dao.prepare_document_deletion(session_id=session_id, doc_id=doc_id)
     except ActiveRunConflictError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -297,10 +297,24 @@ async def delete_document(
 
     try:
         await storage.delete(storage_key)
-    except Exception:
+    except (OSError, FileStorageError) as exc:
         logger.exception(
-            "Запись документа удалена из БД, но не удалось удалить файл: storage_key=%s",
+            "Не удалось удалить файл; метаданные сохранены для повтора DELETE: storage_key=%s",
             storage_key,
         )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Не удалось удалить файл документа. Повторите запрос удаления.",
+        ) from exc
+
+    # False от storage.delete означает, что файл уже отсутствует: это также
+    # успех, в частности после отмены запроса между удалением файла и commit БД.
+    try:
+        await dao.delete_document(session_id=session_id, doc_id=doc_id, storage_key=storage_key)
+    except ActiveRunConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Нельзя удалить документ во время активного запуска обработки.",
+        ) from exc
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)

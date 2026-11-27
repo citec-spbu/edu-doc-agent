@@ -2,7 +2,7 @@
 
 from uuid import UUID
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -78,34 +78,63 @@ class DocumentDAO:
             result = await db.execute(stmt)
             return result.scalar_one_or_none()
 
-    async def delete_document(self, session_id: str, doc_id: UUID) -> str | None:
-        """Удаляет запись документа и возвращает storage_key (или None, если не найден).
+    async def _lock_deletable_session(self, db: AsyncSession, session_id: str) -> bool:
+        """Сериализует DELETE с созданием Run через блокировку родительской Session."""
+        session_stmt = select(Session.id).where(Session.id == session_id).with_for_update()
+        if (await db.execute(session_stmt)).scalar_one_or_none() is None:
+            return False
+
+        active_run_stmt = (
+            select(Run.id)
+            .where(Run.session_id == session_id, Run.status.in_(ACTIVE_RUN_STATUSES))
+            .limit(1)
+        )
+        if (await db.execute(active_run_stmt)).scalar_one_or_none() is not None:
+            raise ActiveRunConflictError(session_id)
+        return True
+
+    async def prepare_document_deletion(self, session_id: str, doc_id: UUID) -> str | None:
+        """Фиксирует намерение удалить документ, сохраняя его ключ для повторов.
 
         Бросает ActiveRunConflictError, если в сессии есть активный Run.
-        Блокирует строку Session (FOR UPDATE), чтобы избежать гонки с созданием Run.
+        Повтор возвращает тот же ключ, в том числе после перезапуска API.
+        Транзакция завершается до обращения к файловому хранилищу.
         """
         async with self._session_factory() as db:
-            session_stmt = select(Session.id).where(Session.id == session_id).with_for_update()
-            session_exists = (await db.execute(session_stmt)).scalar_one_or_none()
-            if session_exists is None:
+            if not await self._lock_deletable_session(db, session_id):
                 return None
 
-            active_run_stmt = (
-                select(Run.id)
-                .where(
-                    Run.session_id == session_id,
-                    Run.status.in_(ACTIVE_RUN_STATUSES),
-                )
-                .limit(1)
-            )
-            if (await db.execute(active_run_stmt)).scalar_one_or_none() is not None:
-                raise ActiveRunConflictError(session_id)
-
-            delete_stmt = (
-                delete(Document)
+            stmt = (
+                update(Document)
                 .where(Document.id == doc_id, Document.session_id == session_id)
+                .values(deletion_pending=True)
                 .returning(Document.storage_key)
             )
-            storage_key = (await db.execute(delete_stmt)).scalar_one_or_none()
+            storage_key = (await db.execute(stmt)).scalar_one_or_none()
             await db.commit()
             return storage_key
+
+    async def delete_document(self, session_id: str, doc_id: UUID, *, storage_key: str) -> None:
+        """Подтверждает удаление метаданных после успешной очистки хранилища.
+
+        Проверяет активный Run повторно под блокировкой Session. При отказе
+        запись остаётся для повтора, даже если файл уже удалён. Если другой
+        DELETE уже завершил удаление этой записи, подтверждение ничего не делает.
+        """
+        async with self._session_factory() as db:
+            if not await self._lock_deletable_session(db, session_id):
+                return
+
+            delete_stmt = delete(Document).where(
+                Document.id == doc_id,
+                Document.session_id == session_id,
+                Document.storage_key == storage_key,
+                Document.deletion_pending.is_(True),
+            )
+            await db.execute(delete_stmt)
+            remaining = await db.scalar(
+                select(Document.id).where(Document.id == doc_id, Document.session_id == session_id)
+            )
+            if remaining is not None:
+                raise RuntimeError("Document deletion was not prepared for this storage key")
+            await db.commit()

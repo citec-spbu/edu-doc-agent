@@ -64,6 +64,15 @@ curl -i -X POST http://localhost:8000/api/v1/sessions/local-demo/process
 В терминале worker должно появиться сообщение о завершении с тем же `run_id`.
 Сейчас выполняется задача-заглушка; это проверка связки API → Redis → worker.
 
+Пока run активен, повторный POST той же сессии возвращает `409`. Статус доступен
+через `GET /api/v1/sessions/{session_id}/runs/{run_id}`; после терминального
+статуса новый POST получает `202` с другим `run_id`. Heartbeat и Reconciler
+восстанавливают зависшие `running` и потерянные `queued` по настройкам
+`RUN_HEARTBEAT_INTERVAL_SECONDS`, `RUN_STALE_RUNNING_SECONDS`,
+`RUN_STALE_QUEUED_SECONDS` и `RUN_MAX_RECONCILE_ATTEMPTS` из [.env.example](.env.example).
+Контракты владения, доставки и границы восстановления описаны в
+[архитектуре backend](docs/backend-architecture.md#асинхронная-обработка-документов-api-arq).
+
 Чтобы завершить локальный запуск, остановите API, worker и UI через `Ctrl+C`,
 затем выполните `docker compose stop db redis`.
 
@@ -76,6 +85,15 @@ make migrate-docker && make up
 `make migrate-docker` дожидается готовности PostgreSQL и запускает Alembic
 в одноразовом контейнере из образа API с настройками БД из Compose.
 Выполняйте эту команду перед запуском стека после добавления новых миграций.
+
+Обновление на версию с Heartbeat/Reconciler выполняется с остановкой сервиса:
+остановите старые API и **все** воркеры (для Compose — `docker compose stop api worker`),
+примените миграции новой версии (`make migrate-docker`), затем запустите новые
+API и воркеры (`make up`). Смешивать версии потребителей одной очереди нельзя:
+старый worker не поддерживает аргумент поколения `expected_reconcile_attempts`.
+При поочерёдном обновлении Reconciler можно включать только после замены всех
+потребителей; в текущей конфигурации он включён при старте, поэтому используется
+обновление с остановкой сервиса.
 
 Задавайте `POSTGRES_PASSWORD` в исходном виде. Локальные команды по умолчанию
 подключаются к `localhost:5432` и учитывают явно заданный `DATABASE_URL`.

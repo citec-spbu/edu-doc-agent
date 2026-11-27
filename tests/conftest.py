@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from arq.connections import ArqRedis
+from arq.constants import default_queue_name
 from arq.jobs import Job
 from fastapi.testclient import TestClient
 from starlette.datastructures import State
@@ -83,8 +84,11 @@ def isolated_app(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture
 def redis_pool() -> AsyncMock:
     pool = AsyncMock(spec=ArqRedis)
+    pool.default_queue_name = default_queue_name
     # redis.close обёрнут декоратором deprecation: autospec считает его sync.
     pool.close = AsyncMock()
+    # Redis возвращает awaitable; autospec для exists создаёт обычный Mock.
+    pool.exists = AsyncMock(return_value=0)
     pool.enqueue_job.return_value = Mock(spec=Job)
     return pool
 

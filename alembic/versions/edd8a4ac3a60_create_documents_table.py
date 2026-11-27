@@ -1,7 +1,7 @@
 """create documents table
 
 Revision ID: edd8a4ac3a60
-Revises: 9b4d2c6e8f10
+Revises: a6e91f0b2c43
 Create Date: 2026-11-25 02:39:29.767607
 
 """
@@ -14,7 +14,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "edd8a4ac3a60"
-down_revision: str | Sequence[str] | None = "9b4d2c6e8f10"
+down_revision: str | Sequence[str] | None = "a6e91f0b2c43"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -30,6 +30,7 @@ def upgrade() -> None:
         sa.Column("content_type", sa.String(), nullable=False),
         sa.Column("size_bytes", sa.BigInteger(), nullable=False),
         sa.Column("storage_key", sa.String(), nullable=False),
+        sa.Column("deletion_pending", sa.Boolean(), server_default=sa.false(), nullable=False),
         sa.Column("doc_type", sa.String(), nullable=True),
         sa.Column("derived_from", sa.Uuid(), nullable=True),
         sa.Column(
