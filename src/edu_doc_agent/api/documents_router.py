@@ -22,6 +22,7 @@ from fastapi import (
 )
 
 from edu_doc_agent.api.dependencies import get_document_dao, get_file_storage
+from edu_doc_agent.api.multipart import BoundedMultipartRoute
 from edu_doc_agent.api.schemas import DocumentListResponse, DocumentResponse
 from edu_doc_agent.config import get_settings
 from edu_doc_agent.dao import (
@@ -36,7 +37,7 @@ from edu_doc_agent.parsing import supported_suffixes
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/v1/sessions", tags=["documents"])
+router = APIRouter(prefix="/api/v1/sessions", tags=["documents"], route_class=BoundedMultipartRoute)
 
 _READ_CHUNK_SIZE = 64 * 1024  # 64 KiB
 _DEFAULT_CONTENT_TYPE = "application/octet-stream"
@@ -162,6 +163,8 @@ async def upload_document(
     """Загружает документ в хранилище и сохраняет его метаданные в PostgreSQL."""
     _validate_session_id(session_id)
     filename, suffix = _validate_upload_filename(file.filename)
+    if doc_type is not None and "\x00" in doc_type:
+        raise HTTPException(status_code=400, detail="Некорректный тип документа.")
     normalized_doc_type = (doc_type or "").strip() or None
 
     max_bytes = get_settings().max_upload_file_bytes
@@ -265,6 +268,7 @@ async def list_documents(
     dao: Annotated[DocumentDAO, Depends(get_document_dao)],
 ) -> DocumentListResponse:
     """Возвращает список документов, загруженных в рамках сессии."""
+    _validate_session_id(session_id)
     docs = await dao.list_by_session(session_id)
     return DocumentListResponse(items=[DocumentResponse.model_validate(d) for d in docs])
 
@@ -280,6 +284,7 @@ async def download_document(
     storage: Annotated[FileStorage, Depends(get_file_storage)],
 ) -> Response:
     """Возвращает бинарное содержимое документа."""
+    _validate_session_id(session_id)
     doc = await dao.get_document(session_id=session_id, doc_id=doc_id)
     if doc is None:
         raise HTTPException(
@@ -325,6 +330,7 @@ async def delete_document(
     storage: Annotated[FileStorage, Depends(get_file_storage)],
 ) -> Response:
     """Повторяемо удаляет файл и метаданные (запрещено при активном запуске)."""
+    _validate_session_id(session_id)
     try:
         storage_key = await dao.prepare_document_deletion(session_id=session_id, doc_id=doc_id)
     except ActiveRunConflictError as exc:
