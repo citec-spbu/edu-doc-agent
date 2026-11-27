@@ -20,6 +20,7 @@ from fastapi import (
     UploadFile,
     status,
 )
+from fastapi.routing import APIRoute
 
 from edu_doc_agent.api.dependencies import get_document_dao, get_file_storage
 from edu_doc_agent.api.multipart import BoundedMultipartRoute
@@ -31,9 +32,11 @@ from edu_doc_agent.dao import (
     FileStorage,
     FileStorageError,
     InvalidStoragePathError,
+    LocalFileStorage,
 )
 from edu_doc_agent.dao.documents import DocumentCreateRolledBackError
 from edu_doc_agent.parsing import supported_suffixes
+from edu_doc_agent.reconcile_uploads import clear_upload_marker
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,26 @@ def _validate_session_id(session_id: str) -> str:
             detail="Некорректный идентификатор сессии.",
         )
     return session_id
+
+
+async def _reject_empty_session_id() -> None:
+    """Пустой сегмент не совпадает с {session_id}, поэтому отклоняется явно."""
+    _validate_session_id("")
+
+
+# Только четыре операции Documents API; без зависимостей и разбора multipart.
+# UUID-конвертер оставляет неизвестные пути вне этих обработчиков.
+for _path, _methods in (
+    ("//documents", ["GET", "POST"]),
+    ("//documents/{doc_id:uuid}", ["GET", "DELETE"]),
+):
+    router.add_api_route(
+        _path,
+        _reject_empty_session_id,
+        methods=_methods,
+        include_in_schema=False,
+        route_class_override=APIRoute,
+    )
 
 
 def _validate_upload_filename(raw_filename: str | None) -> tuple[str, str]:
@@ -358,6 +381,13 @@ async def delete_document(
 
     try:
         await storage.delete(storage_key)
+        # До физического удаления строки остаётся подтверждение COMMIT POST.
+        # Ошибка очистки маркера сохраняет deletion_pending для повтора DELETE
+        # или локальной сверки; отсутствие публичного GET не используется.
+        if isinstance(storage, LocalFileStorage):
+            await clear_upload_marker(
+                storage, session_id=session_id, doc_id=doc_id, storage_key=storage_key
+            )
     except (OSError, FileStorageError) as exc:
         logger.exception(
             "Не удалось удалить файл; метаданные сохранены для повтора DELETE: storage_key=%s",

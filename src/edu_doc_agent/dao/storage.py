@@ -204,6 +204,22 @@ class LocalFileStorage:
     def base_dir(self) -> Path:
         return self._base_dir
 
+    def key_for(self, session_id: str, doc_id: UUID | str, filename: str) -> str:
+        """Вычисляет ключ без создания файла (для локального обслуживания)."""
+        return self._build_key(session_id, doc_id, filename)
+
+    async def list_upload_intents(self) -> list[str]:
+        """Находит локальные маркеры; дальнейшее чтение проверяет путь через FD."""
+
+        def scan() -> list[str]:
+            return sorted(
+                path.relative_to(self._base_dir).as_posix()
+                for path in self._base_dir.rglob("*upload-reconciliation.json")
+                if path.is_file()
+            )
+
+        return await asyncio.to_thread(scan)
+
     def resolve_path(self, storage_key: str) -> Path:
         """Возвращает путь для осмотра. Файловые операции работают через дескрипторы."""
         candidate = self._base_dir

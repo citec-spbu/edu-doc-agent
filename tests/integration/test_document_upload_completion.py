@@ -197,6 +197,8 @@ def test_committed_but_database_unavailable_for_reconciliation(upload_backend, m
 
 
 def test_empty_select_does_not_delete_file_before_late_commit(upload_backend, monkeypatch):
+    from edu_doc_agent.reconcile_uploads import reconcile_uploads
+
     sessions, dao, storage = upload_backend
 
     async def scenario():
@@ -226,6 +228,8 @@ def test_empty_select_does_not_delete_file_before_late_commit(upload_backend, mo
                 async with sessions() as db:
                     assert (await db.scalars(select(Document))).all() == []
                 assert len([p for p in storage.base_dir.rglob("*") if p.is_file()]) == 2
+                assert await reconcile_uploads(dao, storage) == {"unresolved": 1}
+                assert len([p for p in storage.base_dir.rglob("*") if p.is_file()]) == 2
             finally:
                 release.set()
                 await asyncio.gather(*outstanding)
@@ -236,5 +240,207 @@ def test_empty_select_does_not_delete_file_before_late_commit(upload_backend, mo
             assert download.status_code == 200
             assert download.content == CONTENT
             assert len(list(storage.base_dir.rglob("*upload-reconciliation.json"))) == 1
+            assert await reconcile_uploads(dao, storage) == {"confirmed": 1}
+            assert await storage.read(row.storage_key) == CONTENT
+            assert await reconcile_uploads(dao, storage) == {}
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("order", ["reconcile-delete", "delete-reconcile"])
+def test_recovery_from_new_app_and_both_cleanup_orders(upload_backend, monkeypatch, order):
+    from fastapi import FastAPI
+
+    from edu_doc_agent.api.documents_router import router
+    from edu_doc_agent.reconcile_uploads import reconcile_uploads
+
+    sessions, dao, storage = upload_backend
+    real_create = dao.create_document
+
+    async def lose_return(**kwargs):
+        await real_create(**kwargs)
+        raise ConnectionError("synthetic lost acknowledgement")
+
+    monkeypatch.setattr(dao, "create_document", lose_return)
+    monkeypatch.setattr(dao, "get_document", AsyncMock(side_effect=ConnectionError("outage")))
+
+    async def scenario():
+        async with client() as api:
+            response = await api.post(URL, files={"file": ("test.docx", CONTENT)})
+            assert response.status_code == 503
+        async with sessions() as db:
+            row = (await db.scalars(select(Document))).one()
+        assert len(list(storage.base_dir.rglob("*upload-reconciliation.json"))) == 1
+        recovered_dao = DocumentDAO(sessions)
+        recovered_storage = LocalFileStorage(storage.base_dir)
+        recovered = FastAPI()
+        recovered.include_router(router)
+        recovered.dependency_overrides[get_document_dao] = lambda: recovered_dao
+        recovered.dependency_overrides[get_file_storage] = lambda: recovered_storage
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=recovered), base_url="http://test"
+        ) as api:
+            download = await api.get(f"{URL}/{row.id}")
+            assert download.status_code == 200 and download.content == CONTENT
+            if order == "reconcile-delete":
+                assert await reconcile_uploads(recovered_dao, recovered_storage) == {"confirmed": 1}
+                assert await storage.read(row.storage_key) == CONTENT
+                assert not list(storage.base_dir.rglob("*upload-reconciliation.json"))
+                assert await reconcile_uploads(recovered_dao, recovered_storage) == {}
+            assert (await api.delete(f"{URL}/{row.id}")).status_code == 204
+            assert await reconcile_uploads(recovered_dao, recovered_storage) == {}
+            assert await reconcile_uploads(recovered_dao, recovered_storage) == {}
+        async with sessions() as db:
+            assert (await db.scalars(select(Document))).all() == []
+        assert not [path for path in storage.base_dir.rglob("*") if path.is_file()]
+
+    asyncio.run(scenario())
+
+
+def test_reconcile_pending_deletion_when_marker_cleanup_failed(upload_backend, monkeypatch):
+    from edu_doc_agent.dao import FileStorageError
+    from edu_doc_agent.reconcile_uploads import reconcile_uploads
+
+    sessions, dao, storage = upload_backend
+    real_create, real_get = dao.create_document, dao.get_document
+    original_delete = storage.delete
+
+    async def lose_return(**kwargs):
+        await real_create(**kwargs)
+        raise ConnectionError("synthetic lost acknowledgement")
+
+    monkeypatch.setattr(dao, "create_document", lose_return)
+    monkeypatch.setattr(dao, "get_document", AsyncMock(side_effect=ConnectionError("outage")))
+
+    async def fail_marker_delete(key):
+        if key.endswith("upload-reconciliation.json"):
+            raise FileStorageError("synthetic marker cleanup failure")
+        return await original_delete(key)
+
+    async def scenario():
+        async with client() as api:
+            assert (await api.post(URL, files={"file": ("test.docx", CONTENT)})).status_code == 503
+            monkeypatch.setattr(dao, "get_document", real_get)
+            async with sessions() as db:
+                row = (await db.scalars(select(Document))).one()
+            monkeypatch.setattr(storage, "delete", fail_marker_delete)
+            assert (await api.delete(f"{URL}/{row.id}")).status_code == 500
+            assert not await storage.exists(row.storage_key)
+            assert len(list(storage.base_dir.rglob("*upload-reconciliation.json"))) == 1
+            assert (await api.get(f"{URL}/{row.id}")).status_code == 404
+            assert (await api.get(URL)).json()["items"] == []
+            assert await dao.get_document_for_cleanup(SESSION_ID, row.id) is not None
+            monkeypatch.setattr(storage, "delete", original_delete)
+            assert await reconcile_uploads(
+                DocumentDAO(sessions), LocalFileStorage(storage.base_dir)
+            ) == {"confirmed": 1}
+            assert await reconcile_uploads(dao, storage) == {}
+            assert not list(storage.base_dir.rglob("*upload-reconciliation.json"))
+            assert (await api.delete(f"{URL}/{row.id}")).status_code == 204
+            assert not [path for path in storage.base_dir.rglob("*") if path.is_file()]
+
+    asyncio.run(scenario())
+
+
+def test_maintenance_cli_can_be_repeated(upload_backend, migrated_database, tmp_path):
+    import json
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    from uuid import uuid4
+
+    sessions, dao, storage = upload_backend
+
+    async def seed():
+        doc_id = uuid4()
+        key = await storage.save(
+            session_id=SESSION_ID, doc_id=doc_id, filename="test.docx", content=CONTENT
+        )
+        await dao.create_document(
+            session_id=SESSION_ID,
+            doc_id=doc_id,
+            filename="test.docx",
+            content_type="application/octet-stream",
+            size_bytes=len(CONTENT),
+            storage_key=key,
+        )
+        await storage.save(
+            session_id=SESSION_ID,
+            doc_id=doc_id,
+            filename="upload-reconciliation.json",
+            content=json.dumps(
+                {"version": 1, "session_id": SESSION_ID, "doc_id": str(doc_id), "storage_key": key}
+            ).encode(),
+        )
+        return key
+
+    key = asyncio.run(seed())
+    environment = {
+        name: os.environ[name] for name in ("PATH", "HOME", "SYSTEMROOT") if name in os.environ
+    }
+    environment.update(
+        DATABASE_URL=migrated_database.url.render_as_string(hide_password=False),
+        PYTHONPATH=str(Path(__file__).resolve().parents[2] / "src"),
+        PYTHONDONTWRITEBYTECODE="1",
+    )
+    for expected in ({"confirmed": 1}, {}):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "edu_doc_agent.reconcile_uploads",
+                "--storage-dir",
+                str(storage.base_dir),
+            ],
+            cwd=tmp_path,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert json.loads(result.stdout) == expected
+        assert asyncio.run(storage.read(key)) == CONTENT
+        assert not list(storage.base_dir.rglob("*upload-reconciliation.json"))
+
+    async def seed_unresolved():
+        doc_id = uuid4()
+        unknown_key = await storage.save(
+            session_id=SESSION_ID, doc_id=doc_id, filename="unknown.docx", content=CONTENT
+        )
+        await storage.save(
+            session_id=SESSION_ID,
+            doc_id=doc_id,
+            filename="upload-reconciliation.json",
+            content=json.dumps(
+                {
+                    "version": 1,
+                    "session_id": SESSION_ID,
+                    "doc_id": str(doc_id),
+                    "storage_key": unknown_key,
+                }
+            ).encode(),
+        )
+        return unknown_key
+
+    unknown_key = asyncio.run(seed_unresolved())
+    for _ in range(2):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "edu_doc_agent.reconcile_uploads",
+                "--storage-dir",
+                str(storage.base_dir),
+            ],
+            cwd=tmp_path,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert json.loads(result.stdout) == {"unresolved": 1}
+        assert asyncio.run(storage.read(unknown_key)) == CONTENT
+        assert len(list(storage.base_dir.rglob("*upload-reconciliation.json"))) == 1

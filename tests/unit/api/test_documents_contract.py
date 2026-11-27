@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 
 from edu_doc_agent.api import documents_router, multipart
 from edu_doc_agent.api.dependencies import get_document_dao, get_file_storage
-from edu_doc_agent.dao import ActiveRunConflictError, DocumentDAO, FileStorage
+from edu_doc_agent.dao import ActiveRunConflictError, DocumentDAO, FileStorage, FileStorageError
 from edu_doc_agent.dao.documents import DocumentCreateRolledBackError
 from edu_doc_agent.dao.storage import StorageFileNotFoundError
 from edu_doc_agent.main import app
@@ -81,6 +81,7 @@ def documents_api(monkeypatch):
         ]
 
     async def delete_document(session_id, doc_id):
+        """Return the cleanup key while hiding an accepted deletion from reads."""
         doc = state.rows.get(doc_id)
         if doc is None or doc.session_id != session_id:
             return None
@@ -214,6 +215,35 @@ def test_invalid_session_id_is_rejected_on_each_route(documents_api, session_id,
     response = api.client.request(method, url, **kwargs)
     assert 400 <= response.status_code < 500, response.text
     assert_no_writes(api)
+    assert api.dao.mock_calls == []
+    assert api.storage.mock_calls == []
+
+
+@pytest.mark.parametrize(
+    "method,item", [("GET", False), ("POST", False), ("GET", True), ("DELETE", True)]
+)
+def test_empty_session_segment_is_rejected_through_http(documents_api, method, item):
+    api = documents_api
+    url = "/api/v1/sessions//documents" + (f"/{uuid4()}" if item else "")
+    kwargs = {"files": {"file": ("sample.docx", CONTENT)}} if method == "POST" else {}
+    response = api.client.request(method, url, follow_redirects=False, **kwargs)
+    assert response.status_code in {400, 422}, response.text
+    assert api.dao.mock_calls == []
+    assert api.storage.mock_calls == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "/api/v1/sessions//unknown",
+        "/api/v1/sessions//documents/not-a-uuid",
+        "/api/v1/unknown",
+    ],
+)
+def test_unknown_route_still_returns_404(documents_api, url):
+    api = documents_api
+    response = api.client.get(url, follow_redirects=False)
+    assert response.status_code == 404, response.text
     assert api.dao.mock_calls == []
     assert api.storage.mock_calls == []
 
@@ -369,15 +399,23 @@ def test_openapi_download_describes_binary_for_all_supported_mimes(documents_api
 @pytest.mark.parametrize("run_status", ["queued", "running", "waiting_for_input"])
 def test_delete_with_active_run_returns_409(documents_api, run_status):
     api = documents_api
-    doc_id = UUID(upload(api).json()["id"])
+    created = upload(api).json()
+    doc_id = UUID(created["id"])
     api.active_run = run_status
     api.storage.reset_mock()
     response = api.client.delete(f"{URL}/{doc_id}")
     assert response.status_code == 409, response.text
     assert api.storage.mock_calls == []
+    api.storage.delete.assert_not_awaited()
     api.dao.delete_document.assert_awaited_once_with(session_id="synthetic-session", doc_id=doc_id)
     api.dao.complete_document_deletion.assert_not_awaited()
     assert doc_id in api.rows
+    listed = api.client.get(URL)
+    assert listed.status_code == 200
+    assert listed.json() == {"items": [created]}
+    downloaded = api.client.get(f"{URL}/{doc_id}")
+    assert downloaded.status_code == 200
+    assert downloaded.content == CONTENT
 
 
 def test_post_is_allowed_while_waiting_for_input(documents_api):
@@ -390,25 +428,72 @@ def test_post_is_allowed_while_waiting_for_input(documents_api):
     assert api.client.get(f"{URL}/{response.json()['id']}").content == CONTENT
 
 
-def test_delete_cleanup_failure_is_reported_and_retry_completes(documents_api):
+def test_successful_delete_hides_document_and_cleans_storage(documents_api):
+    api = documents_api
+    created = upload(api).json()
+    doc_id = UUID(created["id"])
+    key = api.rows[doc_id].storage_key
+    listed = api.client.get(URL)
+    assert listed.status_code == 200
+    assert listed.json() == {"items": [created]}
+    api.storage.reset_mock()
+
+    response = api.client.delete(f"{URL}/{doc_id}")
+
+    assert response.status_code == 204, response.text
+    assert response.content == b""
+    api.dao.delete_document.assert_awaited_once_with(session_id="synthetic-session", doc_id=doc_id)
+    api.storage.delete.assert_awaited_once_with(key)
+    assert key not in api.files
+    listed = api.client.get(URL)
+    assert listed.status_code == 200
+    assert listed.json() == {"items": []}
+    assert api.client.get(f"{URL}/{doc_id}").status_code == 404
+    api.storage.read.assert_not_awaited()
+
+
+@pytest.mark.parametrize("cleanup_error", [OSError, FileStorageError])
+@pytest.mark.parametrize("retry_run", [None, "queued", "running", "waiting_for_input"])
+def test_delete_cleanup_failure_is_reported_and_retry_completes(
+    documents_api, cleanup_error, retry_run
+):
     api = documents_api
     doc_id = UUID(upload(api).json()["id"])
     key = api.rows[doc_id].storage_key
     delete = api.storage.delete.side_effect
-    api.storage.delete.side_effect = OSError("synthetic cleanup unavailable")
+    api.storage.reset_mock()
+    api.storage.delete.side_effect = cleanup_error("synthetic cleanup unavailable")
     failed = api.client.delete(f"{URL}/{doc_id}")
     assert failed.status_code == 500, failed.text
+    api.storage.delete.assert_awaited_once_with(key)
     api.dao.complete_document_deletion.assert_not_awaited()
     assert doc_id in api.rows
     assert api.files[key] == CONTENT
-    assert api.client.get(URL).json() == {"items": []}
+    listed = api.client.get(URL)
+    assert listed.status_code == 200
+    assert listed.json() == {"items": []}
     assert api.client.get(f"{URL}/{doc_id}").status_code == 404
+    api.storage.read.assert_not_awaited()
+    # A Run starting after logical deletion must not block its accepted cleanup.
+    api.active_run = retry_run
     api.storage.delete.side_effect = delete
+    api.storage.delete.reset_mock()
     retried = api.client.delete(f"{URL}/{doc_id}")
     assert retried.status_code == 204, retried.text
     assert retried.content == b""
+    api.storage.delete.assert_awaited_once_with(key)
+    assert api.dao.delete_document.await_count == 2
+    assert all(
+        call.kwargs == {"session_id": "synthetic-session", "doc_id": doc_id}
+        for call in api.dao.delete_document.await_args_list
+    )
     assert key not in api.files
     assert doc_id not in api.rows
     api.dao.complete_document_deletion.assert_awaited_once_with(
         session_id="synthetic-session", doc_id=doc_id, storage_key=key
     )
+    listed = api.client.get(URL)
+    assert listed.status_code == 200
+    assert listed.json() == {"items": []}
+    assert api.client.get(f"{URL}/{doc_id}").status_code == 404
+    api.storage.read.assert_not_awaited()

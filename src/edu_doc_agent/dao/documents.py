@@ -105,6 +105,21 @@ class DocumentDAO:
                 )
             )
 
+    async def get_document_for_reconciliation(
+        self, session_id: str, doc_id: UUID
+    ) -> Document | None:
+        """Служебное чтение исхода POST, включая логически удалённые строки.
+
+        Только найденная строка подтверждает фиксацию. None не доказывает откат.
+        """
+        async with self._session_factory() as db:
+            return await db.scalar(
+                select(Document).where(
+                    Document.id == doc_id,
+                    Document.session_id == session_id,
+                )
+            )
+
     async def delete_document(self, session_id: str, doc_id: UUID) -> str | None:
         """Логически удаляет документ и возвращает ключ для очистки хранилища.
 
