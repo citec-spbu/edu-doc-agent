@@ -1,0 +1,252 @@
+# Образовательный стандарт высшего образования СПбГУ (приказ № 11144/1 от 24.08.2026).
+# Цитаты скопированы из корпуса нормативов (ADR-0005), id фрагментов — из него же.
+
+- id: spbu-ukb-codes
+  title: Компетенции УКБ дисциплины есть в Образовательном стандарте СПбГУ
+  rule_set: spbu
+  applies_to: course
+  doc_kinds: [discipline, practice]
+  method: code
+  check: codes_in_list
+  params:
+    prefixes: [УКБ]
+    codes: [УКБ-1, УКБ-2, УКБ-3, УКБ-4]
+  severity: error
+  fixable: true
+  requirement:
+    quote: "универсальные компетенции, установленные настоящим Образовательным стандартом СПбГУ (Приложение к Образовательному стандарту СПбГУ)"
+    clause_id: "spbu-os:3.3"
+    edition: "11144/1 от 24.08.2026"
+
+- id: spbu-program-competence-groups
+  title: В программе есть все компетенции УКБ и группы компетенций по стандарту СПбГУ
+  rule_set: spbu
+  applies_to: program
+  doc_kinds: [curriculum, characteristic]
+  method: code
+  check: program_codes_present
+  params:
+    codes: [УКБ-1, УКБ-2, УКБ-3, УКБ-4]
+    prefixes: [УК, ОПК, ПКА, ПКП]
+  severity: error
+  fixable: true
+  requirement:
+    quote: "универсальные компетенции, установленные настоящим Образовательным стандартом СПбГУ (Приложение к Образовательному стандарту СПбГУ)"
+    clause_id: "spbu-os:3.3"
+    edition: "11144/1 от 24.08.2026"
+
+- id: spbu-ukb-wording
+  title: Формулировки компетенций УКБ совпадают со стандартом СПбГУ
+  rule_set: spbu
+  applies_to: program
+  doc_kinds: [curriculum, characteristic]
+  method: code
+  check: competence_wording_matches
+  params:
+    wordings:
+      УКБ-1: "Способен участвовать в разработке и реализации проектов, в т.ч. предпринимательских"
+      УКБ-2: "Способен устанавливать и поддерживать взаимоотношения в социальной и профессиональной сфере, исходя из нетерпимости к коррупционному поведению и проявлениям экстремизма, учитывать культурно-исторический опыт России, содействовать сохранению и укреплению традиционных российских духовно-нравственных ценностей"
+      УКБ-3: "Способен понимать сущность и значение информации в развитии общества, использовать основные методы получения и работы с информацией с учетом современных технологий цифровой экономики, искусственного интеллекта и науки о данных, а также информационной безопасности"
+      УКБ-4: "Способен использовать базовые дефектологические знания в социальной и профессиональной сферах"
+  severity: warning
+  fixable: true
+  requirement:
+    quote: "универсальные компетенции, установленные настоящим Образовательным стандартом СПбГУ (Приложение к Образовательному стандарту СПбГУ)"
+    clause_id: "spbu-os:3.3"
+    edition: "11144/1 от 24.08.2026"
+
+- id: spbu-credit-hours
+  title: Одна зачётная единица — 36 академических часов
+  rule_set: spbu
+  applies_to: course
+  doc_kinds: [discipline, practice]
+  method: code
+  check: hours_match_credits
+  params:
+    hours_per_credit: 36
+  severity: error
+  fixable: true
+  requirement:
+    quote: "Единицей трудоемкости для всех образовательных программ СПбГУ устанавливается зачетная единица (з. е.), соответствующая 27 астрономическим (36 академическим) часам."
+    clause_id: "spbu-os:2.4"
+    edition: "11144/1 от 24.08.2026"
+
+- id: spbu-rpd-goals-outcomes-workload
+  title: В РПД и РПП есть цели, результаты обучения и трудоёмкость
+  rule_set: spbu
+  applies_to: documents
+  doc_kinds: [discipline, practice]
+  method: code
+  check: sections_present
+  params:
+    sections:
+      цели и задачи (аннотация): "цел.*задач|аннотац"
+      результаты обучения или компетенции: "результат|компетенц"
+      структура и трудоёмкость: "структура и содержание|трудо[её]мк"
+  severity: error
+  fixable: false  # раздел добавляется в самом документе
+  requirement:
+    quote: "цели и задачи и (или) аннотацию, с указанием трудоемкости и результатов обучения и (или) результатов освоения образовательной программы;"
+    clause_id: "spbu-os:2.2.4.1"
+    edition: "11144/1 от 24.08.2026"
+
+- id: spbu-rpd-assessment
+  title: В РПД и РПП есть оценочные средства и методические материалы
+  rule_set: spbu
+  applies_to: documents
+  doc_kinds: [discipline, practice]
+  method: code
+  check: sections_present
+  params:
+    sections:
+      средства контроля (оценочные средства): "оценочн|контрольно-измерительн|текущего контроля"
+      методические материалы: "методическ"
+  severity: error
+  fixable: false  # раздел добавляется в самом документе
+  requirement:
+    quote: "описание средств контроля качества освоения образовательной программы (фонда оценочных средств) и методические материалы;"
+    clause_id: "spbu-os:2.2.4.2"
+    edition: "11144/1 от 24.08.2026"
+
+- id: spbu-rpd-conditions
+  title: В РПД и РПП есть кадровое, материально-техническое и учебно-методическое обеспечение
+  rule_set: spbu
+  applies_to: documents
+  doc_kinds: [discipline, practice]
+  method: code
+  check: sections_present
+  params:
+    sections:
+      кадровое обеспечение: "кадров"
+      материально-техническое обеспечение: "материально-техническ"
+      учебно-методическое и информационное обеспечение: "методическое обеспечение|информационное обеспечение|литератур"
+  severity: error
+  fixable: false  # раздел добавляется в самом документе
+  requirement:
+    quote: "требования к условиям реализации образовательной программы с указанием минимальных характеристик и особенностей привлекаемых для реализации программы ресурсов: кадровых, материально-технических, учебно-методических;"
+    clause_id: "spbu-os:2.2.4.3"
+    edition: "11144/1 от 24.08.2026"
+
+- id: spbu-characteristic-language-form-duration
+  title: В общей характеристике указаны язык, форма и срок обучения
+  rule_set: spbu
+  applies_to: program
+  doc_kinds: [characteristic]
+  method: code
+  check: characteristic_fields_present
+  params:
+    fields:
+      languages: язык обучения
+      study_form: форма обучения
+      duration: срок обучения
+  severity: error
+  fixable: true
+  requirement:
+    quote: "указание языка (языков), формы (форм) и срока получения образования по образовательной программе;"
+    clause_id: "spbu-os:2.2.1.1"
+    edition: "11144/1 от 24.08.2026"
+
+- id: spbu-characteristic-annotation-mission
+  title: В общей характеристике есть аннотация и миссия программы
+  rule_set: spbu
+  applies_to: program
+  doc_kinds: [characteristic]
+  method: code
+  check: characteristic_fields_present
+  params:
+    fields:
+      annotation: аннотация
+      mission: миссия
+  severity: error
+  fixable: true
+  requirement:
+    quote: "аннотацию и миссию (стратегию развития) образовательной программы;"
+    clause_id: "spbu-os:2.2.1.2"
+    edition: "11144/1 от 24.08.2026"
+
+- id: spbu-characteristic-activity
+  title: В общей характеристике описана профессиональная деятельность выпускников
+  rule_set: spbu
+  applies_to: program
+  doc_kinds: [characteristic]
+  method: code
+  check: characteristic_fields_present
+  params:
+    fields:
+      areas: области профессиональной деятельности
+      activities: типы задач профессиональной деятельности
+  severity: error
+  fixable: true
+  requirement:
+    quote: "описание профессиональной деятельности выпускников образовательной программы с указанием областей,"
+    clause_id: "spbu-os:2.2.1.4"
+    edition: "11144/1 от 24.08.2026"
+
+- id: spbu-characteristic-results
+  title: В общей характеристике есть планируемые результаты освоения программы
+  rule_set: spbu
+  applies_to: program
+  doc_kinds: [characteristic]
+  method: code
+  check: characteristic_fields_present
+  params:
+    fields:
+      competences: компетенции выпускника
+  severity: error
+  fixable: true
+  requirement:
+    quote: "описание планируемых результатов освоения образовательной программы;"
+    clause_id: "spbu-os:2.2.1.5"
+    edition: "11144/1 от 24.08.2026"
+
+- id: spbu-characteristic-mapping
+  title: В общей характеристике результаты сопоставлены с трудовыми функциями
+  rule_set: spbu
+  applies_to: program
+  doc_kinds: [characteristic]
+  method: code
+  check: characteristic_fields_present
+  params:
+    fields:
+      mappings: сопоставление компетенций с трудовыми функциями
+  severity: error
+  fixable: true
+  requirement:
+    quote: "сопоставление результатов освоения образовательной программы с обобщенными трудовыми функциями"
+    clause_id: "spbu-os:2.2.1.6"
+    edition: "11144/1 от 24.08.2026"
+
+- id: spbu-study-form
+  title: Форма обучения бакалавриата — очная или очно-заочная
+  rule_set: spbu
+  applies_to: program
+  doc_kinds: [curriculum, characteristic]
+  method: code
+  check: study_form_allowed
+  params:
+    forms: [очная, очно-заочная]
+  severity: error
+  fixable: false
+  requirement:
+    quote: "Обучение по программе бакалавриата проводится в очной или очно-заочной форме"
+    clause_id: "spbu-os:2.8.1"
+    edition: "11144/1 от 24.08.2026"
+
+- id: spbu-plan-blocks
+  title: В учебном плане есть блоки «Дисциплины», «Практика» и «ГИА»
+  rule_set: spbu
+  applies_to: program
+  doc_kinds: [curriculum]
+  method: code
+  check: plan_blocks_present
+  params:
+    blocks:
+      Блок 1 «Дисциплины (модули)»: "Блок.1"
+      Блок 2 «Практика»: "Блок.2"
+      Блок 3 «Государственная итоговая аттестация»: "Блок.3"
+  severity: error
+  fixable: false
+  requirement:
+    quote: "Структура образовательной программы включает следующие блоки:"
+    clause_id: "spbu-os:2.3"
+    edition: "11144/1 от 24.08.2026"

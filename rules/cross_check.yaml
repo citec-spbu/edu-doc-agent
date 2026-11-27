@@ -1,0 +1,134 @@
+# Сверка данных документов без ссылки на норматив.
+
+- id: cross-check-rpd-semesters-sum-to-total
+  title: Трудоёмкость по семестрам даёт итог таблицы трудоёмкости
+  rule_set: cross_check
+  applies_to: course
+  doc_kinds: [discipline, practice]
+  method: code
+  check: semesters_sum_to_total
+  severity: error
+  fixable: true
+
+- id: cross-check-rpd-credits-vs-workload-table
+  title: Трудоёмкость дисциплины совпадает с итогом таблицы трудоёмкости
+  rule_set: cross_check
+  applies_to: course
+  doc_kinds: [discipline, practice]
+  method: code
+  check: credits_match_workload_table
+  severity: error
+  fixable: true
+
+- id: cross-check-credits-plan-vs-rpd
+  title: Трудоёмкость дисциплины совпадает в учебном плане и РПД
+  rule_set: cross_check
+  applies_to: documents
+  doc_kinds: [discipline, practice]
+  method: code
+  check: credits_match_plan
+  severity: error
+  fixable: true
+
+- id: cross-check-competences-plan-vs-rpd
+  title: Компетенции дисциплины совпадают в учебном плане и РПД
+  rule_set: cross_check
+  applies_to: documents
+  doc_kinds: [discipline, practice]
+  method: code
+  check: competences_match_plan
+  severity: error
+  fixable: true
+
+- id: cross-check-plan-vs-characteristic
+  title: Реквизиты программы совпадают в учебном плане и общей характеристике
+  rule_set: cross_check
+  applies_to: program
+  doc_kinds: [curriculum, characteristic]
+  method: code
+  check: plan_matches_characteristic
+  severity: error
+  fixable: false
+
+- id: cross-check-competence-names
+  title: Коды и формулировки компетенций совпадают с учебным планом
+  rule_set: cross_check
+  applies_to: program
+  doc_kinds: [curriculum]
+  method: code
+  check: competence_names_match_plan
+  severity: warning
+  fixable: false
+
+- id: cross-check-rpd-goals-vs-outcomes
+  title: Цели и результаты обучения соответствуют месту дисциплины в программе
+  rule_set: cross_check
+  applies_to: course
+  doc_kinds: [discipline]
+  method: llm
+  criterion: >-
+    Цели (раздел 1.1) и результаты обучения (раздел 1.3) соответствуют месту дисциплины в
+    программе. Результат обучения на своём месте, если он относится к целям дисциплины или к
+    любой компетенции, которую учебный план закрепляет за дисциплиной (формулировки и
+    результаты из ЦКМВ — в контексте программы), даже если он совпадает с результатами других
+    дисциплин. Нарушение — есть результаты, которые не относятся ни к целям, ни к закреплённым
+    компетенциям, или цели называют другую дисциплину.
+  fields: [title, goals, learning_outcomes]
+  severity: warning
+  fixable: false  # смысловое замечание: исправляет человек, автоправка не нужна
+
+- id: cross-check-competences-covered
+  title: Каждую компетенцию программы формирует хотя бы одна строка учебного плана
+  rule_set: cross_check
+  applies_to: program
+  doc_kinds: [curriculum]
+  method: code
+  check: competences_covered
+  severity: error
+  fixable: true
+
+- id: cross-check-matrix-vs-plan
+  title: Компетенции дисциплин совпадают в матрице компетенций и учебном плане
+  rule_set: cross_check
+  applies_to: program
+  doc_kinds: [curriculum, matrix]
+  method: code
+  check: matrix_matches_plan
+  severity: error
+  fixable: true
+
+- id: cross-check-duplicate-codes
+  title: Коды компетенций в перечнях документов не повторяются
+  rule_set: cross_check
+  applies_to: program
+  doc_kinds: [curriculum, characteristic, ckmv, discipline, practice]
+  method: code
+  check: no_duplicate_codes
+  severity: warning
+  fixable: true
+
+- id: cross-check-single-document-per-kind
+  title: Учебный план, характеристика, ЦКМВ и матрица загружены по одному файлу
+  rule_set: cross_check
+  applies_to: program
+  doc_kinds: [curriculum, characteristic, ckmv, matrix]
+  method: code
+  check: single_document_per_kind
+  severity: error
+  fixable: false
+
+- id: cross-check-contradictions
+  title: Семестры и часы в РПД не противоречат учебному плану
+  rule_set: cross_check
+  applies_to: documents
+  doc_kinds: [discipline, practice]
+  method: llm
+  criterion: >-
+    Семестры, часы контактной работы по видам занятий и часы самостоятельной работы в таблице
+    трудоёмкости РПД не противоречат строкам учебного плана этой дисциплины. Учебный план —
+    источник истины: при расхождении верно значение учебного плана, нарушение — в РПД; в
+    объяснении назови значение плана как верное. Трудоёмкость в з.е. и коды компетенций
+    проверяют другие правила, их расхождения не учитывай.
+  fields: [title, workload_table]
+  severity: warning
+  fixable: true
