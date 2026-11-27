@@ -44,6 +44,7 @@ _DEFAULT_CONTENT_TYPE = "application/octet-stream"
 _CANONICAL_CONTENT_TYPES: dict[str, str] = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".pdf": "application/pdf",
 }
 
 
@@ -155,7 +156,7 @@ async def _cleanup_storage(storage: FileStorage, storage_key: str) -> bool:
 )
 async def upload_document(
     session_id: Annotated[str, Path(..., description="ID сессии пользователя")],
-    file: Annotated[UploadFile, File(..., description="Файл документа ОП (.docx, .xlsx)")],
+    file: Annotated[UploadFile, File(..., description="Файл документа ОП (.docx, .xlsx, .pdf)")],
     dao: Annotated[DocumentDAO, Depends(get_document_dao)],
     storage: Annotated[FileStorage, Depends(get_file_storage)],
     doc_type: Annotated[str | None, Form(description="Тип документа (rpd, plan, ...)")] = None,
@@ -276,6 +277,16 @@ async def list_documents(
 @router.get(
     "/{session_id}/documents/{doc_id}",
     status_code=status.HTTP_200_OK,
+    response_class=Response,
+    responses={
+        200: {
+            "description": "Исходное бинарное содержимое документа (DOCX, XLSX или PDF).",
+            "content": {
+                media_type: {"schema": {"type": "string", "format": "binary"}}
+                for media_type in _CANONICAL_CONTENT_TYPES.values()
+            },
+        },
+    },
 )
 async def download_document(
     session_id: Annotated[str, Path(..., description="ID сессии пользователя")],

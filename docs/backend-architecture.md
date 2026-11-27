@@ -161,11 +161,24 @@ SHA-256 вычисляется от полного идентификатора 
 **Эндпоинты (префикс `/api/v1/sessions`):**
 
 - **`POST /{session_id}/documents`** (`201 Created`, `DocumentResponse`) — загрузка файла (`multipart/form-data`, опциональное поле `doc_type`).
-  - Проверяет расширение через `parsing.supported_suffixes()` (`.docx`, `.xlsx` → иначе `415 Unsupported Media Type`), непустое имя и содержимое (`400 Bad Request`) и лимит размера `MAX_UPLOAD_FILE_BYTES` (по умолчанию 50 МБ, чтение чанками → `413 Content Too Large`).
-  - Сохраняет байты через `FileStorage.save()`, затем идемпотентно гарантирует существование `Session` и пишет метаданные в `documents`. При сбое записи в БД или отмене запроса файл удаляется из `FileStorage`.
+  - Проверяет расширение без учёта регистра через `parsing.supported_suffixes()`: DOCX (`.docx`), XLSX (`.xlsx`) и PDF (`.pdf`); неподдерживаемое расширение → `415 Unsupported Media Type`. Непустое имя и содержимое обязательны (`400 Bad Request`).
+  - `MAX_UPLOAD_FILE_BYTES` ограничивает размер файловой части, а не всего multipart-запроса: по умолчанию 52 428 800 байт (50 МиБ). Ровно лимит разрешён; превышение → `413 Content Too Large`. Лимит проверяется при приёме потока до записи лишних байтов во временный файл и повторно при чтении файла чанками.
+  - Сохраняет исходные байты через `FileStorage.save()`, затем идемпотентно гарантирует существование `Session` и пишет метаданные в `documents`. Канонический MIME-тип определяется по расширению, независимо от присланного клиентом `Content-Type` (см. таблицу ниже).
+  - При отмене запроса начатая операция сохранения, записи метаданных и компенсации дожидается завершения даже при повторной отмене, после чего передаёт `CancelledError`. Отмена сама по себе не означает откат загрузки. При подтверждённом rollback до COMMIT файл удаляется; при ошибке компенсации сохраняется служебное намерение для сверки.
+  - До обращения к БД сохраняется служебный `upload-reconciliation.json` с исходными идентификаторами и ключом файла; он не виден как документ в API. При потере подтверждения COMMIT найденная запись с тем же ключом подтверждает успех. Пустой SELECT или недоступная БД не доказывают rollback: файл и намерение сохраняются, ответ → `503 Service Unavailable` с `doc_id` для сверки. После подтверждённого успеха намерение удаляется.
+  - POST разрешён при любом статусе `Run`, включая `queued`, `running` и `waiting_for_input`; в частности, пользователь может загрузить документ, запрошенный во время `waiting_for_input`.
 - **`GET /{session_id}/documents`** (`200 OK`, `DocumentListResponse`) — список метаданных документов сессии в порядке загрузки (`storage_key` в публичный ответ не попадает).
-- **`GET /{session_id}/documents/{doc_id}`** (`200 OK` / `404 Not Found`) — скачивание содержимого файла с `Content-Disposition` (UTF-8) и `media_type`. Если запись есть в БД, а файл отсутствует в `FileStorage`, возвращает `500 Internal Server Error`.
-- **`DELETE /{session_id}/documents/{doc_id}`** (`204 No Content` / `404 Not Found` / `409 Conflict`) — удаляет запись из БД и файл из `FileStorage`. Блокирует строку `Session` (`FOR UPDATE`) и запрещает мутации документов во время активного запуска: при наличии активного `Run` (`queued`, `running`, `waiting_for_input`) возвращает `409 Conflict` до проверки существования конкретного `doc_id`.
+- **`GET /{session_id}/documents/{doc_id}`** (`200 OK` / `404 Not Found`) — скачивание исходных байтов с каноническим `Content-Type`, `Content-Disposition: attachment` (ASCII-вариант `filename` и исходное UTF-8-имя в `filename*`) и `X-Content-Type-Options: nosniff`. OpenAPI объявляет ответ `200` для всех трёх MIME-типов с бинарной схемой (`type: string`, `format: binary`). Если запись есть в БД, а файл отсутствует в `FileStorage`, возвращает `500 Internal Server Error`.
+- **`DELETE /{session_id}/documents/{doc_id}`** (`204 No Content` / `404 Not Found` / `409 Conflict`) — сохраняет намерение удаления (`deletion_pending`) и ключ в БД, удаляет файл, затем метаданные. При ошибке удаления файла возвращает `500 Internal Server Error`, сохраняя метаданные для повтора DELETE. После отмены или сбоя между удалением файла и фиксацией БД повтор также разрешён: уже отсутствующий файл считается успешно удалённым. После завершённого удаления новый DELETE возвращает `404 Not Found`.
+  - Только DELETE заблокирован при активном `Run` (`queued`, `running`, `waiting_for_input`): под блокировкой строки `Session` (`FOR UPDATE`) возвращает `409 Conflict` до проверки существования конкретного `doc_id`. Статус повторно проверяется перед удалением метаданных; если появился активный Run, запись сохраняется для последующего повтора.
+
+Канонические MIME-типы в метаданных POST и в `Content-Type` скачивания:
+
+| Формат | MIME-тип |
+| --- | --- |
+| DOCX | `application/vnd.openxmlformats-officedocument.wordprocessingml.document` |
+| XLSX | `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` |
+| PDF | `application/pdf` |
 
 ## С4, уровень 3: Компоненты воркера
 
