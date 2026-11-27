@@ -209,6 +209,11 @@ def _plan_headers(table: MdTable) -> dict[int, dict[int, tuple[str, str]]]:
                     name = upper
                 if name:
                     columns[col] = (groups[col], _one_line(name))
+            if headers and not any(name.startswith("наименование") for _, name in columns.values()):
+                previous = next(reversed(headers.values()))
+                if all(previous.get(col) == value for col, value in columns.items()):
+                    # Неполная копия шапки с прежней раскладкой не отменяет полную.
+                    continue
             headers[i] = columns
             previous_groups = groups
     return headers
@@ -267,7 +272,11 @@ def _extract_entries(table: MdTable, file: str, plan: CurriculumPlan) -> bool:
             cols, contact, self_study = _entry_columns(columns)
             width = max(columns, default=-1) + 1
             if "name" not in cols:
-                return False
+                plan.warnings.append(
+                    f"{table.section}, строка {table.row_lines[idx]}: неполная шапка нагрузки; "
+                    "раскладка не совпадает с предыдущей, требуется проверка"
+                )
+                cols = {}
             continue
         if not cols:
             continue

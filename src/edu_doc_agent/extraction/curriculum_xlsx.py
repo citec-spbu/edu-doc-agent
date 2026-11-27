@@ -107,11 +107,14 @@ def _tables(block: Block, sheet: str, plan: CurriculumPlan) -> list[tuple[str, M
     return result
 
 
-def _merge_translations(table: MdTable, name_col: int, block_col: int = 0) -> MdTable:
+def _merge_translations(
+    table: MdTable, name_col: int, block_col: int = 0, columns: set[int] | None = None
+) -> MdTable:
     """Перевод связан объединением предметного поля, а не только общего блока.
 
     Одинаковый код блока сам по себе не повод склеить соседние дисциплины.
-    Остальные ячейки продолжения должны быть пустыми или повторять исходные.
+    Остальные ячейки продолжения внутри таблицы должны быть пустыми или повторять
+    исходные. Заметки за пределами её столбцов остаются только в цитате источника.
     """
     merged_cells: dict[tuple[int, int], tuple[int, int]] = {}
     merged_names: dict[int, int] = {}
@@ -125,19 +128,20 @@ def _merge_translations(table: MdTable, name_col: int, block_col: int = 0) -> Md
     rows, lines, quotes, end_lines = [], [], [], []
     anchor = -1
     for idx, row in enumerate(table.rows):
+        relevant = columns if columns is not None else set(range(len(row)))
         name = row[name_col]
         is_english = bool(re.search(r"[a-zA-Z]{2,}", name)) and not re.search(r"[а-яА-ЯёЁ]", name)
         same_cells = rows and all(
-            not c or c == rows[-1][col] for col, c in enumerate(row) if col != name_col
+            not row[col] or row[col] == rows[-1][col] for col in relevant if col != name_col
         )
         shared = {
             col
-            for col in range(len(row))
+            for col in relevant
             if (idx, col) in merged_cells
             and merged_cells[idx, col] == merged_cells.get((anchor, col))
         }
         continuation = shared and all(
-            not c or col in {name_col, block_col} or col in shared for col, c in enumerate(row)
+            not row[col] or col in {name_col, block_col} or col in shared for col in relevant
         )
         repeated_name = rows and idx < merged_names.get(anchor, 0) and name == rows[-1][name_col]
         translation = rows and is_english and continuation and not re.match(r"^\[\d+\]", name)
@@ -196,7 +200,10 @@ def _choice_groups(table: MdTable, cols: dict[str, int]) -> MdTable:
             end_lines.append(table.row_end_lines[idx])
             continue
         if choice is not None:
-            if (
+            choice_limit = "credits" in cols and re.match(
+                r"^(?:от|до)\s+\d", row[cols["credits"]], re.I
+            )
+            if not choice_limit and (
                 re.match(r"^\[\d+\]", name)
                 or (
                     row[cols.get("block", 0)].lower().startswith("блок")
@@ -256,10 +263,16 @@ def _prepare_entries(table: MdTable) -> MdTable:
         )
         header = _find_plan_header(chunk)
         if header is not None:
-            cols, _, _ = _entry_columns(header[1])
+            cols, contact, self_study = _entry_columns(header[1])
             if "name" in cols:
                 chunk = _choice_groups(
-                    _merge_translations(chunk, cols["name"], cols.get("block", 0)), cols
+                    _merge_translations(
+                        chunk,
+                        cols["name"],
+                        cols.get("block", 0),
+                        set(cols.values()) | contact.keys() | self_study.keys(),
+                    ),
+                    cols,
                 )
         result.rows.extend(chunk.rows)
         result.row_lines.extend(chunk.row_lines)
@@ -278,7 +291,11 @@ def extract_xlsx_plan(document: ParsedDocument, file: str) -> CurriculumPlan:
         elif block.kind == BlockKind.TABLE:
             for kind, table in _tables(block, sheet, plan):
                 if kind != "title":
-                    fingerprint = (kind, tuple(tuple(row) for row in table.rows))
+                    fingerprint = (
+                        kind,
+                        tuple(tuple(row) for row in table.rows),
+                        tuple(sorted((s.row, s.col, s.row_span, s.col_span) for s in table.spans)),
+                    )
                     previous = seen_sections.setdefault(fingerprint, sheet)
                     if previous != sheet:
                         plan.warnings.append(

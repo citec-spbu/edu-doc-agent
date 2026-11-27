@@ -82,8 +82,8 @@ def _words(stem: str) -> set[str]:
     return {w for w in stem.split() if w not in _STOP}
 
 
-def _meaning_signature(text: str) -> tuple[tuple[str, ...], bool]:
-    """Сохраняет порядок предикатов, отрицаний, сравнений и их числовых границ."""
+def _meaning_signature(text: str) -> tuple[tuple[tuple[str, ...], ...], bool]:
+    """Сохраняет предикаты и границы; независимые пороги с «и» допускают перестановку."""
     text = normalize(text)
     for pattern, operator in (
         (r"!=|≠", "≠"),
@@ -96,15 +96,29 @@ def _meaning_signature(text: str) -> tuple[tuple[str, ...], bool]:
         text = re.sub(pattern, f" {operator} ", text)
     sensitive = bool(re.search(r"[\d≥≤<>=≠]|\b(?:не|нет|нельзя|невозможно|запрещено)\b", text))
     tokens = re.findall(r"[+-]?\d+(?:[.,]\d+)?|[^\W\d_]+|[≥≤<>=≠%]", text)
-    return tuple(t.replace(",", ".") if re.search(r"\d", t) else t[:5] for t in tokens), sensitive
+    signature = tuple(t.replace(",", ".") if re.search(r"\d", t) else t[:5] for t in tokens)
+    # Переставлять можно целые независимые пороги, сохраняя число, знак и работу
+    # внутри каждого условия. Смешанную логику и условия без явного знака не упрощаем.
+    clauses = re.split(r"\bи\b", text)
+    if len(clauses) > 1 and not re.search(
+        r"[()]|\b(?:или|либо|если|то|когда|после|перед|затем|сначала)\b", text
+    ):
+        parts = [_meaning_signature(clause)[0][0] for clause in clauses]
+        if all(
+            any(t in {"≥", "≤", "<", ">", "=", "≠"} for t in part)
+            and any(re.search(r"\d", t) for t in part)
+            for part in parts
+        ):
+            return tuple(sorted(parts)), sensitive
+    return (signature,), sensitive
 
 
 def _same_meaning(a: str, b: str) -> bool:
-    """Для отрицаний/чисел — консервативное совпадение порядка, иначе сходство слов."""
+    """Сохраняет связь порогов/отрицаний с предикатами, иначе сравнивает слова."""
     signature_a, sensitive_a = _meaning_signature(a)
     signature_b, sensitive_b = _meaning_signature(b)
     if sensitive_a or sensitive_b:
-        return bool(signature_a) and signature_a == signature_b
+        return bool(signature_a[0]) and signature_a == signature_b
     wa, wb = _words(_stem(a)), _words(_stem(b))
     return bool(wa and wb) and len(wa & wb) / min(len(wa), len(wb)) >= 0.5
 

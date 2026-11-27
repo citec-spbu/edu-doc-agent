@@ -277,6 +277,20 @@ def _extract_outcome_table(table: MdTable, file: str, result: RPDExtraction) -> 
     if header is None:
         return
     header_idx, comp_col, out_col, ind_col = header
+    effective_codes: dict[int, list[str]] = {}
+    inherited_code: str | None = None
+    for idx, row in enumerate(table.rows):
+        if idx <= header_idx:
+            continue
+        codes = [
+            code
+            for code, _ in _parse_competence_cells(
+                row[comp_col] if comp_col is not None and comp_col < len(row) else ""
+            )
+        ]
+        if codes:
+            inherited_code = codes[0]
+        effective_codes[idx] = codes or ([inherited_code] if inherited_code else [])
     merged_codes: dict[tuple[int, int], list[str]] = {}
     for span in table.spans or []:
         if span.row_span <= 1 or not span.col <= out_col < span.col + span.col_span:
@@ -286,10 +300,8 @@ def _extract_outcome_table(table: MdTable, file: str, result: RPDExtraction) -> 
         merged_codes[span.row, span.col] = list(
             dict.fromkeys(
                 code
-                for row in table.rows[span.row : span.row + span.row_span]
-                for code, _ in _parse_competence_cells(
-                    row[comp_col] if comp_col is not None and comp_col < len(row) else ""
-                )
+                for idx in range(span.row, span.row + span.row_span)
+                for code in effective_codes.get(idx, [])
             )
         )
 
