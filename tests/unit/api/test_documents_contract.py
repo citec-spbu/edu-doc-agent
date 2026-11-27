@@ -58,28 +58,44 @@ def documents_api(monkeypatch):
 
     async def create(**values):
         values["id"] = values.pop("doc_id")
-        doc = SimpleNamespace(**values, derived_from=None, created_at=datetime.now(UTC))
+        doc = SimpleNamespace(
+            **values, derived_from=None, created_at=datetime.now(UTC), deletion_pending=False
+        )
         state.rows[doc.id] = doc
         state.events.append(("metadata", doc.storage_key))
         return doc
 
     async def get_document(session_id, doc_id):
         doc = state.rows.get(doc_id)
-        return doc if doc is not None and doc.session_id == session_id else None
+        return (
+            doc
+            if doc is not None and doc.session_id == session_id and not doc.deletion_pending
+            else None
+        )
 
     async def list_documents(session_id):
-        return [doc for doc in state.rows.values() if doc.session_id == session_id]
+        return [
+            doc
+            for doc in state.rows.values()
+            if doc.session_id == session_id and not doc.deletion_pending
+        ]
 
-    async def prepare_document_deletion(*, session_id, doc_id):
+    async def delete_document(session_id, doc_id):
+        doc = state.rows.get(doc_id)
+        if doc is None or doc.session_id != session_id:
+            return None
+        if doc.deletion_pending:
+            return doc.storage_key
         # The real DAO owns Run lookup; model its conflict at the API boundary.
         if state.active_run in {"queued", "running", "waiting_for_input"}:
             raise ActiveRunConflictError(state.active_run)
-        doc = await get_document(session_id, doc_id)
-        return doc.storage_key if doc is not None else None
+        doc.deletion_pending = True
+        return doc.storage_key
 
-    async def delete_document(*, session_id, doc_id, storage_key):
-        doc = await get_document(session_id, doc_id)
+    async def complete_document_deletion(*, session_id, doc_id, storage_key):
+        doc = state.rows.get(doc_id)
         assert doc is not None and doc.storage_key == storage_key
+        assert doc.session_id == session_id and doc.deletion_pending
         assert storage_key not in state.files
         del state.rows[doc_id]
 
@@ -89,8 +105,8 @@ def documents_api(monkeypatch):
     state.dao.create_document.side_effect = create
     state.dao.get_document.side_effect = get_document
     state.dao.list_by_session.side_effect = list_documents
-    state.dao.prepare_document_deletion.side_effect = prepare_document_deletion
     state.dao.delete_document.side_effect = delete_document
+    state.dao.complete_document_deletion.side_effect = complete_document_deletion
     settings = SimpleNamespace(max_upload_file_bytes=LIMIT)
     monkeypatch.setattr(documents_router, "get_settings", lambda: settings)
     monkeypatch.setattr(multipart, "get_settings", lambda: settings)
@@ -310,7 +326,7 @@ def test_foreign_document_without_active_run_returns_404(documents_api, method):
     url = f"/api/v1/sessions/other-session/documents/{doc_id}"
     response = api.client.request(method, url)
     assert response.status_code == 404, response.text
-    lookup = api.dao.get_document if method == "GET" else api.dao.prepare_document_deletion
+    lookup = api.dao.get_document if method == "GET" else api.dao.delete_document
     lookup.assert_awaited_once_with(session_id="other-session", doc_id=doc_id)
     assert api.storage.mock_calls == []
     assert api.rows[doc_id] is doc
@@ -359,7 +375,8 @@ def test_delete_with_active_run_returns_409(documents_api, run_status):
     response = api.client.delete(f"{URL}/{doc_id}")
     assert response.status_code == 409, response.text
     assert api.storage.mock_calls == []
-    api.dao.delete_document.assert_not_awaited()
+    api.dao.delete_document.assert_awaited_once_with(session_id="synthetic-session", doc_id=doc_id)
+    api.dao.complete_document_deletion.assert_not_awaited()
     assert doc_id in api.rows
 
 
@@ -369,7 +386,7 @@ def test_post_is_allowed_while_waiting_for_input(documents_api):
     response = upload(api)
     assert response.status_code == 201, response.text
     api.dao.create_document.assert_awaited_once()
-    api.dao.prepare_document_deletion.assert_not_awaited()
+    api.dao.delete_document.assert_not_awaited()
     assert api.client.get(f"{URL}/{response.json()['id']}").content == CONTENT
 
 
@@ -381,15 +398,17 @@ def test_delete_cleanup_failure_is_reported_and_retry_completes(documents_api):
     api.storage.delete.side_effect = OSError("synthetic cleanup unavailable")
     failed = api.client.delete(f"{URL}/{doc_id}")
     assert failed.status_code == 500, failed.text
-    api.dao.delete_document.assert_not_awaited()
+    api.dao.complete_document_deletion.assert_not_awaited()
     assert doc_id in api.rows
     assert api.files[key] == CONTENT
+    assert api.client.get(URL).json() == {"items": []}
+    assert api.client.get(f"{URL}/{doc_id}").status_code == 404
     api.storage.delete.side_effect = delete
     retried = api.client.delete(f"{URL}/{doc_id}")
     assert retried.status_code == 204, retried.text
     assert retried.content == b""
     assert key not in api.files
     assert doc_id not in api.rows
-    api.dao.delete_document.assert_awaited_once_with(
+    api.dao.complete_document_deletion.assert_awaited_once_with(
         session_id="synthetic-session", doc_id=doc_id, storage_key=key
     )

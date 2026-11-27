@@ -2,7 +2,7 @@
 
 from uuid import UUID
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -73,73 +73,82 @@ class DocumentDAO:
             return doc
 
     async def list_by_session(self, session_id: str) -> list[Document]:
-        """Возвращает список документов сессии в порядке загрузки."""
+        """Возвращает доступный пакет сессии без логически удалённых документов."""
         async with self._session_factory() as db:
             stmt = (
                 select(Document)
-                .where(Document.session_id == session_id)
+                .where(Document.session_id == session_id, Document.deletion_pending.is_(False))
                 .order_by(Document.created_at.asc(), Document.id.asc())
             )
             result = await db.execute(stmt)
             return list(result.scalars().all())
 
     async def get_document(self, session_id: str, doc_id: UUID) -> Document | None:
-        """Читает документ строго по паре (session_id, doc_id)."""
+        """Публичное чтение по паре (session_id, doc_id), без удаляемых документов."""
         async with self._session_factory() as db:
             stmt = select(Document).where(
                 Document.id == doc_id,
                 Document.session_id == session_id,
+                Document.deletion_pending.is_(False),
             )
             result = await db.execute(stmt)
             return result.scalar_one_or_none()
 
-    async def _lock_deletable_session(self, db: AsyncSession, session_id: str) -> bool:
-        """Сериализует DELETE с созданием Run через блокировку родительской Session."""
-        session_stmt = select(Session.id).where(Session.id == session_id).with_for_update()
-        if (await db.execute(session_stmt)).scalar_one_or_none() is None:
-            return False
+    async def get_document_for_cleanup(self, session_id: str, doc_id: UUID) -> Document | None:
+        """Служебное чтение незавершённого удаления; публичный GET его не использует."""
+        async with self._session_factory() as db:
+            return await db.scalar(
+                select(Document).where(
+                    Document.id == doc_id,
+                    Document.session_id == session_id,
+                    Document.deletion_pending.is_(True),
+                )
+            )
 
-        active_run_stmt = (
-            select(Run.id)
-            .where(Run.session_id == session_id, Run.status.in_(ACTIVE_RUN_STATUSES))
-            .limit(1)
-        )
-        if (await db.execute(active_run_stmt)).scalar_one_or_none() is not None:
-            raise ActiveRunConflictError(session_id)
-        return True
+    async def delete_document(self, session_id: str, doc_id: UUID) -> str | None:
+        """Логически удаляет документ и возвращает ключ для очистки хранилища.
 
-    async def prepare_document_deletion(self, session_id: str, doc_id: UUID) -> str | None:
-        """Фиксирует намерение удалить документ, сохраняя его ключ для повторов.
-
-        Бросает ActiveRunConflictError, если в сессии есть активный Run.
-        Повтор возвращает тот же ключ, в том числе после перезапуска API.
-        Транзакция завершается до обращения к файловому хранилищу.
+        COMMIT deletion_pending под FOR UPDATE Session — единственный момент
+        удаления. Вставка Run берёт конфликтующую FK-блокировку этой же Session:
+        если Run выиграл, первый DELETE получает ActiveRunConflictError без правок.
+        Уже принятое удаление повторяется с тем же ключом независимо от новых Run.
+        Файловый I/O выполняется после завершения этой транзакции.
         """
         async with self._session_factory() as db:
-            if not await self._lock_deletable_session(db, session_id):
+            session_stmt = select(Session.id).where(Session.id == session_id).with_for_update()
+            if (await db.execute(session_stmt)).scalar_one_or_none() is None:
                 return None
 
-            stmt = (
-                update(Document)
-                .where(Document.id == doc_id, Document.session_id == session_id)
-                .values(deletion_pending=True)
-                .returning(Document.storage_key)
+            doc = await db.scalar(
+                select(Document).where(Document.id == doc_id, Document.session_id == session_id)
             )
-            storage_key = (await db.execute(stmt)).scalar_one_or_none()
+            if doc is None:
+                return None
+            if doc.deletion_pending:
+                return doc.storage_key
+
+            active_run_stmt = (
+                select(Run.id)
+                .where(Run.session_id == session_id, Run.status.in_(ACTIVE_RUN_STATUSES))
+                .limit(1)
+            )
+            if (await db.execute(active_run_stmt)).scalar_one_or_none() is not None:
+                raise ActiveRunConflictError(session_id)
+
+            doc.deletion_pending = True
+            storage_key = doc.storage_key
             await db.commit()
             return storage_key
 
-    async def delete_document(self, session_id: str, doc_id: UUID, *, storage_key: str) -> None:
+    async def complete_document_deletion(
+        self, session_id: str, doc_id: UUID, *, storage_key: str
+    ) -> None:
         """Подтверждает удаление метаданных после успешной очистки хранилища.
 
-        Проверяет активный Run повторно под блокировкой Session. При отказе
-        запись остаётся для повтора, даже если файл уже удалён. Если другой
-        DELETE уже завершил удаление этой записи, подтверждение ничего не делает.
+        Решение уже принято в delete_document: новый Run не может его отменить.
+        Если другой DELETE завершил очистку, подтверждение ничего не делает.
         """
         async with self._session_factory() as db:
-            if not await self._lock_deletable_session(db, session_id):
-                return
-
             delete_stmt = delete(Document).where(
                 Document.id == doc_id,
                 Document.session_id == session_id,

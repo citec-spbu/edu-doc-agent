@@ -2,21 +2,24 @@
 
 import asyncio
 import errno
+import os
+import subprocess
+import sys
 from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import select, update
+from sqlalchemy import insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from edu_doc_agent.api.dependencies import get_document_dao, get_file_storage
 from edu_doc_agent.api.documents_router import router
-from edu_doc_agent.dao import Document, DocumentDAO, LocalFileStorage, Run, SessionRunDAO
+from edu_doc_agent.dao import Document, DocumentDAO, LocalFileStorage, Run, Session, SessionRunDAO
 from edu_doc_agent.dao import storage as storage_module
 from tests.integration.dao.support import Database
 
@@ -235,6 +238,342 @@ def test_physical_delete_failure_is_retryable_after_application_restart(
             await assert_absent(
                 api, document_sessions, restarted_storage, metadata["id"], row.storage_key
             )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("run_status", ["queued", "running", "waiting_for_input"])
+def test_logical_deletion_wins_before_new_run(
+    document_sessions: async_sessionmaker[AsyncSession],
+    document_storage: LocalFileStorage,
+    monkeypatch: pytest.MonkeyPatch,
+    run_status: str,
+) -> None:
+    async def scenario() -> None:
+        dao = DocumentDAO(document_sessions)
+        async with documents_client(dao, document_storage) as api:
+            metadata = await upload(api)
+            row = await read_document(document_sessions, metadata["id"])
+            assert row is not None
+            real_delete = document_storage.delete
+            visible_during_cleanup = []
+
+            async def start_run_then_unlink(key):
+                # Storage I/O начинается после COMMIT логического удаления.
+                run = await SessionRunDAO(document_sessions).create_queued_run(SESSION_ID)
+                async with document_sessions() as db:
+                    await db.execute(update(Run).where(Run.id == run.id).values(status=run_status))
+                    await db.commit()
+                listing = await api.get(URL)
+                download = await api.get(f"{URL}/{row.id}")
+                visible_during_cleanup.append((listing.json(), download.status_code))
+                return await real_delete(key)
+
+            monkeypatch.setattr(document_storage, "delete", start_run_then_unlink)
+            response = await api.delete(f"{URL}/{row.id}")
+            print(
+                f"DELETE first, {run_status}: HTTP {response.status_code}; "
+                f"during cleanup={visible_during_cleanup}; "
+                f"file={await document_storage.exists(row.storage_key)}"
+            )
+            assert response.status_code == 204, response.text
+            assert visible_during_cleanup == [({"items": []}, 404)]
+            await assert_absent(
+                api, document_sessions, document_storage, metadata["id"], row.storage_key
+            )
+
+    asyncio.run(scenario())
+
+
+async def wait_for_session_blocker(engine, blocker_pid: int) -> None:
+    """Наблюдаем настоящую блокировку, не предполагаем её после sleep."""
+    async with engine.connect() as observer, asyncio.timeout(5):
+        while True:
+            # pg_stat_activity кэширует снимок до конца транзакции наблюдателя.
+            await observer.commit()
+            if await observer.scalar(
+                text(
+                    "SELECT EXISTS (SELECT FROM pg_stat_activity "
+                    "WHERE :blocker = ANY(pg_blocking_pids(pid)))"
+                ),
+                {"blocker": blocker_pid},
+            ):
+                return
+            await asyncio.sleep(0.01)
+
+
+@pytest.mark.parametrize("run_status", ["queued", "running", "waiting_for_input"])
+def test_run_transaction_wins_before_delete(
+    document_sessions, document_storage, run_status
+) -> None:
+    async def scenario() -> None:
+        async with documents_client(DocumentDAO(document_sessions), document_storage) as api:
+            metadata = await upload(api)
+            row = await read_document(document_sessions, metadata["id"])
+            async with document_sessions() as writer:
+                # FK удерживает KEY SHARE на Session до COMMIT Run.
+                pid = await writer.scalar(text("SELECT pg_backend_pid()"))
+                await writer.execute(insert(Run).values(session_id=SESSION_ID, status=run_status))
+                request = asyncio.create_task(api.delete(f"{URL}/{row.id}"))
+                try:
+                    await wait_for_session_blocker(document_sessions.kw["bind"], pid)
+                    assert not request.done()
+                    await writer.commit()
+                    response = await request
+                finally:
+                    request.cancel()
+                    await asyncio.gather(request, return_exceptions=True)
+            assert response.status_code == 409, response.text
+            preserved = await read_document(document_sessions, metadata["id"])
+            assert preserved is not None and not preserved.deletion_pending
+            assert await document_storage.read(row.storage_key) == CONTENT
+            assert (await api.get(URL)).json() == {"items": [metadata]}
+            download = await api.get(f"{URL}/{row.id}")
+            assert download.status_code == 200 and download.content == CONTENT
+            print(f"Run first ({run_status}): DELETE=409; pending=False; list visible; GET=200")
+
+    asyncio.run(scenario())
+
+
+def test_delete_transaction_wins_before_run_insert(
+    document_sessions, document_storage, monkeypatch
+) -> None:
+    async def scenario() -> None:
+        commit_entered = asyncio.Event()
+        release_commit = asyncio.Event()
+        cleanup_entered = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        pids = []
+
+        class PauseCommit(AsyncSession):
+            async def commit(self):
+                await self.flush()  # deletion_pending уже записан, Session заблокирована.
+                pids.append(await self.scalar(text("SELECT pg_backend_pid()")))
+                commit_entered.set()
+                await release_commit.wait()
+                await super().commit()
+
+        engine = document_sessions.kw["bind"]
+        paused_sessions = async_sessionmaker(engine, class_=PauseCommit, expire_on_commit=False)
+        dao = DocumentDAO(paused_sessions)
+        real_delete = document_storage.delete
+
+        async def pause_cleanup(key):
+            cleanup_entered.set()
+            await release_cleanup.wait()
+            return await real_delete(key)
+
+        async with documents_client(DocumentDAO(document_sessions), document_storage) as api:
+            metadata = await upload(api)
+        async with documents_client(dao, document_storage) as api:
+            monkeypatch.setattr(document_storage, "delete", pause_cleanup)
+            request = asyncio.create_task(api.delete(f"{URL}/{metadata['id']}"))
+            run_task = None
+            try:
+                await asyncio.wait_for(commit_entered.wait(), 5)
+                run_task = asyncio.create_task(
+                    SessionRunDAO(document_sessions).create_queued_run(SESSION_ID)
+                )
+                await wait_for_session_blocker(engine, pids[0])
+                assert not run_task.done()
+                release_commit.set()
+                await asyncio.wait_for(run_task, 5)
+                await asyncio.wait_for(cleanup_entered.wait(), 5)
+                # Run стартовал, но удалённого документа уже нет в доступном пакете.
+                assert (await api.get(URL)).json() == {"items": []}
+                assert (await api.get(f"{URL}/{metadata['id']}")).status_code == 404
+                row = await dao.get_document_for_cleanup(SESSION_ID, UUID(metadata["id"]))
+                assert row is not None and await document_storage.exists(row.storage_key)
+                # Файловый этап не удерживает даже блокировку Session.
+                async with document_sessions() as observer:
+                    await observer.execute(text("SET LOCAL lock_timeout = '500ms'"))
+                    await observer.execute(
+                        select(Session.id).where(Session.id == SESSION_ID).with_for_update()
+                    )
+                release_cleanup.set()
+                assert (await asyncio.wait_for(request, 5)).status_code == 204
+                await assert_absent(
+                    api, document_sessions, document_storage, metadata["id"], row.storage_key
+                )
+            finally:
+                release_commit.set()
+                release_cleanup.set()
+                tasks = [request] + ([run_task] if run_task is not None else [])
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("run_status", ["queued", "running", "waiting_for_input"])
+@pytest.mark.parametrize("failure", ["storage", "cancel_after_unlink", "confirmation"])
+def test_accepted_delete_retries_in_new_process_with_active_run(
+    document_sessions, document_storage, monkeypatch, tmp_path, run_status, failure
+) -> None:
+    async def scenario() -> None:
+        dao = DocumentDAO(document_sessions)
+        async with documents_client(dao, document_storage) as api:
+            metadata = await upload(api)
+            row = await read_document(document_sessions, metadata["id"])
+            real_delete = document_storage.delete
+
+            async def failed_cleanup(key):
+                run = await SessionRunDAO(document_sessions).create_queued_run(SESSION_ID)
+                async with document_sessions() as db:
+                    await db.execute(update(Run).where(Run.id == run.id).values(status=run_status))
+                    await db.commit()
+                if failure == "storage":
+                    raise PermissionError("synthetic storage permission failure")
+                await real_delete(key)
+                if failure == "cancel_after_unlink":
+                    raise asyncio.CancelledError()
+
+            async def failed_confirmation(*args, **kwargs):
+                async with document_sessions() as db:
+                    await db.execute(Document.__table__.delete().where(Document.id == row.id))
+                    # Настоящий DELETE БД откатывается при выходе, файл уже удалён.
+                    raise RuntimeError("synthetic confirmation failure")
+
+            monkeypatch.setattr(document_storage, "delete", failed_cleanup)
+            if failure == "confirmation":
+                monkeypatch.setattr(dao, "complete_document_deletion", failed_confirmation)
+            if failure == "cancel_after_unlink":
+                with pytest.raises(asyncio.CancelledError):
+                    await api.delete(f"{URL}/{row.id}")
+            else:
+                assert (await api.delete(f"{URL}/{row.id}")).status_code == 500
+            assert (await api.get(URL)).json() == {"items": []}
+            assert (await api.get(f"{URL}/{row.id}")).status_code == 404
+            pending = await dao.get_document_for_cleanup(SESSION_ID, row.id)
+            assert pending is not None and pending.storage_key == row.storage_key
+            assert await dao.get_document_for_cleanup("foreign-session", row.id) is None
+            assert await document_storage.exists(row.storage_key) is (failure == "storage")
+            # Контракт issue #52: ровно два аргумента; активный Run не мешает повтору.
+            assert await dao.delete_document(SESSION_ID, row.id) == row.storage_key
+
+        root = Path(__file__).resolve().parents[2]
+        environment = {key: os.environ[key] for key in ("PATH", "HOME") if key in os.environ}
+        environment.update(
+            DATABASE_URL=document_sessions.kw["bind"].url.render_as_string(hide_password=False),
+            PYTHONPATH=os.pathsep.join((str(root), str(root / "src"))),
+            PYTHONDONTWRITEBYTECODE="1",
+        )
+        code = """
+import asyncio, os, sys
+from pathlib import Path
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
+from edu_doc_agent.dao import DocumentDAO, LocalFileStorage
+from tests.integration.test_documents_api import documents_client
+async def main():
+    engine = create_async_engine(os.environ['DATABASE_URL'], poolclass=NullPool)
+    try:
+        dao = DocumentDAO(async_sessionmaker(engine, expire_on_commit=False))
+        async with documents_client(dao, LocalFileStorage(Path(sys.argv[1]))) as api:
+            print((await api.delete(sys.argv[2])).status_code)
+    finally:
+        await engine.dispose()
+asyncio.run(main())
+"""
+        result = await asyncio.to_thread(
+            subprocess.run,
+            [sys.executable, "-c", code, str(document_storage.base_dir), f"{URL}/{row.id}"],
+            cwd=tmp_path,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.strip() == "204", result.stdout + result.stderr
+        async with documents_client(DocumentDAO(document_sessions), document_storage) as api:
+            await assert_absent(
+                api, document_sessions, document_storage, metadata["id"], row.storage_key
+            )
+            assert await dao.delete_document(SESSION_ID, row.id) is None
+        print(f"{failure}, {run_status}: new-process retry=204; DB row absent; file absent")
+
+    asyncio.run(scenario())
+
+
+def test_document_dao_logical_delete_contract_and_session_isolation(
+    document_sessions, document_storage
+) -> None:
+    async def scenario() -> None:
+        dao = DocumentDAO(document_sessions)
+        async with documents_client(dao, document_storage) as api:
+            metadata = await upload(api)
+            row = await read_document(document_sessions, metadata["id"])
+            foreign_url = "/api/v1/sessions/foreign-session/documents"
+            foreign = await api.post(foreign_url, files={"file": ("foreign.pdf", CONTENT)})
+            assert foreign.status_code == 201
+            assert await dao.delete_document("foreign-session", row.id) is None
+            assert await dao.delete_document(SESSION_ID, uuid4()) is None
+
+            # Issue #52: первый вызов с двумя позиционными аргументами даёт ключ.
+            assert await dao.delete_document(SESSION_ID, row.id) == row.storage_key
+            assert await dao.get_document(SESSION_ID, row.id) is None
+            assert await dao.list_by_session(SESSION_ID) == []
+            pending = await dao.get_document_for_cleanup(SESSION_ID, row.id)
+            assert pending is not None and pending.storage_key == row.storage_key
+            assert await dao.get_document_for_cleanup("foreign-session", row.id) is None
+            await SessionRunDAO(document_sessions).create_queued_run(SESSION_ID)
+            assert await dao.delete_document(SESSION_ID, row.id) == row.storage_key
+            with pytest.raises(RuntimeError):
+                await dao.complete_document_deletion(SESSION_ID, row.id, storage_key="wrong-key")
+            await dao.complete_document_deletion(
+                "foreign-session", row.id, storage_key=row.storage_key
+            )
+            assert await dao.get_document_for_cleanup(SESSION_ID, row.id) is not None
+            await document_storage.delete(row.storage_key)
+            for _ in range(2):
+                await dao.complete_document_deletion(
+                    SESSION_ID, row.id, storage_key=row.storage_key
+                )
+            assert await dao.get_document_for_cleanup(SESSION_ID, row.id) is None
+            assert await dao.delete_document(SESSION_ID, row.id) is None
+            assert (await api.get(f"{foreign_url}/{foreign.json()['id']}")).content == CONTENT
+
+    asyncio.run(scenario())
+
+
+def test_parallel_accepted_deletes_finish_with_new_run(
+    document_sessions, document_storage, monkeypatch
+) -> None:
+    async def scenario() -> None:
+        async with documents_client(DocumentDAO(document_sessions), document_storage) as api:
+            metadata = await upload(api)
+            row = await read_document(document_sessions, metadata["id"])
+            both_entered = asyncio.Event()
+            release = asyncio.Event()
+            calls = []
+            real_delete = document_storage.delete
+
+            async def pause_cleanup(key):
+                calls.append(key)
+                if len(calls) == 2:
+                    both_entered.set()
+                await release.wait()
+                return await real_delete(key)
+
+            monkeypatch.setattr(document_storage, "delete", pause_cleanup)
+            requests = [asyncio.create_task(api.delete(f"{URL}/{row.id}")) for _ in range(2)]
+            try:
+                await asyncio.wait_for(both_entered.wait(), 5)
+                await SessionRunDAO(document_sessions).create_queued_run(SESSION_ID)
+                assert (await api.get(URL)).json() == {"items": []}
+                release.set()
+                responses = await asyncio.wait_for(asyncio.gather(*requests), 5)
+                assert [r.status_code for r in responses] == [204, 204]
+                await assert_absent(
+                    api, document_sessions, document_storage, metadata["id"], row.storage_key
+                )
+            finally:
+                release.set()
+                for request in requests:
+                    request.cancel()
+                await asyncio.gather(*requests, return_exceptions=True)
 
     asyncio.run(scenario())
 
