@@ -1,6 +1,7 @@
 """Роутер для загрузки, просмотра, скачивания и удаления документов сессии."""
 
 import asyncio
+import json
 import logging
 from collections.abc import Coroutine
 from pathlib import Path as FilePath
@@ -25,12 +26,12 @@ from edu_doc_agent.api.schemas import DocumentListResponse, DocumentResponse
 from edu_doc_agent.config import get_settings
 from edu_doc_agent.dao import (
     ActiveRunConflictError,
-    Document,
     DocumentDAO,
     FileStorage,
     FileStorageError,
     InvalidStoragePathError,
 )
+from edu_doc_agent.dao.documents import DocumentCreateRolledBackError
 from edu_doc_agent.parsing import supported_suffixes
 
 logger = logging.getLogger(__name__)
@@ -136,12 +137,14 @@ async def _read_upload_bounded(file: UploadFile, max_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
-async def _cleanup_storage(storage: FileStorage, storage_key: str) -> None:
+async def _cleanup_storage(storage: FileStorage, storage_key: str) -> bool:
     """Компенсация: удаляет файл из хранилища при сбое записи в БД."""
     try:
         await storage.delete(storage_key)
+        return True
     except Exception:
         logger.exception("Не удалось удалить файл при откате загрузки: storage_key=%s", storage_key)
+        return False
 
 
 @router.post(
@@ -172,43 +175,84 @@ async def upload_document(
     doc_id = uuid4()
     content_type = _CANONICAL_CONTENT_TYPES.get(suffix, _DEFAULT_CONTENT_TYPE)
 
-    try:
+    async def _store_document() -> DocumentResponse:
+        # Одна защищённая операция удерживает результат save, метаданные и
+        # компенсацию. Внешняя (в том числе повторная) отмена не попадает в
+        # LocalFileStorage.save и не скрывает ключ после os.replace.
         storage_key = await storage.save(
             session_id=session_id,
             doc_id=doc_id,
             filename=filename,
             content=content,
         )
+        # Записываем намерение ДО обращения к БД: при недоступной БД или
+        # перезапуске процесса останутся исходные ID и ключ для сверки.
+        # Этот служебный файл не имеет метаданных Document и не виден в API.
+        try:
+            intent_key = await storage.save(
+                session_id=session_id,
+                doc_id=doc_id,
+                filename="upload-reconciliation.json",
+                content=json.dumps(
+                    {
+                        "version": 1,
+                        "session_id": session_id,
+                        "doc_id": str(doc_id),
+                        "storage_key": storage_key,
+                    }
+                ).encode("utf-8"),
+            )
+        except BaseException:
+            await _cleanup_storage(storage, storage_key)
+            raise
+
+        try:
+            doc = await dao.create_document(
+                session_id=session_id,
+                doc_id=doc_id,
+                filename=filename,
+                content_type=content_type,
+                size_bytes=len(content),
+                storage_key=storage_key,
+                doc_type=normalized_doc_type,
+            )
+        except DocumentCreateRolledBackError:
+            if await _cleanup_storage(storage, storage_key):
+                await _cleanup_storage(storage, intent_key)
+            raise
+        except BaseException as exc:
+            # Новый SELECT способен подтвердить COMMIT только найденной
+            # строкой с исходным ключом. Пустой результат не доказывает
+            # rollback: транзакция на сервере ещё может завершаться.
+            doc = None
+            try:
+                doc = await dao.get_document(session_id=session_id, doc_id=doc_id)
+            except Exception:
+                logger.warning("БД недоступна при сверке загрузки: doc_id=%s", doc_id)
+            if doc is None or doc.storage_key != storage_key:
+                logger.error(
+                    "Исход загрузки неизвестен; файл и намерение сохранены: "
+                    "doc_id=%s storage_key=%s intent_key=%s",
+                    doc_id,
+                    storage_key,
+                    intent_key,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=f"Исход загрузки требует сверки. Идентификатор документа: {doc_id}",
+                ) from exc
+
+        response = DocumentResponse.model_validate(doc)
+        await _cleanup_storage(storage, intent_key)
+        return response
+
+    try:
+        return await _await_uninterruptible(_store_document())
     except InvalidStoragePathError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Некорректное имя файла или идентификатор сессии.",
         ) from exc
-
-    db_saved = False
-
-    async def _create_metadata() -> Document:
-        nonlocal db_saved
-        created = await dao.create_document(
-            session_id=session_id,
-            doc_id=doc_id,
-            filename=filename,
-            content_type=content_type,
-            size_bytes=len(content),
-            storage_key=storage_key,
-            doc_type=normalized_doc_type,
-        )
-        db_saved = True
-        return created
-
-    try:
-        doc = await _await_uninterruptible(_create_metadata())
-    except BaseException:
-        if not db_saved:
-            await _await_uninterruptible(_cleanup_storage(storage, storage_key))
-        raise
-
-    return DocumentResponse.model_validate(doc)
 
 
 @router.get(

@@ -13,6 +13,10 @@ from edu_doc_agent.dao.repositories import ActiveRunConflictError
 ACTIVE_RUN_STATUSES = ("queued", "running", "waiting_for_input")
 
 
+class DocumentCreateRolledBackError(Exception):
+    """Создание не дошло до COMMIT; rollback подтверждён, файл можно удалить."""
+
+
 class DocumentDAO:
     """Короткоживущие операции БД для документов в рамках сессии."""
 
@@ -34,15 +38,17 @@ class DocumentDAO:
         doc_type: str | None = None,
         derived_from: UUID | None = None,
     ) -> Document:
-        """Гарантирует существование Session и сохраняет метаданные документа."""
+        """Сохраняет документ; только DocumentCreateRolledBackError разрешает компенсацию.
+
+        Любая другая ошибка может означать потерянное подтверждение COMMIT,
+        включая ошибку при возврате/закрытии сессии после успешной фиксации.
+        """
         async with self._session_factory() as db:
             stmt = (
                 pg_insert(Session)
                 .values(id=session_id, status="active")
                 .on_conflict_do_nothing(index_elements=[Session.id])
             )
-            await db.execute(stmt)
-
             doc = Document(
                 id=doc_id,
                 session_id=session_id,
@@ -53,7 +59,16 @@ class DocumentDAO:
                 doc_type=doc_type,
                 derived_from=derived_from,
             )
-            db.add(doc)
+            try:
+                await db.execute(stmt)
+                db.add(doc)
+                # Все INSERT и ограничения проверяются до отправки COMMIT.
+                await db.flush()
+            except Exception as exc:
+                await db.rollback()
+                raise DocumentCreateRolledBackError("Document creation rolled back") from exc
+            # Ошибку COMMIT нельзя превращать в подтверждённый отказ даже
+            # после успешного rollback(): сервер мог уже зафиксировать INSERT.
             await db.commit()
             return doc
 
