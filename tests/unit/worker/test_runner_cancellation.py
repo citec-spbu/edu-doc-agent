@@ -29,12 +29,12 @@ def test_cancel_during_status_update_waits_for_outcome(
         entered, release = asyncio.Event(), asyncio.Event()
         original = getattr(dao, operation)
 
-        async def paused_update(run_id: UUID) -> bool:
+        async def paused_update(run_id: UUID, **kwargs: object) -> object:
             if commit_before_pause:
-                result = await original(run_id)
+                result = await original(run_id, **kwargs)
             entered.set()
             await release.wait()
-            return result if commit_before_pause else await original(run_id)
+            return result if commit_before_pause else await original(run_id, **kwargs)
 
         monkeypatch.setattr(dao, operation, paused_update)
         logic = AsyncMock(
@@ -86,12 +86,12 @@ def test_cancelled_unsuccessful_claim_does_not_requeue_another_execution(
     async def scenario() -> None:
         dao = InMemorySessionRunDAO()
         run = await dao.create_queued_run("synthetic-session")
-        assert await dao.claim_run_for_execution(run.id)
+        assert await dao.claim_run_for_execution(run.id) == 0
         entered, release = asyncio.Event(), asyncio.Event()
         original = dao.claim_run_for_execution
 
-        async def paused_claim(run_id: UUID) -> bool:
-            claimed = await original(run_id)
+        async def paused_claim(run_id: UUID, **kwargs: object) -> int | None:
+            claimed = await original(run_id, **kwargs)
             entered.set()
             await release.wait()
             return claimed
@@ -132,10 +132,10 @@ def test_repeated_cancellation_waits_for_cleanup(
             started.set()
             await asyncio.Event().wait()
 
-        async def paused_cleanup(run_id: UUID) -> bool:
+        async def paused_cleanup(run_id: UUID, **kwargs: object) -> bool:
             cleaning.set()
             await release.wait()
-            return await original(run_id)
+            return await original(run_id, **kwargs)
 
         monkeypatch.setattr(dao, operation, paused_cleanup)
         task = asyncio.create_task(
@@ -176,7 +176,11 @@ def test_default_runner_allows_work_beyond_570_seconds(monkeypatch: pytest.Monke
             await asyncio.sleep(0)
             await asyncio.sleep(0)
 
-        result = await runner_module.SessionRunner(dao).execute(run.session_id, run.id, logic)
+        # Здесь проверяется отсутствие внутреннего лимита исполнения 570 с.
+        # Прыжок часов без heartbeat отдельно означал бы истечение lease.
+        result = await runner_module.SessionRunner(dao, heartbeat_interval=None).execute(
+            run.session_id, run.id, logic
+        )
         assert result["status"] == "completed"
         assert run.status == "completed"
 

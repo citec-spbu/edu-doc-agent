@@ -10,6 +10,79 @@ import pytest
 from tests.fakes import InMemorySessionRunDAO
 
 
+@pytest.mark.parametrize("kind", ["future", "custom-awaitable"])
+def test_business_callable_accepts_any_awaitable(kind: str) -> None:
+    runner_class = importlib.import_module("edu_doc_agent.worker.runner").SessionRunner
+
+    async def scenario() -> None:
+        dao = InMemorySessionRunDAO()
+        run = await dao.create_queued_run("synthetic-session")
+        future = asyncio.get_running_loop().create_future()
+        future.set_result(None)
+
+        class CustomAwaitable:
+            def __await__(self):
+                return future.__await__()
+
+        def logic(session_id: str):
+            assert session_id == run.session_id
+            return future if kind == "future" else CustomAwaitable()
+
+        result = await runner_class(dao).execute(run.session_id, run.id, logic)
+        assert result["status"] == "completed"
+        assert run.status == "completed"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("kind", ["sync-error", "future-error"])
+def test_business_callable_failure_before_coroutine_marks_run_failed(kind: str) -> None:
+    runner_class = importlib.import_module("edu_doc_agent.worker.runner").SessionRunner
+
+    async def scenario() -> None:
+        dao = InMemorySessionRunDAO()
+        run = await dao.create_queued_run("synthetic-session")
+        error = ValueError("synthetic business failure")
+
+        def logic(session_id: str):
+            if kind == "sync-error":
+                raise error
+            future = asyncio.get_running_loop().create_future()
+            future.set_exception(error)
+            return future
+
+        with pytest.raises(ValueError) as caught:
+            await runner_class(dao).execute(run.session_id, run.id, logic)
+        assert caught.value is error
+        assert run.status == "failed"
+
+    asyncio.run(scenario())
+
+
+def test_runner_cancellation_propagates_to_business_future() -> None:
+    runner_class = importlib.import_module("edu_doc_agent.worker.runner").SessionRunner
+
+    async def scenario() -> None:
+        dao = InMemorySessionRunDAO()
+        run = await dao.create_queued_run("synthetic-session")
+        future = asyncio.get_running_loop().create_future()
+        started = asyncio.Event()
+
+        def logic(session_id: str):
+            started.set()
+            return future
+
+        task = asyncio.create_task(runner_class(dao).execute(run.session_id, run.id, logic))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert future.cancelled()
+        assert run.status == "queued"
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=2))
+
+
 def test_failed_write_preserves_original_business_exception(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
