@@ -36,7 +36,7 @@ from edu_doc_agent.dao import (
 )
 from edu_doc_agent.dao.documents import DocumentCreateRolledBackError
 from edu_doc_agent.parsing import supported_suffixes
-from edu_doc_agent.reconcile_uploads import clear_upload_marker
+from edu_doc_agent.reconcile_uploads import clear_upload_marker, record_upload_rollback
 
 logger = logging.getLogger(__name__)
 
@@ -244,6 +244,11 @@ async def upload_document(
                 doc_type=normalized_doc_type,
             )
         except DocumentCreateRolledBackError:
+            # Свидетельство rollback должно пережить сбой удаления файла
+            # и перезапуск API. Обычного намерения и пустого SELECT недостаточно.
+            intent_key = await record_upload_rollback(
+                storage, session_id=session_id, doc_id=doc_id, storage_key=storage_key
+            )
             if await _cleanup_storage(storage, storage_key):
                 await _cleanup_storage(storage, intent_key)
             raise
@@ -253,10 +258,16 @@ async def upload_document(
             # rollback: транзакция на сервере ещё может завершаться.
             doc = None
             try:
-                doc = await dao.get_document(session_id=session_id, doc_id=doc_id)
+                doc = await dao.get_document_for_reconciliation(
+                    session_id=session_id, doc_id=doc_id
+                )
             except Exception:
                 logger.warning("БД недоступна при сверке загрузки: doc_id=%s", doc_id)
-            if doc is None or doc.storage_key != storage_key:
+            if doc is None or (doc.session_id, doc.id, doc.storage_key) != (
+                session_id,
+                doc_id,
+                storage_key,
+            ):
                 logger.error(
                     "Исход загрузки неизвестен; файл и намерение сохранены: "
                     "doc_id=%s storage_key=%s intent_key=%s",

@@ -214,7 +214,7 @@ def test_committed_upload_recovers_in_new_app_with_cli_in_either_order(
         document_sessions.kw["bind"], class_=LoseCommitAcknowledgement, expire_on_commit=False
     )
     uncertain_dao = DocumentDAO(uncertain_sessions)
-    real_select = uncertain_dao.get_document
+    real_select = uncertain_dao.get_document_for_reconciliation
 
     async def first_select_unavailable(*args, **kwargs):
         selects.append(True)
@@ -224,7 +224,9 @@ def test_committed_upload_recovers_in_new_app_with_cli_in_either_order(
 
     async def scenario() -> None:
         with monkeypatch.context() as boundary:
-            boundary.setattr(uncertain_dao, "get_document", first_select_unavailable)
+            boundary.setattr(
+                uncertain_dao, "get_document_for_reconciliation", first_select_unavailable
+            )
             async with documents_client(uncertain_dao, document_storage) as api:
                 response = await api.post(URL, files={"file": ("synthetic.pdf", CONTENT)})
                 assert response.status_code == 503, response.text

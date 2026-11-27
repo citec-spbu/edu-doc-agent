@@ -167,27 +167,27 @@ def test_cancellation_during_real_save_finishes_real_metadata(upload_backend, mo
 def test_committed_but_database_unavailable_for_reconciliation(upload_backend, monkeypatch):
     sessions, dao, storage = upload_backend
     real_create = dao.create_document
-    real_get = dao.get_document
+    real_get = dao.get_document_for_reconciliation
 
     async def lose_return(**kwargs):
         await real_create(**kwargs)
         raise ConnectionError("synthetic lost acknowledgement")
 
     monkeypatch.setattr(dao, "create_document", lose_return)
-    monkeypatch.setattr(
-        dao, "get_document", AsyncMock(side_effect=ConnectionError("synthetic unavailable DB"))
-    )
+    unavailable = AsyncMock(side_effect=ConnectionError("synthetic unavailable DB"))
+    monkeypatch.setattr(dao, "get_document_for_reconciliation", unavailable)
 
     async def scenario():
         async with client() as api:
             response = await api.post(URL, files={"file": ("test.docx", CONTENT)})
             assert response.status_code == 503
+            unavailable.assert_awaited_once()
             async with sessions() as db:
                 row = (await db.scalars(select(Document))).one()
             assert await storage.read(row.storage_key) == CONTENT
             assert len(list(storage.base_dir.rglob("*upload-reconciliation.json"))) == 1
             # После восстановления БД доступны и список, и исходные байты.
-            monkeypatch.setattr(dao, "get_document", real_get)
+            monkeypatch.setattr(dao, "get_document_for_reconciliation", real_get)
             assert (await api.get(URL)).json()["items"][0]["id"] == str(row.id)
             download = await api.get(f"{URL}/{row.id}")
             assert download.status_code == 200
@@ -262,12 +262,14 @@ def test_recovery_from_new_app_and_both_cleanup_orders(upload_backend, monkeypat
         raise ConnectionError("synthetic lost acknowledgement")
 
     monkeypatch.setattr(dao, "create_document", lose_return)
-    monkeypatch.setattr(dao, "get_document", AsyncMock(side_effect=ConnectionError("outage")))
+    unavailable = AsyncMock(side_effect=ConnectionError("outage"))
+    monkeypatch.setattr(dao, "get_document_for_reconciliation", unavailable)
 
     async def scenario():
         async with client() as api:
             response = await api.post(URL, files={"file": ("test.docx", CONTENT)})
             assert response.status_code == 503
+            unavailable.assert_awaited_once()
         async with sessions() as db:
             row = (await db.scalars(select(Document))).one()
         assert len(list(storage.base_dir.rglob("*upload-reconciliation.json"))) == 1
@@ -302,7 +304,7 @@ def test_reconcile_pending_deletion_when_marker_cleanup_failed(upload_backend, m
     from edu_doc_agent.reconcile_uploads import reconcile_uploads
 
     sessions, dao, storage = upload_backend
-    real_create, real_get = dao.create_document, dao.get_document
+    real_create, real_get = dao.create_document, dao.get_document_for_reconciliation
     original_delete = storage.delete
 
     async def lose_return(**kwargs):
@@ -310,7 +312,8 @@ def test_reconcile_pending_deletion_when_marker_cleanup_failed(upload_backend, m
         raise ConnectionError("synthetic lost acknowledgement")
 
     monkeypatch.setattr(dao, "create_document", lose_return)
-    monkeypatch.setattr(dao, "get_document", AsyncMock(side_effect=ConnectionError("outage")))
+    unavailable = AsyncMock(side_effect=ConnectionError("outage"))
+    monkeypatch.setattr(dao, "get_document_for_reconciliation", unavailable)
 
     async def fail_marker_delete(key):
         if key.endswith("upload-reconciliation.json"):
@@ -320,7 +323,8 @@ def test_reconcile_pending_deletion_when_marker_cleanup_failed(upload_backend, m
     async def scenario():
         async with client() as api:
             assert (await api.post(URL, files={"file": ("test.docx", CONTENT)})).status_code == 503
-            monkeypatch.setattr(dao, "get_document", real_get)
+            unavailable.assert_awaited_once()
+            monkeypatch.setattr(dao, "get_document_for_reconciliation", real_get)
             async with sessions() as db:
                 row = (await db.scalars(select(Document))).one()
             monkeypatch.setattr(storage, "delete", fail_marker_delete)

@@ -1,4 +1,4 @@
-"""Повторяемая локальная сверка никогда не удаляет содержимое документа."""
+"""Сверка сохраняет неопределённый исход и завершает подтверждённый rollback."""
 
 import asyncio
 import json
@@ -97,3 +97,91 @@ def test_invalid_marker_retained_without_querying_database(tmp_path):
         assert await storage.exists(key)
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure_at", ["content", "marker"])
+def test_cli_rollback_cleanup_is_repeatable_after_another_disk_failure(
+    tmp_path, monkeypatch, failure_at
+):
+    from edu_doc_agent.reconcile_uploads import record_upload_rollback
+
+    async def scenario():
+        storage = LocalFileStorage(tmp_path)
+        doc_id, key, marker = await seed(storage)
+        await record_upload_rollback(
+            storage, session_id="synthetic", doc_id=doc_id, storage_key=key
+        )
+        real_delete = storage.delete
+
+        async def fail_delete(storage_key):
+            if storage_key == (key if failure_at == "content" else marker):
+                raise FileStorageError("synthetic temporary disk failure")
+            return await real_delete(storage_key)
+
+        monkeypatch.setattr(storage, "delete", fail_delete)
+        dao = SimpleNamespace(get_document_for_reconciliation=AsyncMock(return_value=None))
+        assert await reconcile_uploads(dao, storage) == {"cleanup_failed": 1}
+        assert await storage.exists(marker)
+        assert json.loads(await storage.read(marker))["outcome"] == "rolled_back"
+        assert await storage.exists(key) == (failure_at == "content")
+        fresh_storage = LocalFileStorage(tmp_path)
+        assert await reconcile_uploads(dao, fresh_storage) == {"rolled_back": 1}
+        assert await reconcile_uploads(dao, fresh_storage) == {}
+        assert not [path for path in tmp_path.rglob("*") if path.is_file()]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("state", ["row-exists", "database-unavailable"])
+def test_rollback_evidence_does_not_override_contradiction_or_database_outage(tmp_path, state):
+    from edu_doc_agent.reconcile_uploads import record_upload_rollback
+
+    async def scenario():
+        storage = LocalFileStorage(tmp_path)
+        doc_id, key, marker = await seed(storage)
+        await record_upload_rollback(
+            storage, session_id="synthetic", doc_id=doc_id, storage_key=key
+        )
+        lookup = AsyncMock(
+            return_value=SimpleNamespace(session_id="synthetic", id=doc_id, storage_key=key)
+        )
+        if state == "database-unavailable":
+            lookup.side_effect = ConnectionError("synthetic unavailable database")
+        dao = SimpleNamespace(get_document_for_reconciliation=lookup)
+        expected = "mismatch" if state == "row-exists" else "database_unavailable"
+        assert await reconcile_uploads(dao, storage) == {expected: 1}
+        assert await storage.exists(marker)
+        assert await storage.read(key) == b"synthetic bytes"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("root_kind", ["missing", "file", "unavailable", "empty"])
+def test_cli_validates_storage_root(tmp_path, monkeypatch, capsys, root_kind):
+    from edu_doc_agent import reconcile_uploads as module
+
+    root = tmp_path / "storage"
+    if root_kind == "file":
+        root.write_bytes(b"synthetic file")
+    elif root_kind != "missing":
+        root.mkdir()
+    monkeypatch.setattr("sys.argv", ["reconcile_uploads", "--storage-dir", str(root)])
+    if root_kind == "unavailable":
+        original_scandir = module.os.scandir
+
+        def denied(path):
+            if str(path) == str(root):
+                raise PermissionError("synthetic permission denied")
+            return original_scandir(path)
+
+        monkeypatch.setattr(module.os, "scandir", denied)
+    if root_kind == "empty":
+        assert module.main() == 0
+        assert json.loads(capsys.readouterr().out) == {}
+    else:
+        with pytest.raises(SystemExit) as caught:
+            module.main()
+        assert caught.value.code != 0
+        output = capsys.readouterr()
+        assert str(root) in output.err
+        assert not output.out

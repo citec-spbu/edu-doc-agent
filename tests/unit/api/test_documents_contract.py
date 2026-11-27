@@ -105,6 +105,12 @@ def documents_api(monkeypatch):
     state.storage.delete.side_effect = remove_file
     state.dao.create_document.side_effect = create
     state.dao.get_document.side_effect = get_document
+
+    async def get_document_for_reconciliation(session_id, doc_id):
+        doc = state.rows.get(doc_id)
+        return doc if doc is not None and doc.session_id == session_id else None
+
+    state.dao.get_document_for_reconciliation.side_effect = get_document_for_reconciliation
     state.dao.list_by_session.side_effect = list_documents
     state.dao.delete_document.side_effect = delete_document
     state.dao.complete_document_deletion.side_effect = complete_document_deletion
@@ -282,13 +288,37 @@ def test_lost_commit_acknowledgement_preserves_downloadable_document(documents_a
         raise ConnectionError("synthetic lost commit acknowledgement")
 
     api.dao.create_document.side_effect = committed_without_reply
-    upload(api)
+    response = upload(api)
+    assert response.status_code == 201, response.text
     api.dao.create_document.assert_awaited_once()
     doc = next(iter(api.rows.values()))
     assert all(call.args != (doc.storage_key,) for call in api.storage.delete.await_args_list)
     response = api.client.get(f"{URL}/{doc.id}")
     assert response.status_code == 200, response.text
     assert response.content == CONTENT
+
+
+def test_lost_commit_ack_during_logical_delete_returns_original_id(documents_api):
+    api = documents_api
+    create = api.dao.create_document.side_effect
+
+    async def committed_then_deleted_without_reply(**values):
+        doc = await create(**values)
+        doc.deletion_pending = True
+        raise ConnectionError("synthetic lost acknowledgement after logical DELETE")
+
+    api.dao.create_document.side_effect = committed_then_deleted_without_reply
+    response = upload(api)
+    assert response.status_code == 201, response.text
+    doc = next(iter(api.rows.values()))
+    assert response.json()["id"] == str(doc.id)
+    api.dao.get_document_for_reconciliation.assert_awaited_once_with(
+        session_id=doc.session_id, doc_id=doc.id
+    )
+    api.dao.get_document.assert_not_awaited()
+    assert api.client.get(f"{URL}/{doc.id}").status_code == 404
+    assert api.client.get(URL).json()["items"] == []
+    assert api.files[doc.storage_key] == CONTENT
 
 
 def test_cancellation_during_save_leaves_no_file_without_metadata(documents_api):

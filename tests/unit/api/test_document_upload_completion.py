@@ -121,7 +121,9 @@ def test_unknown_outcome_preserves_file_and_persistent_intent(tmp_path, lookup):
             return document(**(values | {"storage_key": lookup}))
         return lookup
 
-    dao = SimpleNamespace(create_document=unknown_create, get_document=lookup_document)
+    dao = SimpleNamespace(
+        create_document=unknown_create, get_document_for_reconciliation=lookup_document
+    )
 
     async def scenario():
         with pytest.raises(HTTPException) as caught:
@@ -177,5 +179,50 @@ def test_dao_only_marks_confirmed_precommit_rollback(stage):
         else:
             assert caught.value is failure
             assert not isinstance(caught.value, DocumentCreateRolledBackError)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure_at", ["content", "marker"])
+def test_confirmed_rollback_survives_disk_cleanup_failure_and_new_process(
+    tmp_path, monkeypatch, failure_at
+):
+    from edu_doc_agent.dao import FileStorageError
+    from edu_doc_agent.reconcile_uploads import reconcile_uploads
+
+    storage = LocalFileStorage(tmp_path)
+    dao = SimpleNamespace(
+        create_document=AsyncMock(side_effect=DocumentCreateRolledBackError("confirmed rollback"))
+    )
+    real_delete = storage.delete
+    failed = False
+
+    async def fail_once(key):
+        nonlocal failed
+        is_marker = key.endswith("upload-reconciliation.json")
+        if not failed and is_marker == (failure_at == "marker"):
+            failed = True
+            raise FileStorageError("synthetic temporary disk failure")
+        return await real_delete(key)
+
+    monkeypatch.setattr(storage, "delete", fail_once)
+
+    async def scenario():
+        with pytest.raises(DocumentCreateRolledBackError):
+            await upload(dao, storage)
+        assert failed
+        values = dao.create_document.call_args.kwargs
+        marker = next(tmp_path.rglob("*upload-reconciliation.json"))
+        intent = json.loads(marker.read_bytes())
+        assert intent["outcome"] == "rolled_back"
+        assert intent["doc_id"] == str(values["doc_id"])
+        assert intent["storage_key"] == values["storage_key"]
+        assert await storage.exists(values["storage_key"]) == (failure_at == "content")
+        # Новые экземпляры не имеют доступа к состоянию исходного запроса.
+        fresh_storage = LocalFileStorage(tmp_path)
+        fresh_dao = SimpleNamespace(get_document_for_reconciliation=AsyncMock(return_value=None))
+        assert await reconcile_uploads(fresh_dao, fresh_storage) == {"rolled_back": 1}
+        assert not [path for path in tmp_path.rglob("*") if path.is_file()]
+        assert await reconcile_uploads(fresh_dao, fresh_storage) == {}
 
     asyncio.run(scenario())
