@@ -8,6 +8,8 @@
 - сноски убираются: строки мельче основного шрифта после черты (текстовой «_____» или
   нарисованной короткой линией у левого поля) и абзацы-сноски в конце документа «*(1) …»
   (ГАРАНТ), «<1> …» (КонсультантПлюс);
+- номера сносок в тексте — цифры мелким шрифтом выше строки («образования¹⁰.») — убираются,
+  иначе приклеиваются к слову: «образования10.»;
 - новый абзац начинается с отступа первой строки, после увеличенного интервала, при смене
   шрифта (размер, жирность) или после короткой строки, закончившейся «.», «:» или «;»;
   абзац продолжается через границу страниц;
@@ -56,6 +58,11 @@ _ITEM_START = re.compile(r"^(?:[А-ЯЁA-Z]{1,6}-\d|\d+[.)]\s)")
 _CUT_WORD = re.compile(r"^\S+-[а-яё]+$")
 _CUT_SLACK = 1.5  # в символах: строка с оборванным словом занимает ячейку почти целиком
 _MIN_SIZE = 4.0  # pt: текст мельче — служебный/невидимый (метки на обложке)
+# номер сноски: цифры мельче строки (доля размера) и выше её базовой линии (доля размера)
+_SUPERSCRIPT_SIZE = 0.8
+_SUPERSCRIPT_RAISE = 0.25
+_GAP_BEFORE_PUNCT = re.compile(r"\s+(?=[.,;:])")
+_PUNCT_ONLY = re.compile(r"[.,;:]+")
 _SNAP = 2.0  # pt: координаты рамок таблицы ближе этого считаются одной линией
 _COLUMN_TOLERANCE = 3.0  # pt: столбцы продолжения таблицы совпадают с точностью до этого
 # таблица продолжается на следующей странице, только если упирается в низ страницы,
@@ -116,14 +123,22 @@ def _read_page(page: Page, index: int) -> tuple[list[_Line], list[_Table]]:
         return not any(x0 <= cx <= x1 and top <= cy <= bottom for x0, top, x1, bottom in boxes)
 
     text_page = page.filter(outside_tables) if boxes else page
+    raised = _superscripts(text_page.extract_text_lines(return_chars=True, strip=True))
+    if raised:
+        text_page = text_page.filter(lambda obj: _char_key(obj) not in raised)
     lines = []
     for raw in text_page.extract_text_lines(return_chars=True, strip=True):
         chars = [c for c in raw["chars"] if c["text"].strip() and c["size"] >= _MIN_SIZE]
         if not chars or not raw["text"].strip():
             continue
+        if raised and lines and _PUNCT_ONLY.fullmatch(raw["text"].strip()):
+            # номер сноски перенёсся на новую строку вместе с точкой: «организацией» + «⁴.»
+            lines[-1].text += raw["text"].strip()
+            continue
         lines.append(
             _Line(
-                text=raw["text"],
+                # на месте убранного номера сноски остаётся пробел: «уровня .»
+                text=_GAP_BEFORE_PUNCT.sub("", raw["text"]) if raised else raw["text"],
                 x0=raw["x0"],
                 x1=raw["x1"],
                 top=raw["top"],
@@ -137,6 +152,36 @@ def _read_page(page: Page, index: int) -> tuple[list[_Line], list[_Table]]:
     lines.sort(key=lambda ln: ln.top)
     tables = [_table(page, t, index) for t in found]
     return lines, [t for t in tables if t is not None]
+
+
+def _superscripts(raw_lines: list[dict]) -> set[tuple]:
+    """Номера сносок в тексте: цифры мельче остальной строки и выше её базовой линии.
+
+    Только цифры (и точка внутри номера «11.1»): мелкий шрифт в таблицах и подписях стоит на
+    базовой линии и не трогается.
+    """
+    found: set[tuple] = set()
+    for raw in raw_lines:
+        chars = [c for c in raw["chars"] if c["text"].strip()]
+        if not chars:
+            continue
+        size = max(c["size"] for c in chars)
+        normal = [c for c in chars if c["size"] > size * _SUPERSCRIPT_SIZE]
+        if not normal:
+            continue
+        baseline = median(c["bottom"] for c in normal)
+        for c in chars:
+            if (
+                (c["text"].isdigit() or c["text"] == ".")
+                and c["size"] <= size * _SUPERSCRIPT_SIZE
+                and c["bottom"] <= baseline - size * _SUPERSCRIPT_RAISE
+            ):
+                found.add(_char_key(c))
+    return found
+
+
+def _char_key(obj: dict) -> tuple:
+    return (obj.get("object_type"), obj.get("text"), round(obj["x0"], 2), round(obj["top"], 2))
 
 
 def _footnote_rules(page: Page, index: int, boxes: list[tuple]) -> list[_Line]:
@@ -226,6 +271,13 @@ def _cell_text(page: Page, bbox: tuple) -> tuple[str, bool]:
 
     Возвращает и признак, что последняя строка — оборванное слово (см. `_is_cut`).
     """
+    # таблица может выходить за край страницы (широкая таблица на альбомном листе) —
+    # pdfplumber не режет за пределами страницы, поэтому ячейку обрезаем по странице
+    x0, top, x1, bottom = bbox
+    px0, ptop, px1, pbottom = page.bbox
+    bbox = (max(x0, px0), max(top, ptop), min(x1, px1), min(bottom, pbottom))
+    if bbox[0] >= bbox[2] or bbox[1] >= bbox[3]:
+        return "", False
     lines = page.crop(bbox).extract_text_lines(strip=True)
     cuts = [_is_cut(ln, bbox) for ln in lines]
     text = clean_text(_join([ln["text"] for ln in lines], cuts))

@@ -6,7 +6,10 @@
   координатах, что и ячейки первой страницы (объединений нет);
 - `standard_narrow-cells_01.pdf` — перенос строк в ячейках: целые слова и составное слово,
   оборванное без дефиса, потому что шире ячейки;
-- `standard_vector-footnote_01.pdf` — черта перед сносками нарисована линией, а не «_____».
+- `standard_vector-footnote_01.pdf` — черта перед сносками нарисована линией, а не «_____»;
+- `standard_footnote-marks_01.pdf` — номера сносок в тексте: мелкие цифры выше строки, в том
+  числе перенесённые в начало следующей строки вместе с точкой (#50);
+- `standard_wide-table_01.pdf` — таблица шире страницы: правая граница за краем листа (#50).
 
 Файлы уже лежат в репозитории; перегенерировать (нужны reportlab и шрифты DejaVu):
     uv run --with reportlab python tests/fixtures/make_pdf_edge_cases.py
@@ -112,12 +115,46 @@ def vector_footnote() -> None:
     d.save()
 
 
+def footnote_marks() -> None:
+    d = Doc("standard_footnote-marks_01.pdf")
+    y = d.para(60, BODY)
+
+    def mark(x: float, top: float, number: str) -> None:
+        d.c.setFont("Serif", 7)
+        d.c.drawString(x, H - top - 12 + 5, number)  # мельче и выше базовой линии
+
+    first = "1. Программы разрабатываются организацией"
+    d.text(INDENT, y, first)
+    mark(INDENT + pdfmetrics.stringWidth(first, "Serif", 12), y, "10")
+    d.text(INDENT + pdfmetrics.stringWidth(first, "Serif", 12) + 8, y, ".")
+    y += STEP
+    d.text(LEFT, y, "Программы утверждаются организацией")
+    y += STEP
+    mark(LEFT, y, "4")  # номер перенёсся на новую строку вместе с точкой
+    d.text(LEFT + 4, y, ".")
+    y += STEP * 2
+    d.text(INDENT, y, "2. Примечание мелким шрифтом на своей строке не трогается:")
+    d.text(LEFT, y + STEP, "объем 144 часа", size=7)
+    d.save()
+
+
+def wide_table() -> None:
+    d = Doc("standard_wide-table_01.pdf")
+    y = d.para(60, BODY)
+    # правая граница таблицы — за краем страницы (ширина A4 — 595 pt)
+    y = d.row(y + 10, [200, 420], [["Код"], ["Наименование"]])
+    d.row(y, [200, 420], [["A/01.3"], ["Разработка кода"]])
+    d.save()
+
+
 def main() -> None:
     pdfmetrics.registerFont(TTFont("Serif", str(FONTS / "DejaVuSerif.ttf")))
     two_tables()
     long_table()
     narrow_cells()
     vector_footnote()
+    footnote_marks()
+    wide_table()
 
 
 if __name__ == "__main__":
