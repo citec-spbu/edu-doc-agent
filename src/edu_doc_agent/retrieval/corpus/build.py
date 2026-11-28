@@ -12,12 +12,19 @@
         type: fgos
         edition: "808 ред. от 27.02.2023"
       - file: spbu/os_2026.pdf
-        type: spbu_standard              # для не-ФГОС doc_id, title, edition — обязательны
+        type: spbu_standard              # для ОС doc_id, title, edition — обязательны
         doc_id: spbu-os
         title: Образовательный стандарт высшего образования СПбГУ
         edition: "11144/1 от 24.08.2026"
+      - file: laws/273-fz.pdf             # выгрузка из ГАРАНТа: название и редакция — по шапке
+        type: federal_act
+        layout: law                      # law — по статьям и частям, order — по пунктам
+        doc_id: 273-fz
+      - files: "prof_standards/*.txt"    # профстандарт — текст карточки, всё по тексту
+        type: prof_standard
 
-Новый ФГОС добавляется без кода: положить файл в папку из `files` и пересобрать.
+Новый ФГОС или профстандарт добавляется без кода: положить файл в папку из `files` и
+пересобрать. Федеральный акт (`federal_act`) — запись в манифесте с `doc_id` и `layout`.
 YAML-снимки нужны, чтобы проверить нарезку глазами; руками их не правят — правки идут
 в overrides (по `doc_id`): `replace` (id -> текст), `add` (новые фрагменты), `drop` (id).
 """
@@ -30,8 +37,12 @@ from pathlib import Path
 import yaml
 
 from edu_doc_agent.parsing import parse_document
+from edu_doc_agent.parsing.models import ParsedDocument
+from edu_doc_agent.retrieval.corpus import garant
+from edu_doc_agent.retrieval.corpus.acts import LAYOUTS, chunk_act
 from edu_doc_agent.retrieval.corpus.chunker import chunk_document, detect_info
-from edu_doc_agent.retrieval.corpus.models import CorpusDocument, Overrides
+from edu_doc_agent.retrieval.corpus.models import CorpusDocument, DocumentInfo, Overrides
+from edu_doc_agent.retrieval.corpus.prof_standard import chunk_prof_standard
 
 _META_KEYS = (
     "doc_id",
@@ -55,13 +66,35 @@ def build(manifest: Path, overrides: Path | None = None) -> tuple[list[CorpusDoc
     for path, entry in _sources(manifest, config):
         given = {k: str(entry[k]) for k in _META_KEYS if entry.get(k)}
         try:
-            parsed = parse_document(path)
-            info = detect_info(parsed, entry["type"], path.name, **given)
+            documents.append(_build_one(path, entry, given, patches))
         except ValueError as error:  # UnsupportedFormatError, NoTextLayerError, метаданные
             failures.append(f"{path.name}: {error}")
-            continue
-        documents.append(chunk_document(parsed, info, patches.get(info.doc_id)))
     return documents, failures
+
+
+def _build_one(
+    path: Path, entry: dict, given: dict[str, str], patches: dict[str, Overrides]
+) -> CorpusDocument:
+    doc_type = entry["type"]
+    if doc_type == "prof_standard":
+        return chunk_prof_standard(path.read_text(encoding="utf-8"), path.name, **given)
+    if doc_type == "federal_act":
+        layout = entry.get("layout")
+        if layout not in LAYOUTS:
+            raise ValueError(f"у федерального акта нужен layout: {' или '.join(LAYOUTS)}")
+        parsed = parse_document(path)
+        return chunk_act(parsed, _act_info(parsed, path.name, given), layout)
+    parsed = parse_document(path)
+    info = detect_info(parsed, doc_type, path.name, **given)
+    return chunk_document(parsed, info, patches.get(info.doc_id))
+
+
+def _act_info(parsed: ParsedDocument, source_file: str, given: dict[str, str]) -> DocumentInfo:
+    values = {**garant.act_requisites(parsed), **given}
+    missing = [k for k in ("doc_id", "title", "edition") if k not in values]
+    if missing:
+        raise ValueError(f"не определены {', '.join(missing)} — задайте в манифесте")
+    return DocumentInfo(doc_type="federal_act", source_file=source_file, **values)
 
 
 def _sources(manifest: Path, config: dict) -> list[tuple[Path, dict]]:
@@ -111,15 +144,19 @@ def _dump(doc: CorpusDocument) -> str:
 
 def _report(documents: list[CorpusDocument], errors: list[str]) -> str:
     lines = ["# Корпус нормативов: отчёт сборки", ""]
-    lines += ["| doc_id | Документ | Редакция | Пункты | Компетенции | Профстандарты | Части |"]
-    lines += ["| --- | --- | --- | --- | --- | --- | --- |"]
+    lines += [
+        "| doc_id | Документ | Редакция | Пункты | Компетенции | Профстандарты "
+        "| Трудовые функции | Части |"
+    ]
+    lines += ["| --- | --- | --- | --- | --- | --- | --- | --- |"]
     for doc in documents:
         kinds = Counter(f.kind for f in doc.fragments if f.part == 0)
         parts = sum(1 for f in doc.fragments if f.part > 0)
+        functions = kinds["generalized_function"] + kinds["labor_function"]
         d = doc.document
         lines.append(
             f"| {d.doc_id} | {d.title} | {d.edition} | {kinds['clause']} | "
-            f"{kinds['competency']} | {kinds['prof_standard_ref']} | {parts} |"
+            f"{kinds['competency']} | {kinds['prof_standard_ref']} | {functions} | {parts} |"
         )
     lines += ["", "## Замечания", ""]
     for doc in documents:

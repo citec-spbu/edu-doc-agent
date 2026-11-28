@@ -89,3 +89,55 @@ def test_main_exit_code(regs: Path) -> None:
     out = regs / "corpus"
     assert main([str(regs / "manifest.yaml"), "--out", str(out)]) == 1  # broken.pdf
     assert (out / "REPORT.md").exists()
+
+
+ACT = ParsedDocument(
+    source="act",
+    blocks=[
+        Block(BlockKind.HEADING, 'Федеральный закон от 1 января 2000 г. N 1-ФЗ "О синтетике"'),
+        Block(BlockKind.HEADING, "Глава 1. Общие положения"),
+        Block(BlockKind.PARAGRAPH, "Статья 1. Предмет"),
+        Block(BlockKind.PARAGRAPH, "1. Закон регулирует синтетику."),
+    ],
+)
+CARD = """Профстандарт: 99.001
+Синтетик
+от 20.07.2022 № 999н
+III. Характеристика обобщенных трудовых функций
+3.1. Обобщенная трудовая функция
+Наименование
+Подготовка данных
+Код
+A
+Уровень квалификации
+6
+"""
+
+
+def test_federal_acts_and_prof_standards(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "laws").mkdir()
+    (tmp_path / "prof_standards").mkdir()
+    for name in ("law.pdf", "nolayout.pdf"):
+        (tmp_path / "laws" / name).write_bytes(b"")
+    (tmp_path / "prof_standards" / "99.001.txt").write_text(CARD, encoding="utf-8")
+    monkeypatch.setattr(build_module, "parse_document", lambda path: ACT)
+    manifest = {
+        "sources": [
+            {"file": "laws/law.pdf", "type": "federal_act", "layout": "law", "doc_id": "1-fz"},
+            {"file": "laws/nolayout.pdf", "type": "federal_act", "doc_id": "x"},
+            {"files": "prof_standards/*.txt", "type": "prof_standard"},
+        ]
+    }
+    (tmp_path / "manifest.yaml").write_text(yaml.safe_dump(manifest), encoding="utf-8")
+    documents, failures = build(tmp_path / "manifest.yaml")
+    by_id = {d.document.doc_id: d for d in documents}
+    assert set(by_id) == {"1-fz", "ps-99.001"}
+    law = by_id["1-fz"]
+    assert law.document.title == 'Федеральный закон от 1 января 2000 г. N 1-ФЗ "О синтетике"'
+    assert law.document.edition == "1-ФЗ от 01.01.2000"  # редакция по шапке
+    assert [f.id for f in law.fragments] == ["1-fz:ст.1:ч.1"]
+    assert [f.id for f in by_id["ps-99.001"].fragments] == ["ps-99.001:general", "ps-99.001:A"]
+    assert len(failures) == 1 and "layout" in failures[0]
+    write(documents, tmp_path / "corpus", failures)
+    report = (tmp_path / "corpus" / "REPORT.md").read_text(encoding="utf-8")
+    assert "| ps-99.001 |" in report and "| 1 | 0 |" in report  # одна трудовая функция

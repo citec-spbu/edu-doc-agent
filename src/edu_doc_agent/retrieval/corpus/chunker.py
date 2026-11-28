@@ -104,7 +104,7 @@ def chunk_document(
     if overrides is not None:
         fragments = _apply(fragments, overrides, info, state.warnings)
     fragments = _with_context(fragments)
-    fragments = [part for fragment in fragments for part in _split(fragment)]
+    fragments = [part for fragment in fragments for part in split_long(fragment)]
     state.warnings.extend(_check(fragments, info))
     return CorpusDocument(document=info, fragments=fragments, warnings=state.warnings)
 
@@ -444,7 +444,7 @@ def _is_competency_table(block: Block) -> bool:
 # Части длинного пункта
 
 
-def _split(fragment: Fragment) -> list[Fragment]:
+def split_long(fragment: Fragment) -> list[Fragment]:
     """Пункт длиннее MAX_PART_CHARS -> части по границам предложений; склейка = исходный текст."""
     text = fragment.text
     if len(text) <= MAX_PART_CHARS:

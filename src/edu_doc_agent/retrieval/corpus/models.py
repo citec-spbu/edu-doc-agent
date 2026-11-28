@@ -9,8 +9,22 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-DocType = Literal["fgos", "spbu_standard", "prof_standard"]
-FragmentKind = Literal["clause", "competency", "prof_standard_ref"]
+# federal_act — федеральный закон или приказ (273-ФЗ, приказ Минобрнауки № 245)
+DocType = Literal["fgos", "spbu_standard", "prof_standard", "federal_act"]
+# clause — пункт норматива, часть статьи закона; competency — компетенция ФГОС или ОС;
+# prof_standard_ref — строка перечня профстандартов в приложении ФГОС;
+# prof_standard — общие сведения профстандарта; generalized_function / labor_function —
+# обобщённая трудовая функция и трудовая функция профстандарта
+FragmentKind = Literal[
+    "clause",
+    "competency",
+    "prof_standard_ref",
+    "prof_standard",
+    "generalized_function",
+    "labor_function",
+]
+DOC_TYPES: tuple[str, ...] = DocType.__args__
+FRAGMENT_KINDS: tuple[str, ...] = FragmentKind.__args__
 
 
 class ChangeNote(BaseModel):

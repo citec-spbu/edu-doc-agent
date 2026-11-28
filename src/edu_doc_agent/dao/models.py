@@ -145,7 +145,7 @@ class RegulationDocument(Base):
     __tablename__ = "regulation_documents"
     __table_args__ = (
         CheckConstraint(
-            "doc_type IN ('fgos', 'spbu_standard', 'prof_standard')",
+            "doc_type IN ('fgos', 'spbu_standard', 'prof_standard', 'federal_act')",
             name="ck_regulation_documents_doc_type",
         ),
         CheckConstraint(
@@ -180,11 +180,12 @@ class RegulationFragment(Base):
             name="fk_regulation_fragments_document",
         ),
         CheckConstraint(
-            "doc_type IN ('fgos', 'spbu_standard', 'prof_standard')",
+            "doc_type IN ('fgos', 'spbu_standard', 'prof_standard', 'federal_act')",
             name="ck_regulation_fragments_doc_type",
         ),
         CheckConstraint(
-            "kind IN ('clause', 'competency', 'prof_standard_ref')",
+            "kind IN ('clause', 'competency', 'prof_standard_ref', 'prof_standard', "
+            "'generalized_function', 'labor_function')",
             name="ck_regulation_fragments_kind",
         ),
         CheckConstraint("part >= 0", name="ck_regulation_fragments_part_nonnegative"),
