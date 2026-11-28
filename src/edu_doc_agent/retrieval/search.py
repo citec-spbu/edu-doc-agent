@@ -139,6 +139,10 @@ class RegulationSearch:
         hits = await self._hits([((id, edition), False, "exact")])
         return hits[0] if hits else None
 
+    async def document_types(self) -> dict[str, str]:
+        """Загруженные документы: doc_id -> doc_type."""
+        return {d["doc_id"]: d["doc_type"] for d in await self._dao.list_documents()}
+
     async def documents_for_direction(self, direction_code: str) -> list[str]:
         """Документы, применимые к программе направления: её ФГОС, нормы СПбГУ, федеральные
         акты и профстандарты (ФГОС других направлений — нет: их тексты почти совпадают)."""
@@ -250,7 +254,9 @@ async def _cli(args) -> int:
         doc_ids = args.doc_id or None
         if args.direction:
             doc_ids = [*(doc_ids or []), *await search.documents_for_direction(args.direction)]
-        hits = await search.search(args.query, doc_ids=doc_ids, top_k=args.top_k)
+        hits = await search.search(
+            args.query, doc_ids=doc_ids, doc_types=args.type, top_k=args.top_k
+        )
     finally:
         await engine.dispose()
     for hit in hits:
@@ -267,13 +273,23 @@ def main(argv: list[str] | None = None) -> int:
     """Поиск из терминала — проверить выдачу на загруженном корпусе:
 
     uv run python -m edu_doc_agent.retrieval.search "объем программы" --direction 02.03.02
+    uv run python -m edu_doc_agent.retrieval.search "ч. 5 ст. 13" --type federal_act
     """
     import argparse
+
+    from edu_doc_agent.retrieval.corpus.models import DOC_TYPES
 
     parser = argparse.ArgumentParser(description="Поиск по нормативам в базе RAG")
     parser.add_argument("query")
     parser.add_argument("--direction", help="код направления: его ФГОС и нормы СПбГУ")
     parser.add_argument("--doc-id", action="append", help="документ для поиска (можно повторять)")
+    parser.add_argument(
+        "--type",
+        action="append",
+        choices=DOC_TYPES,
+        help="тип документа, как у инструментов агента: fgos — search_fgos и т. д. "
+        "(можно повторять)",
+    )
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--full", action="store_true", help="печатать текст пунктов целиком")
     parser.add_argument("--no-embeddings", action="store_true", help="только полнотекстовый")

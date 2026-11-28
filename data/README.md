@@ -66,8 +66,15 @@ uv run python -m edu_doc_agent.retrieval.corpus.load data/regulations/manifest.y
 
 ```bash
 uv run python -m edu_doc_agent.retrieval.search "объем программы" --direction 02.03.02
+uv run python -m edu_doc_agent.retrieval.search "объем программы" --direction 02.03.02 --type fgos
 uv run python -m edu_doc_agent.retrieval.evaluate data/regulations/golden.yaml
 ```
+
+`--type` (`fgos`, `spbu_standard`, `federal_act`, `prof_standard`) ограничивает поиск типом
+документа — так ищут инструменты агента (`search_fgos` и т. д.); без него поиск идёт по всем
+документам направления, как `search_all_regulations`. В отчёте `evaluate` — оба разреза:
+по всем документам и «по инструментам», где вопрос ищется только в документах того типа,
+в котором есть правильный пункт.
 
 В `REPORT.md` — число пунктов, компетенций, профстандартов, трудовых функций и строк перечней
 по документам и

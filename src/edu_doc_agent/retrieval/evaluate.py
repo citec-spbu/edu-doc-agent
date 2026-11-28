@@ -8,7 +8,13 @@
 - «в первых 5» — правильный пункт среди первых пяти (столько по умолчанию видит агент).
 
 Сравниваются способы: только векторный, только полнотекстовый (слова запроса через ИЛИ и
-через И) и гибрид с разным сочетанием слов и весом полнотекстового списка в RRF.
+через И) и гибрид с разным сочетанием слов и весом полнотекстового списка в RRF. Поиск идёт
+по всем документам направления сразу — как `search_all_regulations`.
+
+Второй разрез — по инструментам агента (гибрид с настройками по умолчанию): вопрос ищется
+только в документах того типа, где есть правильный пункт (`search_fgos` — во ФГОС,
+`search_federal_acts` — в законе и приказах…), и правильными считаются только пункты этого
+типа. Вопрос с ответами в нескольких типах документов проверяется каждым инструментом.
 Вопросы без ответа (`relevant: []`) в метрики не входят: по ним видно, какое сходство с
 запросом у первого результата, когда ответа нет. Нужны загруженный корпус и Ollama с моделью
 эмбеддингов.
@@ -34,6 +40,14 @@ from edu_doc_agent.retrieval.search import (
 )
 
 TOP = 5  # «в первых 5»
+# тип документа -> инструмент агента, который ищет только в нём (retrieval.tools)
+TOOLS = {
+    "fgos": "search_fgos",
+    "spbu_standard": "search_spbu_regulations",
+    "federal_act": "search_federal_acts",
+    "prof_standard": "search_prof_standards",
+}
+ALL_TOOL = "search_all_regulations"
 DEPTH = 10  # сколько результатов смотрим, чтобы показать место правильного пункта
 FTS_WEIGHTS = (1.0, 0.25)
 MATCH_NAMES: dict[TextMatch, str] = {"any": "ИЛИ", "all": "И"}
@@ -107,7 +121,10 @@ def metrics(outcomes: Sequence[Outcome]) -> dict[str, float]:
 
 
 async def evaluate(
-    search: RegulationSearch, questions: Sequence[Question], variant: Variant
+    search: RegulationSearch,
+    questions: Sequence[Question],
+    variant: Variant,
+    doc_types: Sequence[str] | None = None,
 ) -> list[Outcome]:
     outcomes = []
     for q in questions:
@@ -115,6 +132,7 @@ async def evaluate(
         hits = await search.search(
             q.question,
             doc_ids=doc_ids,
+            doc_types=doc_types,
             top_k=DEPTH,
             mode=variant.mode,
             fts_match=variant.fts_match,
@@ -127,7 +145,37 @@ async def evaluate(
     return outcomes
 
 
-def report(results: dict[str, list[Outcome]]) -> str:
+def split_by_type(
+    questions: Sequence[Question], types: dict[str, str]
+) -> dict[str, list[Question]]:
+    """Вопросы для каждого инструмента: тип документа -> вопросы, где правильные — только
+    пункты документов этого типа. Пункты незагруженных документов не учитываются."""
+    out: dict[str, list[Question]] = {t: [] for t in TOOLS}
+    for q in questions:
+        by_type: dict[str, list[str]] = {}
+        for r in q.relevant:
+            doc_type = types.get(r.split(":", 1)[0])
+            if doc_type in out:
+                by_type.setdefault(doc_type, []).append(r)
+        for doc_type, relevant in by_type.items():
+            out[doc_type].append(Question(q.question, q.direction, relevant))
+    return out
+
+
+async def evaluate_by_tool(
+    search: RegulationSearch, questions: Sequence[Question], variant: Variant
+) -> dict[str, list[Outcome]]:
+    types = await search.document_types()
+    return {
+        doc_type: await evaluate(search, part, variant, doc_types=[doc_type])
+        for doc_type, part in split_by_type(questions, types).items()
+        if part
+    }
+
+
+def report(
+    results: dict[str, list[Outcome]], by_tool: dict[str, list[Outcome]] | None = None
+) -> str:
     modes = list(results)
     names = list(metrics([]))
     answerable = [o for o in results[modes[0]] if o.question.relevant]
@@ -160,7 +208,38 @@ def report(results: dict[str, list[Outcome]]) -> str:
             lines.append(f"  - ожидалось: {', '.join(o.question.relevant)}")
             lines.append(f"  - найдено: {', '.join(o.found[:5]) or '—'}")
     lines += _similarity_lines(results[main_mode], main_mode)
+    if by_tool:
+        lines += _tool_lines(results[main_mode], by_tool, main_mode)
     return "\n".join(lines)
+
+
+def _tool_lines(
+    everything: Sequence[Outcome], by_tool: dict[str, list[Outcome]], mode: str
+) -> list[str]:
+    """Таблица по инструментам агента и вопросы, где свой инструмент не нашёл первым."""
+    names = list(metrics([]))
+    lines = [
+        "",
+        f"По инструментам агента ({mode}): поиск только в документах своего типа",
+        "",
+        "| Инструмент | Вопросов | " + " | ".join(names) + " |",
+        "|---" * (len(names) + 2) + "|",
+    ]
+    rows = [(f"{TOOLS[t]} ({t})", outcomes) for t, outcomes in by_tool.items()]
+    rows.append((f"{ALL_TOOL} (все документы)", list(everything)))
+    for name, outcomes in rows:
+        values = metrics(outcomes)
+        n = sum(1 for o in outcomes if o.question.relevant)
+        cells = " | ".join(f"{values[m]:.0%} ({round(values[m] * n)})" for m in names)
+        lines.append(f"| {name} | {n} | {cells} |")
+    misses = [(t, o) for t, outcomes in by_tool.items() for o in outcomes if o.rank != 1]
+    if misses:
+        lines += ["", "Свой инструмент нашёл не первым:", ""]
+        for doc_type, o in misses:
+            lines.append(f"- {TOOLS[doc_type]}: {o.question.question} — место {o.rank or '—'}")
+            lines.append(f"  - ожидалось: {', '.join(o.question.relevant)}")
+            lines.append(f"  - найдено: {', '.join(o.found[:5]) or '—'}")
+    return lines
 
 
 def _similarity_lines(outcomes: Sequence[Outcome], mode: str) -> list[str]:
@@ -204,10 +283,14 @@ async def _run(args: argparse.Namespace) -> int:
     try:
         dao = RegulationDAO(async_sessionmaker(engine, expire_on_commit=False))
         search = RegulationSearch(dao, OllamaEmbedder.from_settings(settings))
-        results = {v.name: await evaluate(search, questions, v) for v in variants(args.fts_weights)}
+        found = variants(args.fts_weights)
+        results = {v.name: await evaluate(search, questions, v) for v in found}
+        default = hybrid_name(FTS_MATCH, FTS_WEIGHT)
+        main = next((v for v in found if v.name == default), found[-1])
+        by_tool = await evaluate_by_tool(search, questions, main)
     finally:
         await engine.dispose()
-    text = report(results)
+    text = report(results, by_tool)
     print(text)
     if args.out:
         args.out.write_text(text + "\n", encoding="utf-8")
