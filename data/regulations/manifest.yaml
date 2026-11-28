@@ -1,0 +1,19 @@
+# Нормативы для RAG (ADR-0005). Пути — относительно этого файла.
+# Сами PDF в git не кладём: скачать в fgos/ и spbu/ (ссылки — в data/README.md).
+# Новый ФГОС = положить PDF в fgos/ и пересобрать корпус, код менять не нужно.
+#
+#   uv run python -m edu_doc_agent.retrieval.corpus.build data/regulations/manifest.yaml \
+#       --overrides data/regulations/overrides.yaml --out data/corpus
+
+sources:
+  # ФГОС ВО 3++: код направления, приказ и редакция определяются по тексту выгрузки
+  - files: "fgos/*.pdf"
+    type: fgos
+
+  # Образовательный стандарт СПбГУ: метаданные задаются явно
+  - file: spbu/os_11144-1_2026.pdf
+    type: spbu_standard
+    doc_id: spbu-os
+    title: Образовательный стандарт высшего образования СПбГУ
+    edition: "11144/1 от 24.08.2026"
+    approval_act: "Приказ СПбГУ от 24.08.2026 № 11144/1 «О новой редакции Образовательного стандарта высшего образования СПбГУ»"

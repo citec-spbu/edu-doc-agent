@@ -11,57 +11,21 @@
 `CodeIndex` показывает, как один код записан в каждом документе.
 """
 
-import re
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 
+# Каноническая форма кода — общая для извлечения и нормативов (ADR-0005), без тяжёлых импортов
+from edu_doc_agent.codes import canonical_code as canonical_code
+from edu_doc_agent.codes import clean_dashes as clean_dashes
+from edu_doc_agent.codes import code_dialect as code_dialect
 from edu_doc_agent.extraction.characteristic import ProgramCharacteristic
 from edu_doc_agent.extraction.ckmv import CkmvDocument
 from edu_doc_agent.extraction.curriculum import CurriculumPlan
 from edu_doc_agent.extraction.llm_extract import normalize
 from edu_doc_agent.extraction.models import RPDExtraction
-from edu_doc_agent.extraction.patterns import code_key
 from edu_doc_agent.extraction.source import SourceRef
-
-_NUMBER_INFIX_RE = re.compile(r"^ПКП-\d+-(?=[А-ЯЁ])")
-_BARE_UNK_RE = re.compile(r"^УНК-")
-_OUTCOME_TAIL_RE = re.compile(r"^([ЗУВ3])-(\d+)\.?$")
-
-
-def _canonical_token(token: str) -> str:
-    token = token.strip().rstrip(".")
-    token = _NUMBER_INFIX_RE.sub("ПКП-", token.upper())
-    token = _BARE_UNK_RE.sub("ПКП-УНК-", token)
-    return code_key(token)
-
-
-def canonical_code(code: str) -> str:
-    """Единый вид кода: без сквозного номера, с `ПКП-` у УНК, без ведущих нулей.
-
-    Работает для компетенции (`ПКП-2-ППК-Р2`), индикатора (`УНК-01.01`) и результата
-    (`ПКП-МО-1.1 З-1`, в том числе с опечаткой «3-1»); результат остаётся «код буква-номер».
-    """
-    parts = clean_dashes(code).split()
-    if not parts:
-        return ""
-    head = _canonical_token(parts[0])
-    if len(parts) == 2 and (m := _OUTCOME_TAIL_RE.match(parts[1].upper())):
-        letter = "З" if m.group(1) == "3" else m.group(1)
-        return f"{head} {letter}-{m.group(2)}"
-    return head if len(parts) == 1 else " ".join([head, *parts[1:]])
-
-
-def clean_dashes(text: str) -> str:
-    return text.translate(str.maketrans({c: "-" for c in "‐‑‒–—−"})).replace("\xa0", " ").strip()
-
-
-def code_dialect(code: str) -> str:
-    """`numbered`, если в коде есть сквозной номер или нет `ПКП-` у УНК; иначе `canonical`."""
-    token = clean_dashes(code).split()[0].upper() if code.strip() else ""
-    return "numbered" if _NUMBER_INFIX_RE.match(token) or _BARE_UNK_RE.match(token) else "canonical"
-
 
 # --- индекс кодов по документам ---------------------------------------------------------------
 
