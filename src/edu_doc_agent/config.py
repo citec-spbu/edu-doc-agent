@@ -90,7 +90,9 @@ class Settings(BaseSettings):
     llm_rpm: int | None = Field(
         default=None, gt=0
     )  # лимит запросов в минуту у ключа; None — без ограничения
+    # Эмбеддинги для RAG (ADR-0005): Ollama, по умолчанию http://localhost:11434 и bge-m3
     embedding_model: str | None = None
+    embedding_base_url: str | None = None
 
     @field_validator("data_dir", "llm_rpm", mode="before")
     @classmethod

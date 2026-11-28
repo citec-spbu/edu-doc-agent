@@ -1,0 +1,47 @@
+# Нормативы для RAG (ADR-0005). Пути — относительно этого файла.
+# Сами файлы в git не кладём: скачать в fgos/, spbu/, laws/, prof_standards/ (см. data/README.md).
+# Новый ФГОС или профстандарт = положить файл в папку и пересобрать корпус, код менять не нужно.
+#
+#   uv run python -m edu_doc_agent.retrieval.corpus.build data/regulations/manifest.yaml \
+#       --overrides data/regulations/overrides.yaml --out data/corpus
+
+sources:
+  # ФГОС ВО 3++: код направления, приказ и редакция определяются по тексту выгрузки
+  - files: "fgos/*.pdf"
+    type: fgos
+
+  # Образовательный стандарт СПбГУ: метаданные задаются явно
+  - file: spbu/os_11144-1_2026.pdf
+    type: spbu_standard
+    doc_id: spbu-os
+    title: Образовательный стандарт высшего образования СПбГУ
+    edition: "11144/1 от 24.08.2026"
+    approval_act: "Приказ СПбГУ от 24.08.2026 № 11144/1 «О новой редакции Образовательного стандарта высшего образования СПбГУ»"
+
+  # Федеральные акты — выгрузки из ГАРАНТа (PDF): название и редакция определяются по шапке.
+  # layout: law — закон по статьям и частям, order — утверждённый приказом документ по пунктам,
+  # list — перечни (код, наименование, квалификация) по строкам.
+  - file: laws/273-fz.pdf
+    type: federal_act
+    layout: law
+    doc_id: 273-fz
+
+  - file: laws/order-245.pdf
+    type: federal_act
+    layout: order
+    doc_id: order-245
+
+  - file: laws/order-885-390.pdf
+    type: federal_act
+    layout: order
+    doc_id: order-885-390
+
+  - file: laws/order-1061.pdf
+    type: federal_act
+    layout: list
+    doc_id: order-1061
+
+  # Профстандарты — PDF приказа Минтруда с текстовым слоем (сканы не подходят), по файлу на
+  # стандарт; код, название и приказ определяются по тексту
+  - files: "prof_standards/*.pdf"
+    type: prof_standard

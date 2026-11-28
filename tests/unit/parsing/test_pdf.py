@@ -109,6 +109,19 @@ def test_footnotes_after_vector_rule_are_dropped() -> None:
     assert not any("Сноска номер" in t for t in texts)  # черта — линия, на обеих страницах
 
 
+def test_footnote_marks_in_text_are_dropped() -> None:
+    texts = [b.text for b in parse_document(FIXTURES / "standard_footnote-marks_01.pdf").blocks]
+    assert "1. Программы разрабатываются организацией." in texts  # не «организацией10.»
+    # номер перенёсся на новую строку вместе с точкой — точка вернулась к своей строке
+    assert "Программы утверждаются организацией." in texts
+    assert "объем 144 часа" in texts  # мелкий шрифт на базовой линии — не сноска
+
+
+def test_table_wider_than_page() -> None:
+    (table,) = [b for b in parse_document(FIXTURES / "standard_wide-table_01.pdf").blocks if b.rows]
+    assert table.rows == [["Код", "Наименование"], ["A/01.3", "Разработка кода"]]
+
+
 def test_scan_without_text_layer(tmp_path: Path) -> None:
     scan = tmp_path / "scan.pdf"
     scan.write_bytes(

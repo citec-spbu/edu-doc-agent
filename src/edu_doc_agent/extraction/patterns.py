@@ -6,6 +6,8 @@
 
 import re
 
+from edu_doc_agent.codes import code_key as code_key  # общий модуль кодов
+
 _PREFIX = r"(?:ПКП|ПКА|УНК|УКБ|УК|ОПК)"
 _NOT_WORD_BEFORE = r"(?<![0-9A-Za-zА-Яа-яЁё])"
 
@@ -71,14 +73,3 @@ KIND_BY_LETTER = {"З": "знает", "3": "знает", "У": "умеет", "В
 ATTESTATION_KIND_RE = re.compile(
     r"(?:дифференцированный\s+)?(?:экзамен|зач[её]т(?:\s+с\s+оценкой)?)", re.I
 )
-
-
-_LEADING_ZEROS_RE = re.compile(r"(?<=[-.])0+(?=[0-9])")
-
-
-def code_key(code: str) -> str:
-    """Ключ для сопоставления кодов: «ПКП-УНК-03.01» и «ПКП-УНК-3.1» дают один ключ.
-
-    Хранимые коды не меняем (см. выше); ключ нужен только для поиска соответствий.
-    """
-    return _LEADING_ZEROS_RE.sub("", " ".join(code.split()).upper())

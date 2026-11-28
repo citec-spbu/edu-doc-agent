@@ -18,6 +18,10 @@ htmlcov/
 # Данные и артефакты
 data/*
 !data/README.md
+# корпус нормативов: в git только манифест и ручные правки, сами PDF — нет
+!data/regulations/
+data/regulations/*
+!data/regulations/*.yaml
 storage/*
 !storage/README.md
 models/
