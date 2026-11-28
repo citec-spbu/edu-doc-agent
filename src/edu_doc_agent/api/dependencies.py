@@ -2,7 +2,7 @@ from arq.connections import ArqRedis
 from fastapi import Request
 
 from edu_doc_agent.config import get_settings
-from edu_doc_agent.dao import FileStorage, LocalFileStorage, SessionRunDAO
+from edu_doc_agent.dao import DocumentDAO, FileStorage, LocalFileStorage, SessionRunDAO
 
 
 def get_arq_pool(request: Request) -> ArqRedis:
@@ -18,3 +18,8 @@ def get_session_run_dao() -> SessionRunDAO:
 def get_file_storage() -> FileStorage:
     """Файловое хранилище. В тестах подменяется через app.dependency_overrides."""
     return LocalFileStorage(get_settings().storage_dir)
+
+
+def get_document_dao() -> DocumentDAO:
+    """DAO для Document. В тестах подменяется через app.dependency_overrides."""
+    return DocumentDAO()

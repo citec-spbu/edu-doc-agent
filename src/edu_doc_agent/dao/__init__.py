@@ -11,7 +11,8 @@ Data Access Layer (DAO).
 - Checkpointer: предоставление пула асинхронных соединений для LangGraph.
 """
 
-from edu_doc_agent.dao.models import Base, Run, Session
+from edu_doc_agent.dao.documents import DocumentDAO
+from edu_doc_agent.dao.models import Base, Document, Run, Session
 from edu_doc_agent.dao.repositories import ActiveRunConflictError, ReconciledRun, SessionRunDAO
 from edu_doc_agent.dao.storage import (
     FileStorage,
@@ -24,6 +25,8 @@ from edu_doc_agent.dao.storage import (
 __all__ = [
     "ActiveRunConflictError",
     "Base",
+    "Document",
+    "DocumentDAO",
     "FileStorage",
     "FileStorageError",
     "InvalidStoragePathError",

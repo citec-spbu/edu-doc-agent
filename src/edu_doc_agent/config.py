@@ -8,6 +8,7 @@ from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL
 
+DEFAULT_MAX_UPLOAD_FILE_BYTES = 50 * 1024 * 1024
 # Ограничиваем пороги годом: вычитание из текущего timestamp должно быть
 # безопасно и для PostgreSQL, а не только для Python timedelta.
 MAX_RUN_STALE_SECONDS = 365 * 24 * 60 * 60
@@ -79,6 +80,7 @@ class Settings(BaseSettings):
 
     # --- Хранилище файлов ---
     storage_dir: Path = Path("storage")
+    max_upload_file_bytes: int = Field(default=DEFAULT_MAX_UPLOAD_FILE_BYTES, gt=0)
 
     # --- LLM ---
     llm_provider: str | None = None
@@ -104,6 +106,13 @@ class Settings(BaseSettings):
     def _default_storage_dir_if_empty(cls, value: object) -> object:
         if isinstance(value, str) and not value.strip():
             return Path("storage")
+        return value
+
+    @field_validator("max_upload_file_bytes", mode="before")
+    @classmethod
+    def _default_max_upload_bytes_if_empty(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return DEFAULT_MAX_UPLOAD_FILE_BYTES
         return value
 
     @model_validator(mode="after")

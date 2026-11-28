@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
 
 from edu_doc_agent import __version__
+from edu_doc_agent.api.documents_router import router as documents_router
 from edu_doc_agent.api.router import router as sessions_router
 from edu_doc_agent.config import get_settings
 
@@ -45,9 +46,9 @@ app = FastAPI(
 )
 
 app.include_router(sessions_router)
+app.include_router(documents_router)
 
 
-@app.get("/", include_in_schema=False)
 @app.get("/", include_in_schema=False)
 def root() -> RedirectResponse:
     """Редирект на интерактивную документацию."""

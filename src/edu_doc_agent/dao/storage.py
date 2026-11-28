@@ -204,6 +204,30 @@ class LocalFileStorage:
     def base_dir(self) -> Path:
         return self._base_dir
 
+    def key_for(self, session_id: str, doc_id: UUID | str, filename: str) -> str:
+        """Вычисляет ключ без создания файла (для локального обслуживания)."""
+        return self._build_key(session_id, doc_id, filename)
+
+    async def list_upload_intents(self) -> list[str]:
+        """Находит локальные маркеры; дальнейшее чтение проверяет путь через FD."""
+
+        def scan() -> list[str]:
+            def fail(error: OSError) -> None:
+                raise error
+
+            keys = []
+            # rglob скрывает PermissionError вложенных каталогов. walk с
+            # onerror не позволяет выдать неполный обход за успешную сверку.
+            for directory, _, filenames in os.walk(self._base_dir, onerror=fail):
+                for filename in filenames:
+                    if filename.endswith("upload-reconciliation.json"):
+                        keys.append(
+                            (Path(directory) / filename).relative_to(self._base_dir).as_posix()
+                        )
+            return sorted(keys)
+
+        return await asyncio.to_thread(scan)
+
     def resolve_path(self, storage_key: str) -> Path:
         """Возвращает путь для осмотра. Файловые операции работают через дескрипторы."""
         candidate = self._base_dir
