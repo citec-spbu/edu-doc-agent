@@ -23,6 +23,14 @@ from typing import Protocol
 
 from edu_doc_agent.retrieval.search import RegulationHit
 
+# фрагменты профстандартов: строки перечня в ФГОС и тексты самих профстандартов
+PROF_STANDARD_KINDS = [
+    "prof_standard_ref",
+    "prof_standard",
+    "generalized_function",
+    "labor_function",
+]
+
 
 class SearchBackend(Protocol):
     """Что нужно инструментам от поиска: реализуют RegulationSearch и InMemoryRegulationSearch."""
@@ -56,7 +64,8 @@ class RegulationTools:
     async def for_program(
         cls, search: SearchBackend, direction_code: str, top_k: int = 5
     ) -> "RegulationTools":
-        """Инструменты для программы направления: её ФГОС и нормы СПбГУ."""
+        """Инструменты для программы направления: её ФГОС, нормы СПбГУ, федеральные акты и
+        профстандарты."""
         return cls(search, await search.documents_for_direction(direction_code), top_k)
 
     async def search_fgos(self, query: str, top_k: int | None = None) -> list[RegulationHit]:
@@ -89,16 +98,29 @@ class RegulationTools:
     async def search_prof_standards(
         self, query: str, top_k: int | None = None
     ) -> list[RegulationHit]:
-        """Поиск по профстандартам, соответствующим направлению программы: строки перечня
-        из приложения ФГОС (код, название, приказ об утверждении). Тексты самих
-        профстандартов в корпус пока не загружены. Аргументы и результат — как у search_fgos."""
-        return await self._find(query, top_k, kinds=["prof_standard_ref"])
+        """Поиск по профстандартам: перечень профстандартов направления из приложения ФГОС и
+        тексты загруженных профстандартов — общие сведения, обобщённые трудовые функции
+        (должности, требования к образованию и опыту) и трудовые функции (трудовые действия,
+        необходимые умения и знания). Код функции ищется точно вместе с кодом профстандарта:
+        «06.001 A/01.3», «06.001 ОТФ D». Аргументы и результат — как у search_fgos."""
+        return await self._find(query, top_k, kinds=PROF_STANDARD_KINDS)
+
+    async def search_federal_acts(
+        self, query: str, top_k: int | None = None
+    ) -> list[RegulationHit]:
+        """Поиск по федеральным актам: закон «Об образовании в РФ» (273-ФЗ) — по частям
+        статей, приказы Минобрнауки (Порядок организации образовательной деятельности,
+        Положение о практической подготовке) — по пунктам. Ссылка ищется точно: «ч. 5
+        ст. 13», «ст. 13» (все части статьи), «п. 15». Аргументы и результат — как у
+        search_fgos; ссылка для чтения пункта — get_federal_act_clause."""
+        return await self._find(query, top_k, doc_types=["federal_act"])
 
     async def search_all_regulations(
         self, query: str, top_k: int | None = None
     ) -> list[RegulationHit]:
-        """Поиск по всем нормативам программы: ФГОС, нормы СПбГУ, профстандарты. У каждого
-        результата doc_id и doc_type — из какого он документа. Аргументы — как у search_fgos."""
+        """Поиск по всем нормативам программы: ФГОС, нормы СПбГУ, федеральные акты,
+        профстандарты. У каждого результата doc_id и doc_type — из какого он документа.
+        Аргументы — как у search_fgos."""
         return await self._find(query, top_k)
 
     async def get_fgos_clause(self, id: str, edition: str) -> RegulationHit | None:
@@ -110,17 +132,25 @@ class RegulationTools:
         """Полный текст пункта норм СПбГУ по ссылке. None — такого пункта в этой редакции нет."""
         return await self._search.get_clause(id, edition)
 
+    async def get_federal_act_clause(self, id: str, edition: str) -> RegulationHit | None:
+        """Полный текст части статьи закона или пункта приказа по ссылке (id и edition из
+        результата поиска). None — такого фрагмента в этой редакции нет."""
+        return await self._search.get_clause(id, edition)
+
     def as_functions(self) -> dict[str, Callable[..., Awaitable]]:
-        """Инструменты по именам из ADR-0003 — для регистрации в графе."""
+        """Инструменты по именам из ADR-0003 (и search_federal_acts / get_federal_act_clause
+        для федеральных актов) — для регистрации в графе."""
         return {
             name: getattr(self, name)
             for name in (
                 "search_fgos",
                 "search_spbu_regulations",
                 "search_prof_standards",
+                "search_federal_acts",
                 "search_all_regulations",
                 "get_fgos_clause",
                 "get_spbu_clause",
+                "get_federal_act_clause",
             )
         }
 

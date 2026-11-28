@@ -9,6 +9,7 @@ from edu_doc_agent.retrieval.fake import InMemoryRegulationSearch
 from edu_doc_agent.retrieval.tools import RegulationTools
 
 FGOS, OTHER, OS = "fgos-02.03.02", "fgos-01.03.02", "spbu-os"
+LAW, PS = "273-fz", "ps-06.001"
 
 
 def doc(doc_id: str, doc_type: str, direction: str | None, fragments: list[dict]):
@@ -56,6 +57,30 @@ CORPUS = [
     ),
     doc(OTHER, "fgos", "01.03.02", [clause(OTHER, "1.9", "1.9. Объем программы 240 з.е.")]),
     doc(OS, "spbu_standard", None, [clause(OS, "2.4", "2.4. Объем программы — в з.е.")]),
+    doc(
+        LAW,
+        "federal_act",
+        None,
+        [
+            clause(LAW, "ст.13:ч.5", "5. Количество зачетных единиц устанавливается стандартом."),
+            clause(LAW, "ст.15:ч.1", "1. Сетевая форма реализации образовательных программ."),
+        ],
+    ),
+    doc(
+        PS,
+        "prof_standard",
+        None,
+        [
+            {
+                "id": f"{PS}:D/03.6",
+                "kind": "labor_function",
+                "number": "3.4.3",
+                "path": "Программист › 3.4.3 Трудовая функция D/03.6",
+                "text": "Трудовая функция D/03.6 «Проектирование программного обеспечения»",
+                "codes": ["06.001:D/03.6"],
+            }
+        ],
+    ),
 ]
 
 
@@ -69,9 +94,10 @@ def tools() -> RegulationTools:
 
 def test_program_scope_is_set_by_code_not_by_llm() -> None:
     t = tools()
-    assert t.doc_ids == [FGOS, OS]
+    assert t.doc_ids == [FGOS, OS, LAW, PS]
     hits = run(t.search_all_regulations("объем программы"))
-    assert {h.doc_id for h in hits} == {FGOS, OS}  # чужой ФГОС с тем же текстом не виден
+    found = {h.doc_id for h in hits}
+    assert {FGOS, OS} <= found and OTHER not in found  # чужой ФГОС с тем же текстом не виден
     # у инструментов поиска нет аргумента doc_ids — его не может подставить LLM
     params = inspect.signature(t.search_all_regulations).parameters
     assert list(params) == ["query", "top_k"]
@@ -81,8 +107,23 @@ def test_each_tool_searches_its_documents() -> None:
     t = tools()
     assert {h.doc_type for h in run(t.search_fgos("объем программы"))} == {"fgos"}
     assert {h.doc_id for h in run(t.search_spbu_regulations("объем программы"))} == {OS}
-    (ps,) = run(t.search_prof_standards("программист"))
+    ps, *_ = run(t.search_prof_standards("программист"))
     assert ps.id == f"{FGOS}:app:06.001" and ps.kind == "prof_standard_ref"
+    hits = run(t.search_prof_standards("проектирование программного обеспечения"))
+    assert hits[0].id == f"{PS}:D/03.6"  # текст профстандарта, не только строка перечня
+    assert {h.doc_id for h in run(t.search_federal_acts("сетевая форма"))} == {LAW}
+
+
+def test_law_parts_and_labor_functions_are_found_exactly() -> None:
+    t = tools()
+    (part, *_) = run(t.search_federal_acts("что в ч. 5 ст. 13?"))
+    assert (part.id, part.method) == (f"{LAW}:ст.13:ч.5", "exact")
+    assert [h.id for h in run(t.search_federal_acts("статья 15")) if h.method == "exact"] == [
+        f"{LAW}:ст.15:ч.1"
+    ]
+    (function, *_) = run(t.search_prof_standards("06.001 D/03.6"))
+    assert (function.id, function.method) == (f"{PS}:D/03.6", "exact")
+    assert run(t.get_federal_act_clause(part.id, part.edition)).text == part.text
 
 
 def test_code_is_found_exactly_and_clause_read_by_reference() -> None:
@@ -104,9 +145,11 @@ def test_tools_are_named_as_in_adr_documented_and_json_serializable() -> None:
         "search_fgos",
         "search_spbu_regulations",
         "search_prof_standards",
+        "search_federal_acts",
         "search_all_regulations",
         "get_fgos_clause",
         "get_spbu_clause",
+        "get_federal_act_clause",
     }
     assert all(inspect.iscoroutinefunction(f) and f.__doc__ for f in functions.values())
     hits = run(functions["search_all_regulations"]("объем программы"))

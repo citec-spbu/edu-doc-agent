@@ -7,7 +7,11 @@ import re
 from collections.abc import Hashable, Sequence
 from dataclasses import dataclass
 
-from edu_doc_agent.retrieval.corpus.codes import COMPETENCY_CODE, PROF_STANDARD_CODE, normalize_code
+from edu_doc_agent.retrieval.corpus.codes import (
+    COMPETENCY_CODE,
+    PROF_STANDARD_CODE,
+    normalize_code,
+)
 
 RRF_K = 60  # константа RRF: сглаживает разницу между верхними местами списков
 
@@ -22,10 +26,34 @@ _CLAUSE_NUMBERS = re.compile(
 # после кода компетенции — номер индикатора: «УК-1.2»
 _INDICATOR_TAIL = re.compile(r"\.\d")
 
+# ссылки на закон: «ч. 5 ст. 13», «часть 5 статьи 13», «ст. 13 ч. 5», «п. 6 ст. 2», «ст. 13»
+_ARTICLE = r"(?:ст\.|статьей|стать[яиеюй])\s*(\d+(?:\.\d+)?)"
+_PART = r"(?:ч\.|частью|част[ьиейю])\s*(\d+(?:\.\d+)?)"
+_ITEM = r"(?:п\.|пункт[а-я]*)\s*(\d+(?:\.\d+)?)"
+_LAW_REFS: tuple[tuple[re.Pattern[str], tuple[int, ...], str], ...] = (
+    # (шаблон, группы: статья, часть или пункт; вид)
+    (re.compile(rf"\b{_ITEM}\s+{_PART}\s+{_ARTICLE}", re.I), (3, 2), "ч"),  # пункт части
+    (re.compile(rf"\b{_PART}\s+{_ARTICLE}", re.I), (2, 1), "ч"),
+    (re.compile(rf"\b{_ARTICLE}\s*,?\s*{_PART}", re.I), (1, 2), "ч"),
+    (re.compile(rf"\b{_ITEM}\s+{_ARTICLE}", re.I), (2, 1), "п"),
+    (re.compile(rf"\b{_ARTICLE}", re.I), (1,), ""),
+)
+# пункт приказа — целое число: «п. 15», «пункт 17(1)» (но не «п. 2.3» — это пункт ФГОС)
+_ORDER_POINT = re.compile(
+    r"(?:\bп\.|\bпункт[а-я]*)\s*(\d+(?:\(\d+\))?)(?!\d)(?!\.\d)(?!\s*\))", re.I
+)
+# трудовая функция профстандарта «A/01.3» и обобщённая «A.3», «ОТФ A»
+_LABOR_FUNCTION = re.compile(r"(?<![\wЁё])([A-ZА-ЯЁ])\s*/\s*(\d{2}\.\d(?:\.\d)?)(?!\d)")
+_GENERALIZED_FUNCTION = re.compile(
+    r"(?<![\wЁё.])([A-ZА-ЯЁ])\.\d(?![\d.])|\bОТФ\s*[«\"]?([A-ZА-ЯЁ])\b"
+)
+_LATIN = str.maketrans("АВСЕНКМОРТХ", "ABCEHKMOPTX")
+
 
 @dataclass(frozen=True)
 class QueryKeys:
-    """Что в запросе можно найти точно: коды компетенций и профстандартов, номера пунктов."""
+    """Что в запросе можно найти точно: коды компетенций, профстандартов и трудовых функций,
+    номера пунктов ФГОС и ОС («2.3»), пунктов приказов («15») и частей статей («ст.13:ч.5»)."""
 
     codes: tuple[str, ...] = ()
     numbers: tuple[str, ...] = ()
@@ -47,14 +75,50 @@ def query_keys(query: str) -> QueryKeys:
         for m in COMPETENCY_CODE.finditer(upper)
         if not _INDICATOR_TAIL.match(upper, m.end())
     ]
-    codes = [*competencies, *PROF_STANDARD_CODE.findall(query)]
+    codes = [*competencies, *_prof_standard_codes(query)]
     numbers = [
         number
         for match in _CLAUSE_NUMBERS.findall(query)
         for number in re.findall(_NUMBER_IN_QUERY, match)
         if not number.startswith("0")  # «02.03.02» в перечне — код направления, не пункт
     ]
+    laws, rest = _law_numbers(query)
+    numbers += laws + _ORDER_POINT.findall(rest)
     return QueryKeys(tuple(dict.fromkeys(codes)), tuple(dict.fromkeys(numbers)))
+
+
+def _law_numbers(query: str) -> tuple[list[str], str]:
+    """Ссылки на статьи закона -> номера фрагментов («ст.13:ч.5», «ст.2:п.6», «ст.13») и
+    запрос без них (чтобы «п. 2» из «п. 2 ч. 7 ст. 13» не стал пунктом приказа)."""
+    found: list[tuple[int, str]] = []
+    rest = query
+    for pattern, groups, kind in _LAW_REFS:
+        for match in pattern.finditer(rest):
+            article, *sub = (match.group(g) for g in groups)
+            number = f"ст.{article}:{kind}.{sub[0]}" if sub else f"ст.{article}"
+            found.append((match.start(), number))
+        rest = pattern.sub(lambda m: " " * len(m.group(0)), rest)
+    return [number for _, number in sorted(found)], rest
+
+
+def _prof_standard_codes(query: str) -> list[str]:
+    """Коды профстандартов; с кодом функции — «06.001:A/01.3», «06.001:A» вместо «06.001»."""
+    standards = PROF_STANDARD_CODE.findall(query)
+    functions = [
+        f"{letter.translate(_LATIN)}/{number}" for letter, number in _LABOR_FUNCTION.findall(query)
+    ]
+    functions += [
+        (dotted or named).translate(_LATIN)
+        for dotted, named in _GENERALIZED_FUNCTION.findall(_LABOR_FUNCTION.sub(" ", query))
+    ]
+    if not standards or not functions:
+        return standards
+    return [f"{standard}:{function}" for standard in standards for function in functions]
+
+
+def natural_key(text: str) -> tuple:
+    """Ключ сортировки с числами по значению: «ст.13:ч.2» раньше «ст.13:ч.10»."""
+    return tuple(int(x) if x.isdigit() else x for x in re.findall(r"\d+|\D+", text))
 
 
 def rrf(

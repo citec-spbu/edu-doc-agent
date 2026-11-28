@@ -35,11 +35,19 @@ from pydantic import BaseModel
 from edu_doc_agent.dao.regulations import ClauseKey, RegulationDAO, TextMatch
 from edu_doc_agent.llm.embeddings import Embedder
 from edu_doc_agent.llm.openai_compat import LLMError
-from edu_doc_agent.retrieval.ranking import collapse_lists, number_order, query_keys, rrf
+from edu_doc_agent.retrieval.ranking import (
+    collapse_lists,
+    natural_key,
+    number_order,
+    query_keys,
+    rrf,
+)
 
 logger = logging.getLogger(__name__)
 
 Method = Literal["exact", "hybrid", "fts", "vector"]
+# документы, применимые к любой программе (в отличие от ФГОС — у каждого направления свой)
+COMMON_DOC_TYPES = ("spbu_standard", "federal_act", "prof_standard")
 # auto — как описано выше; fts / vector — один способ после точного (для оценки качества)
 Mode = Literal["auto", "fts", "vector"]
 CANDIDATES = 50  # сколько кандидатов берёт каждый способ поиска до слияния
@@ -106,8 +114,9 @@ class RegulationSearch:
         exact: list[ClauseKey] = []
         if keys.codes:
             exact += await self._dao.find_by_codes(keys.codes, **filters)
-        if keys.numbers:
-            exact += await self._dao.find_by_numbers(keys.numbers, **filters)
+        if keys.numbers:  # части статьи — по порядку номеров: ч. 2 раньше ч. 10
+            found = await self._dao.find_by_numbers(keys.numbers, **filters)
+            exact += sorted(found, key=lambda key: natural_key(key[0]))
 
         embedding = await self._embed(query) if mode != "fts" else None
         method: Method
@@ -131,12 +140,13 @@ class RegulationSearch:
         return hits[0] if hits else None
 
     async def documents_for_direction(self, direction_code: str) -> list[str]:
-        """Документы, применимые к программе направления: её ФГОС и нормы СПбГУ."""
+        """Документы, применимые к программе направления: её ФГОС, нормы СПбГУ, федеральные
+        акты и профстандарты (ФГОС других направлений — нет: их тексты почти совпадают)."""
         documents = await self._dao.list_documents()
         return [
             d["doc_id"]
             for d in documents
-            if d["direction_code"] == direction_code or d["doc_type"] == "spbu_standard"
+            if d["direction_code"] == direction_code or d["doc_type"] in COMMON_DOC_TYPES
         ]
 
     # --- внутреннее

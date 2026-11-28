@@ -6,18 +6,18 @@ from edu_doc_agent.llm import FakeEmbedder, LLMError
 from edu_doc_agent.retrieval.search import RegulationSearch
 from edu_doc_agent.retrieval.tools import RegulationTools
 
-FGOS, OS = "fgos-02.03.02", "spbu-os"
+FGOS, OS, LAW = "fgos-02.03.02", "spbu-os", "273-fz"
 ED = "808"
 
 
 def row(id: str, text: str, *, part: int = 0, kind: str = "clause", doc_id: str = FGOS) -> dict:
     return {
         "id": id,
-        "number": id.split(":")[1],
+        "number": id.split(":", 1)[1],
         "edition": ED,
         "part": part,
         "doc_id": doc_id,
-        "doc_type": "fgos" if doc_id == FGOS else "spbu_standard",
+        "doc_type": {FGOS: "fgos", OS: "spbu_standard"}.get(doc_id, "federal_act"),
         "kind": kind,
         "path": f"путь › {id}",
         "text": text,
@@ -35,6 +35,7 @@ ROWS = [
     row(f"{OS}:2.2.4", "2.2.4. рабочие программы, содержащие:", doc_id=OS),
     row(f"{OS}:2.2.4.2", "2.2.4.2. фонд оценочных средств;", doc_id=OS),
     row(f"{OS}:2.2.4.1", "2.2.4.1. цели и задачи;", doc_id=OS),
+    *(row(f"{LAW}:ст.13:ч.{n}", f"{n}. Часть статьи.", doc_id=LAW) for n in (1, 2, 10)),
 ]
 
 
@@ -90,6 +91,8 @@ class FakeDAO:
             {"doc_id": FGOS, "doc_type": "fgos", "direction_code": "02.03.02"},
             {"doc_id": "fgos-01.03.02", "doc_type": "fgos", "direction_code": "01.03.02"},
             {"doc_id": OS, "doc_type": "spbu_standard", "direction_code": None},
+            {"doc_id": LAW, "doc_type": "federal_act", "direction_code": None},
+            {"doc_id": "ps-06.001", "doc_type": "prof_standard", "direction_code": None},
         ]
 
 
@@ -167,12 +170,14 @@ def test_tools_pass_program_documents_and_types_to_queries() -> None:
     run(tools.search_spbu_regulations("структура программы", top_k=3))
     run(tools.search_fgos("структура программы"))
     run(tools.search_prof_standards("программист"))
+    run(tools.search_federal_acts("сетевая форма"))
     run(tools.search_all_regulations("структура программы"))
     calls = [kwargs for name, kwargs in dao.calls if name == "full_text"]
     assert [(c["doc_types"], c["kinds"]) for c in calls] == [
         (["spbu_standard"], None),
         (["fgos"], None),
-        (None, ["prof_standard_ref"]),
+        (None, ["prof_standard_ref", "prof_standard", "generalized_function", "labor_function"]),
+        (["federal_act"], None),
         (None, None),
     ]
     assert all(c["doc_ids"] == [FGOS, OS] for c in calls)
@@ -183,7 +188,17 @@ def test_get_clause_and_documents_for_direction() -> None:
     clause = run(search.get_clause(f"{FGOS}:4.1", ED))
     assert clause is not None and clause.text == "Первая часть. Вторая часть."
     assert run(search.get_clause(f"{FGOS}:9.9", ED)) is None
-    assert run(search.documents_for_direction("02.03.02")) == [FGOS, OS]
+    # ФГОС своего направления и документы, общие для всех программ; чужого ФГОС — нет
+    assert run(search.documents_for_direction("02.03.02")) == [FGOS, OS, LAW, "ps-06.001"]
+
+
+def test_article_parts_in_number_order() -> None:
+    parts = [f"{LAW}:ст.13:ч.10", f"{LAW}:ст.13:ч.2", f"{LAW}:ст.13:ч.1"]
+    dao = FakeDAO(numbers=parts)
+    hits = run(RegulationSearch(dao).search("ст. 13", top_k=3))
+    assert dao.calls[0][1]["numbers"] == ("ст.13",)
+    # «ч.10» в базе раньше «ч.2» по алфавиту, в выдаче — по номерам
+    assert [h.id for h in hits] == [f"{LAW}:ст.13:ч.1", f"{LAW}:ст.13:ч.2", f"{LAW}:ст.13:ч.10"]
 
 
 def test_list_item_returns_whole_list() -> None:

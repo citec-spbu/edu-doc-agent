@@ -165,11 +165,14 @@ class RegulationDAO:
         kinds: Sequence[str] | None = None,
         limit: int = 50,
     ) -> list[ClauseKey]:
-        """Пункты с указанными номерами («2.3»)."""
+        """Пункты с указанными номерами: «2.3», «15», «ст.13:ч.5»; «ст.13» — все части статьи."""
         f = _FRAGMENTS.c
+        match = f.number.in_(list(numbers))
+        for article in (n for n in numbers if n.startswith("ст.") and ":" not in n):
+            match = match | f.number.startswith(f"{article}:", autoescape=True)
         query = (
             select(f.id, f.edition)
-            .where(f.number.in_(list(numbers)), f.kind == "clause")
+            .where(match, f.kind == "clause")
             .order_by(f.doc_id, f.id, f.part)
             .limit(limit)
         )

@@ -15,7 +15,7 @@ from collections.abc import Sequence
 
 from edu_doc_agent.retrieval.corpus.models import CorpusDocument, Fragment
 from edu_doc_agent.retrieval.ranking import query_keys
-from edu_doc_agent.retrieval.search import RegulationHit
+from edu_doc_agent.retrieval.search import COMMON_DOC_TYPES, RegulationHit
 
 _WORD = re.compile(r"\w{3,}")
 
@@ -47,7 +47,7 @@ class InMemoryRegulationSearch:
                 f
                 for f in pool
                 if set(keys.codes) & set(f.codes)
-                or (f.kind == "clause" and f.number in keys.numbers)
+                or (f.kind == "clause" and _number_matches(f.number, keys.numbers))
             ),
             key=lambda f: f.kind == "clause",
         )
@@ -65,7 +65,7 @@ class InMemoryRegulationSearch:
         return [
             d.doc_id
             for d in self._documents
-            if d.direction_code == direction_code or d.doc_type == "spbu_standard"
+            if d.direction_code == direction_code or d.doc_type in COMMON_DOC_TYPES
         ]
 
     def _hits(self, found: list[tuple[Fragment, str]], top_k: int) -> list[RegulationHit]:
@@ -97,6 +97,13 @@ class InMemoryRegulationSearch:
             if len(hits) == top_k:
                 break
         return hits
+
+
+def _number_matches(number: str, wanted: Sequence[str]) -> bool:
+    """Как в базе: номер совпадает, или «ст.13» — любая часть статьи 13."""
+    return number in wanted or any(
+        w.startswith("ст.") and ":" not in w and number.startswith(f"{w}:") for w in wanted
+    )
 
 
 def _words(text: str) -> set[str]:

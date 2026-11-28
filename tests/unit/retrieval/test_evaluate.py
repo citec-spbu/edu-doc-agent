@@ -79,8 +79,11 @@ def test_golden_set_is_well_formed() -> None:
     assert len(answerable) >= 30 and len(questions) > len(answerable)  # есть и без ответа
     assert all(q.question and q.direction for q in questions)
     assert len({q.direction for q in answerable}) >= 5  # не одно направление
+    # ФГОС — только своего направления; остальные документы общие для всех программ
     assert all(
-        r.split(":", 1)[0] in {f"fgos-{q.direction}", "spbu-os"}
+        r.split(":", 1)[0] == f"fgos-{q.direction}" or not r.startswith("fgos-")
         for q in answerable
         for r in q.relevant
     )
+    prefixes = {r.split(":", 1)[0] for q in answerable for r in q.relevant}
+    assert {"273-fz", "order-245", "order-885-390", "ps-06.001"} <= prefixes
