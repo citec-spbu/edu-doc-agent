@@ -40,8 +40,11 @@ def test_cancellation_during_replace_finishes_metadata(tmp_path, monkeypatch):
     entered, release = threading.Event(), threading.Event()
     original = storage_module.os.replace
 
+    destinations = []
+
     def blocked_replace(*args, **kwargs):
-        if not entered.is_set():
+        destinations.append(str(args[1]))
+        if str(args[1]).endswith(".docx") and not entered.is_set():
             entered.set()
             assert release.wait(5)
         return original(*args, **kwargs)
@@ -53,6 +56,9 @@ def test_cancellation_during_replace_finishes_metadata(tmp_path, monkeypatch):
         task = asyncio.create_task(upload(dao, storage))
         try:
             assert await asyncio.to_thread(entered.wait, 5)
+            assert destinations[-1].endswith(".docx"), destinations
+            assert destinations[0].endswith("upload-reconciliation.json"), destinations
+            dao.create_document.assert_not_awaited()
             task.cancel()
             await asyncio.sleep(0)
             task.cancel()
@@ -65,7 +71,8 @@ def test_cancellation_during_replace_finishes_metadata(tmp_path, monkeypatch):
         dao.create_document.assert_awaited_once()
         values = dao.create_document.call_args.kwargs
         assert await storage.read(values["storage_key"]) == CONTENT
-        assert len(list(tmp_path.rglob("*.*"))) == 1
+        assert len([p for p in tmp_path.rglob("*") if p.is_file()]) == 1
+        assert await storage.list_upload_intents() == []
 
     asyncio.run(scenario())
 
@@ -161,8 +168,8 @@ def test_unknown_outcome_preserves_file_and_persistent_intent(tmp_path, lookup):
         values.update(kwargs)
         raise ConnectionError("commit acknowledgement lost")
 
-    async def lookup_document(**kwargs):
-        assert kwargs == {"session_id": values["session_id"], "doc_id": values["doc_id"]}
+    async def lookup_document(session_id, doc_id):
+        assert (session_id, doc_id) == (values["session_id"], values["doc_id"])
         if isinstance(lookup, Exception):
             raise lookup
         if lookup == "other-key":
@@ -180,12 +187,19 @@ def test_unknown_outcome_preserves_file_and_persistent_intent(tmp_path, lookup):
         assert await storage.read(values["storage_key"]) == CONTENT
         marker = next(tmp_path.rglob("*upload-reconciliation.json"))
         intent = json.loads(marker.read_bytes())
-        assert intent == {
-            "version": 1,
-            "doc_id": str(values["doc_id"]),
-            "session_id": values["session_id"],
-            "storage_key": values["storage_key"],
-        }
+        assert intent["version"] == 1
+        assert intent["doc_id"] == str(values["doc_id"])
+        assert intent["session_id"] == values["session_id"]
+        assert intent["storage_key"] == values["storage_key"]
+        assert intent.get("outcome", "unknown") == "unknown"
+        if lookup is None:
+            from edu_doc_agent.reconcile_uploads import reconcile_uploads
+
+            fresh_storage = LocalFileStorage(tmp_path)
+            for _ in range(2):
+                assert await reconcile_uploads(dao, fresh_storage) == {"unresolved": 1}
+                assert await fresh_storage.read(values["storage_key"]) == CONTENT
+                assert json.loads(marker.read_bytes()) == intent
         # Пустой SELECT может предшествовать позднему COMMIT: байты не удалены.
         assert len([p for p in tmp_path.rglob("*") if p.is_file()]) == 2
 

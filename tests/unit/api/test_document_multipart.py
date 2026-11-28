@@ -188,17 +188,17 @@ def test_empty_and_invalid_session_id(value):
 
 
 @pytest.mark.parametrize(
-    "files,data",
+    "files,data,expected_status",
     [
-        (None, {"file": "text instead of file"}),
-        ({"file": ("sample.docx", b"x"), "doc_type": ("type.txt", b"rpd")}, None),
+        (None, {"file": "text instead of file"}, 422),
+        ({"file": ("sample.docx", b"x"), "doc_type": ("type.txt", b"rpd")}, None, 400),
     ],
 )
-def test_invalid_form_field_types(upload_api, files, data):
+def test_invalid_form_field_types(upload_api, files, data, expected_status):
     app, dao, storage = upload_api
     with TestClient(app) as client:
         response = client.post(URL, files=files, data=data)
-    assert response.status_code == 422
+    assert response.status_code == expected_status
     assert_no_effects(dao, storage)
 
 

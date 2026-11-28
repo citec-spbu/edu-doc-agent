@@ -36,10 +36,11 @@ class UploadIntent(BaseModel):
 async def record_upload_rollback(
     storage: FileStorage, *, session_id: str, doc_id: UUID, storage_key: str, filename: str
 ) -> str:
-    """Сохраняет подтверждение DAO для компенсации после перезапуска.
+    """Сохраняет достоверное отсутствие создания для компенсации после перезапуска.
 
-    Вызывать только после DocumentCreateRolledBackError: исключения COMMIT
-    и пустой SELECT такого свидетельства не дают. save заменяет маркер атомарно.
+    Вызывать после отказа файловой записи до DAO либо DocumentCreateRolledBackError.
+    Исключения COMMIT и пустой SELECT такого свидетельства не дают.
+    save заменяет маркер атомарно.
     filename — исходное имя из save, до нормализации и сокращения пути.
     """
     intent = UploadIntent(

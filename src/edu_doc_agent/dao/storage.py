@@ -212,11 +212,19 @@ class LocalFileStorage:
         """Находит локальные маркеры; дальнейшее чтение проверяет путь через FD."""
 
         def scan() -> list[str]:
-            return sorted(
-                path.relative_to(self._base_dir).as_posix()
-                for path in self._base_dir.rglob("*upload-reconciliation.json")
-                if path.is_file()
-            )
+            def fail(error: OSError) -> None:
+                raise error
+
+            keys = []
+            # rglob скрывает PermissionError вложенных каталогов. walk с
+            # onerror не позволяет выдать неполный обход за успешную сверку.
+            for directory, _, filenames in os.walk(self._base_dir, onerror=fail):
+                for filename in filenames:
+                    if filename.endswith("upload-reconciliation.json"):
+                        keys.append(
+                            (Path(directory) / filename).relative_to(self._base_dir).as_posix()
+                        )
+            return sorted(keys)
 
         return await asyncio.to_thread(scan)
 

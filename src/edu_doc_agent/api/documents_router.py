@@ -206,17 +206,8 @@ async def upload_document(
         # Одна защищённая операция удерживает результат save, метаданные и
         # компенсацию. Внешняя (в том числе повторная) отмена не попадает в
         # LocalFileStorage.save и не скрывает ключ после os.replace.
-        storage_key = await storage.save(
-            session_id=session_id,
-            doc_id=doc_id,
-            filename=filename,
-            content=content,
-        )
-        # Записываем намерение ДО обращения к БД: при недоступной БД или
-        # перезапуске процесса останутся исходные ID и ключ для сверки.
-        # Этот служебный файл не имеет метаданных Document и не виден в API.
-        try:
-            intent_key = await storage.save(
+        async def save_intent(storage_key: str) -> str:
+            return await storage.save(
                 session_id=session_id,
                 doc_id=doc_id,
                 filename="upload-reconciliation.json",
@@ -229,9 +220,60 @@ async def upload_document(
                     }
                 ).encode("utf-8"),
             )
+
+        async def compensate_known_failure() -> None:
+            # Создание не начиналось либо DAO подтвердил rollback. Сохраняем
+            # этот исход до удаления байтов, чтобы пережить сбой очистки.
+            try:
+                await record_upload_rollback(
+                    storage,
+                    session_id=session_id,
+                    doc_id=doc_id,
+                    storage_key=storage_key,
+                    filename=filename,
+                )
+            except Exception:
+                # Текущий вызов знает отсутствие создания; ключ вычислен
+                # заранее либо получен из save. Компенсация нужна и при
+                # невозможности сохранить свидетельство для нового процесса.
+                logger.exception(
+                    "Не удалось записать подтверждение rollback: "
+                    "session_id=%s doc_id=%s storage_key=%s intent_key=%s",
+                    session_id,
+                    doc_id,
+                    storage_key,
+                    intent_key,
+                )
+            if await _cleanup_storage(storage, storage_key):
+                await _cleanup_storage(storage, intent_key)
+
+        # Локальный ключ известен до записи. Сначала сохраняем намерение:
+        # остановка процесса после записи байтов всегда оставляет маркер.
+        # Отказ записи маркера или байтов возможен и после replace. Оба ключа
+        # известны заранее: компенсация не зависит от подтверждения save.
+        if isinstance(storage, LocalFileStorage):
+            storage_key = storage.key_for(session_id, doc_id, filename)
+            intent_key = storage.key_for(session_id, doc_id, "upload-reconciliation.json")
+        try:
+            if isinstance(storage, LocalFileStorage):
+                intent_key = await save_intent(storage_key)
+            storage_key = await storage.save(
+                session_id=session_id,
+                doc_id=doc_id,
+                filename=filename,
+                content=content,
+            )
         except BaseException:
-            await _cleanup_storage(storage, storage_key)
+            if isinstance(storage, LocalFileStorage):
+                await compensate_known_failure()
             raise
+        if not isinstance(storage, LocalFileStorage):
+            # Другие реализации выдают ключ только после save.
+            try:
+                intent_key = await save_intent(storage_key)
+            except BaseException:
+                await _cleanup_storage(storage, storage_key)
+                raise
 
         try:
             doc = await dao.create_document(
@@ -244,29 +286,7 @@ async def upload_document(
                 doc_type=normalized_doc_type,
             )
         except DocumentCreateRolledBackError:
-            # Свидетельство rollback должно пережить сбой удаления файла
-            # и перезапуск API. Обычного намерения и пустого SELECT недостаточно.
-            try:
-                await record_upload_rollback(
-                    storage,
-                    session_id=session_id,
-                    doc_id=doc_id,
-                    storage_key=storage_key,
-                    filename=filename,
-                )
-            except Exception:
-                # Текущий вызов знает rollback и ключ прямо из save, даже
-                # если сохранить это свидетельство для нового процесса нельзя.
-                logger.exception(
-                    "Не удалось записать подтверждение rollback: "
-                    "session_id=%s doc_id=%s storage_key=%s intent_key=%s",
-                    session_id,
-                    doc_id,
-                    storage_key,
-                    intent_key,
-                )
-            if await _cleanup_storage(storage, storage_key):
-                await _cleanup_storage(storage, intent_key)
+            await compensate_known_failure()
             raise
         except BaseException as exc:
             # Новый SELECT способен подтвердить COMMIT только найденной

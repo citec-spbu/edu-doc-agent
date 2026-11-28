@@ -527,3 +527,225 @@ def test_delete_cleanup_failure_is_reported_and_retry_completes(
     assert listed.json() == {"items": []}
     assert api.client.get(f"{URL}/{doc_id}").status_code == 404
     api.storage.read.assert_not_awaited()
+
+
+@pytest.mark.parametrize("second_field", ["file", "other"])
+def test_post_rejects_second_file_before_persistence(documents_api, second_field):
+    api = documents_api
+    response = api.client.post(
+        URL, files=[("file", ("a.pdf", b"A")), (second_field, ("b.pdf", b"B"))]
+    )
+    assert response.status_code == 400, response.text
+    assert_no_writes(api)
+    assert api.dao.mock_calls == []
+    assert api.storage.mock_calls == []
+
+
+@pytest.mark.parametrize("text_first", [False, True])
+def test_single_file_and_doc_type_in_either_order(documents_api, text_first):
+    parts = [("file", ("a.pdf", b"A")), ("doc_type", (None, "rpd"))]
+    response = documents_api.client.post(URL, files=parts[::-1] if text_first else parts)
+    assert response.status_code == 201, response.text
+    assert response.json()["doc_type"] == "rpd"
+    row = next(iter(documents_api.rows.values()))
+    assert documents_api.files[row.storage_key] == b"A"
+
+
+@pytest.mark.parametrize("session_id", ["", "%20", "%00", "valid"])
+def test_session_validation_precedes_multipart_limit(documents_api, monkeypatch, session_id):
+    settings = SimpleNamespace(max_upload_file_bytes=4)
+    monkeypatch.setattr(multipart, "get_settings", lambda: settings)
+    monkeypatch.setattr(documents_router, "get_settings", lambda: settings)
+    api = documents_api
+    response = api.client.post(
+        f"/api/v1/sessions/{session_id}/documents",
+        files={"file": ("a.pdf", b"12345")},
+        follow_redirects=False,
+    )
+    assert response.status_code == (413 if session_id == "valid" else 400), response.text
+    if session_id != "valid":
+        assert response.json() == {"detail": "Некорректный идентификатор сессии."}
+    assert_no_writes(api)
+    assert api.dao.mock_calls == []
+    assert api.storage.mock_calls == []
+
+
+def test_lost_commit_ack_with_local_storage_keeps_download_available(
+    documents_api, tmp_path, monkeypatch
+):
+    from edu_doc_agent.dao import LocalFileStorage
+
+    api = documents_api
+    storage = LocalFileStorage(tmp_path)
+    monkeypatch.setitem(app.dependency_overrides, get_file_storage, lambda: storage)
+    create = api.dao.create_document.side_effect
+
+    async def committed_without_reply(**values):
+        await create(**values)
+        raise ConnectionError("synthetic lost commit acknowledgement")
+
+    api.dao.create_document.side_effect = committed_without_reply
+    response = upload(api, filename="a.pdf", content=b"A")
+    assert response.status_code == 201, response.text
+    downloaded = api.client.get(f"{URL}/{response.json()['id']}")
+    assert downloaded.status_code == 200
+    assert downloaded.content == b"A"
+    assert asyncio.run(storage.list_upload_intents()) == []
+    assert len([p for p in tmp_path.rglob("*") if p.is_file()]) == 1
+
+
+@pytest.mark.parametrize("published", [False, True], ids=["before-replace", "after-replace"])
+@pytest.mark.parametrize("cleanup_failure", [None, "content", "marker"])
+def test_local_save_failure_before_dao_is_compensated(
+    documents_api, tmp_path, monkeypatch, published, cleanup_failure
+):
+    import errno
+    import json
+
+    from edu_doc_agent.dao import LocalFileStorage
+    from edu_doc_agent.dao import storage as storage_module
+    from edu_doc_agent.reconcile_uploads import reconcile_uploads
+    from tests.unit.api.test_upload_process_boundaries import run_python
+
+    api = documents_api
+    root = tmp_path / "storage"
+    storage = LocalFileStorage(root)
+    monkeypatch.setitem(app.dependency_overrides, get_file_storage, lambda: storage)
+    original_replace = storage_module.os.replace
+    original_unlink = storage_module.os.unlink
+    observed = []
+
+    def fail_replace(source, destination, **kwargs):
+        if str(destination).endswith(".pdf"):
+            observed.append(destination)
+            if published:
+                original_replace(source, destination, **kwargs)
+            raise OSError(errno.ENOSPC, "synthetic document save failure")
+        return original_replace(source, destination, **kwargs)
+
+    def fail_unlink(name, **kwargs):
+        is_content = str(name).endswith(".pdf")
+        is_marker = str(name).endswith("upload-reconciliation.json")
+        if (cleanup_failure == "content" and is_content) or (
+            cleanup_failure == "marker" and is_marker
+        ):
+            raise OSError(errno.EIO, "synthetic temporary cleanup failure")
+        return original_unlink(name, **kwargs)
+
+    with monkeypatch.context() as boundary:
+        boundary.setattr(storage_module.os, "replace", fail_replace)
+        boundary.setattr(storage_module.os, "unlink", fail_unlink)
+        response = upload(api, filename="a.pdf", content=b"A")
+    assert response.status_code == 500, response.text
+    assert len(observed) == 1
+    assert api.dao.mock_calls == []
+    markers = asyncio.run(storage.list_upload_intents())
+    if cleanup_failure is None:
+        assert markers == []
+    if markers:
+        marker = json.loads(asyncio.run(storage.read(markers[0])))
+        assert marker["outcome"] == "rolled_back"
+        assert marker["session_id"] == "synthetic-session"
+        assert marker["storage_key"] == storage.key_for(
+            marker["session_id"], marker["doc_id"], "a.pdf"
+        )
+        assert marker["filename"] == "a.pdf"
+        assert asyncio.run(storage.exists(marker["storage_key"])) == (
+            published and cleanup_failure == "content"
+        )
+        # Новый процесс не видит состояние POST. Только DAO заменён пустым
+        # SELECT; штатный CLI должен завершить известную компенсацию.
+        code = """
+import runpy
+from unittest.mock import AsyncMock
+from types import SimpleNamespace
+import edu_doc_agent.dao as dao
+dao.DocumentDAO = lambda: SimpleNamespace(
+    get_document_for_reconciliation=AsyncMock(return_value=None)
+)
+runpy.run_module("edu_doc_agent.reconcile_uploads", run_name="__main__")
+"""
+        for expected in ({"rolled_back": 1}, {}):
+            result = run_python(tmp_path, code, storage_dir=root)
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert json.loads(result.stdout) == expected
+    else:
+        assert cleanup_failure is None or (cleanup_failure == "content" and not published)
+        fresh_dao = SimpleNamespace(get_document_for_reconciliation=AsyncMock(return_value=None))
+        for _ in range(2):
+            assert asyncio.run(reconcile_uploads(fresh_dao, LocalFileStorage(root))) == {}
+    assert not [p for p in root.rglob("*") if p.is_file()]
+
+
+@pytest.mark.parametrize("published", [False, True], ids=["before-replace", "after-replace"])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_initial_marker_save_failure_is_compensated(
+    documents_api, tmp_path, monkeypatch, published, cleanup_fails
+):
+    import errno
+    import json
+
+    from edu_doc_agent.dao import LocalFileStorage
+    from edu_doc_agent.dao import storage as storage_module
+    from tests.unit.api.test_upload_process_boundaries import run_python
+
+    api = documents_api
+    root = tmp_path / "storage"
+    storage = LocalFileStorage(root)
+    monkeypatch.setitem(app.dependency_overrides, get_file_storage, lambda: storage)
+    replace, unlink = storage_module.os.replace, storage_module.os.unlink
+    marker_attempts = []
+    content_attempts = []
+
+    def fail_initial_marker(source, destination, **kwargs):
+        if str(destination).endswith(".pdf"):
+            content_attempts.append(destination)
+        if str(destination).endswith("upload-reconciliation.json"):
+            marker_attempts.append(destination)
+            if len(marker_attempts) == 1:
+                if published:
+                    replace(source, destination, **kwargs)
+                raise OSError(errno.EIO, "synthetic initial marker write failure")
+        return replace(source, destination, **kwargs)
+
+    def fail_marker_cleanup(name, **kwargs):
+        if cleanup_fails and str(name).endswith("upload-reconciliation.json"):
+            raise OSError(errno.EIO, "synthetic temporary marker cleanup failure")
+        return unlink(name, **kwargs)
+
+    with monkeypatch.context() as boundary:
+        boundary.setattr(storage_module.os, "replace", fail_initial_marker)
+        boundary.setattr(storage_module.os, "unlink", fail_marker_cleanup)
+        response = upload(api, filename="a.pdf", content=b"A")
+    assert response.status_code == 500, response.text
+    assert api.dao.mock_calls == []
+    assert content_attempts == []
+    assert not list(root.rglob("*.pdf"))
+    markers = asyncio.run(storage.list_upload_intents())
+    assert len(markers) == int(cleanup_fails)
+    if cleanup_fails:
+        intent = json.loads(asyncio.run(storage.read(markers[0])))
+        assert intent["outcome"] == "rolled_back"
+        assert intent["session_id"] == "synthetic-session"
+        assert intent["filename"] == "a.pdf"
+        assert intent["storage_key"] == storage.key_for(
+            intent["session_id"], intent["doc_id"], "a.pdf"
+        )
+        assert markers[0] == storage.key_for(
+            intent["session_id"], intent["doc_id"], "upload-reconciliation.json"
+        )
+    code = """
+import runpy
+from unittest.mock import AsyncMock
+from types import SimpleNamespace
+import edu_doc_agent.dao as dao
+dao.DocumentDAO = lambda: SimpleNamespace(
+    get_document_for_reconciliation=AsyncMock(return_value=None)
+)
+runpy.run_module("edu_doc_agent.reconcile_uploads", run_name="__main__")
+"""
+    for expected in [{"rolled_back": 1}, {}] if cleanup_fails else [{}, {}]:
+        result = run_python(tmp_path, code, storage_dir=root)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert json.loads(result.stdout) == expected
+        assert not [p for p in root.rglob("*") if p.is_file()]

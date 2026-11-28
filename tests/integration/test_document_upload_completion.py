@@ -134,8 +134,11 @@ def test_cancellation_during_real_save_finishes_real_metadata(upload_backend, mo
     entered, release = threading.Event(), threading.Event()
     replace = storage_module.os.replace
 
+    destinations = []
+
     def blocked_replace(*args, **kwargs):
-        if not entered.is_set():
+        destinations.append(str(args[1]))
+        if str(args[1]).endswith(".docx") and not entered.is_set():
             entered.set()
             assert release.wait(5)
         return replace(*args, **kwargs)
@@ -149,6 +152,9 @@ def test_cancellation_during_real_save_finishes_real_metadata(upload_backend, mo
             task = asyncio.create_task(api.post(URL, files={"file": ("test.docx", CONTENT)}))
             try:
                 assert await asyncio.to_thread(entered.wait, 5)
+                assert destinations[-1].endswith(".docx"), destinations
+                assert destinations[0].endswith("upload-reconciliation.json"), destinations
+                create.assert_not_awaited()
                 task.cancel()
                 await asyncio.sleep(0)
                 task.cancel()
@@ -448,3 +454,70 @@ def test_maintenance_cli_can_be_repeated(upload_backend, migrated_database, tmp_
         assert json.loads(result.stdout) == {"unresolved": 1}
         assert asyncio.run(storage.read(unknown_key)) == CONTENT
         assert len(list(storage.base_dir.rglob("*upload-reconciliation.json"))) == 1
+
+
+@pytest.mark.parametrize("published", [False, True], ids=["before-replace", "after-replace"])
+@pytest.mark.parametrize("cleanup_failure", [None, "content", "marker"])
+def test_save_failure_before_dao_compensates_or_recovers_in_new_cli(
+    upload_backend, migrated_database, tmp_path, monkeypatch, published, cleanup_failure
+):
+    import errno
+    import json
+
+    from tests.integration.test_upload_failure_boundaries import cli_process
+
+    sessions, dao, storage = upload_backend
+    create = AsyncMock(wraps=dao.create_document)
+    monkeypatch.setattr(dao, "create_document", create)
+    replace, unlink = storage_module.os.replace, storage_module.os.unlink
+    attempted = []
+
+    def fail_replace(source, destination, **kwargs):
+        if str(destination).endswith(".pdf"):
+            attempted.append(destination)
+            if published:
+                replace(source, destination, **kwargs)
+            raise OSError(errno.ENOSPC, "synthetic PDF save failure")
+        return replace(source, destination, **kwargs)
+
+    def fail_unlink(name, **kwargs):
+        is_content = str(name).endswith(".pdf")
+        is_marker = str(name).endswith("upload-reconciliation.json")
+        if (cleanup_failure == "content" and is_content) or (
+            cleanup_failure == "marker" and is_marker
+        ):
+            raise OSError(errno.EIO, "synthetic temporary cleanup failure")
+        return unlink(name, **kwargs)
+
+    async def scenario():
+        with monkeypatch.context() as boundary:
+            boundary.setattr(storage_module.os, "replace", fail_replace)
+            boundary.setattr(storage_module.os, "unlink", fail_unlink)
+            async with client() as api:
+                response = await api.post(URL, files={"file": ("a.pdf", CONTENT)})
+        assert response.status_code == 500, response.text
+        assert len(attempted) == 1
+        create.assert_not_awaited()
+        async with sessions() as db:
+            assert (await db.scalars(select(Document))).all() == []
+        markers = await storage.list_upload_intents()
+        pending_cleanup = cleanup_failure == "marker" or (
+            cleanup_failure == "content" and published
+        )
+        assert len(markers) == int(pending_cleanup)
+        if markers:
+            marker = json.loads(await storage.read(markers[0]))
+            assert marker["outcome"] == "rolled_back"
+            assert marker["session_id"] == SESSION_ID
+            assert marker["filename"] == "a.pdf"
+            assert marker["storage_key"] == storage.key_for(SESSION_ID, marker["doc_id"], "a.pdf")
+            assert await storage.exists(marker["storage_key"]) == (
+                published and cleanup_failure == "content"
+            )
+        for expected in [{"rolled_back": 1}, {}] if pending_cleanup else [{}, {}]:
+            result = await cli_process(migrated_database, tmp_path, storage.base_dir)
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert json.loads(result.stdout) == expected
+            assert not [p for p in storage.base_dir.rglob("*") if p.is_file()]
+
+    asyncio.run(scenario())

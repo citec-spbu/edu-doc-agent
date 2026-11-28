@@ -36,6 +36,11 @@ class BoundedMultipartRoute(APIRoute):
         handler = super().get_route_handler()
 
         async def receive_form(request: Request):
+            # Path-параметры уже известны, тело ещё не читалось. Ленивый импорт
+            # оставляет валидатор единым с остальными Documents endpoints.
+            from edu_doc_agent.api.documents_router import _validate_session_id
+
+            _validate_session_id(request.path_params["session_id"])
             content_type, _ = parse_options_header(request.headers.get("content-type", ""))
             if request.method != "POST" or content_type != b"multipart/form-data":
                 return await handler(request)
@@ -43,6 +48,7 @@ class BoundedMultipartRoute(APIRoute):
             parser = BoundedMultiPartParser(
                 request.headers,
                 request.stream(),
+                max_files=1,
                 max_file_bytes=get_settings().max_upload_file_bytes,
             )
             try:

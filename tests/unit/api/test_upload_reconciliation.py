@@ -192,3 +192,33 @@ def test_cli_validates_storage_root(tmp_path, monkeypatch, capsys, root_kind):
         output = capsys.readouterr()
         assert str(root) in output.err
         assert not output.out
+
+
+@pytest.mark.parametrize("explicit_outcome", [False, True])
+def test_unknown_marker_representations_remain_unresolved_on_repeat(tmp_path, explicit_outcome):
+    async def scenario():
+        storage = LocalFileStorage(tmp_path)
+        doc_id, key, marker_key = await seed(storage)
+        marker = json.loads(await storage.read(marker_key))
+        if explicit_outcome:
+            marker["outcome"] = "unknown"
+            await storage.save(
+                session_id="synthetic",
+                doc_id=doc_id,
+                filename=INTENT_FILENAME,
+                content=json.dumps(marker).encode(),
+            )
+        original_marker = await storage.read(marker_key)
+        assert marker["session_id"] == "synthetic"
+        assert marker["doc_id"] == str(doc_id)
+        assert marker["storage_key"] == key
+        assert marker.get("outcome", "unknown") == "unknown"
+        dao = SimpleNamespace(get_document_for_reconciliation=AsyncMock(return_value=None))
+        for _ in range(2):
+            assert await reconcile_uploads(dao, LocalFileStorage(tmp_path)) == {"unresolved": 1}
+            assert await storage.read(key) == b"synthetic bytes"
+            assert await storage.read(marker_key) == original_marker
+        assert dao.get_document_for_reconciliation.await_count == 2
+        dao.get_document_for_reconciliation.assert_awaited_with("synthetic", doc_id)
+
+    asyncio.run(scenario())
