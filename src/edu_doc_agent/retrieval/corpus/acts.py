@@ -15,6 +15,9 @@
 приложений-форм. Фрагмент — пункт («15.», «17(1).»): id `order-245:15`; абзацы без номера
 дописываются к пункту, разделы «II. …» идут в `path`.
 
+Перечень (`layout: list`, приказ № 1061): фрагмент — строка перечня направлений подготовки,
+id `order-1061:02.03.02`, kind `direction`, код направления — в `codes`.
+
 Общее: служебные вставки ГАРАНТа убираются (`garant.py`), «Информация об изменениях» ->
 `changed_by` фрагмента, утратившие силу части и пункты не берутся, сноски после черты
 «──────» отбрасываются.
@@ -33,7 +36,7 @@ from edu_doc_agent.retrieval.corpus.models import (
     Fragment,
 )
 
-ActLayout = Literal["law", "order"]
+ActLayout = Literal["law", "order", "list"]
 LAYOUTS: tuple[str, ...] = ActLayout.__args__
 
 _CHAPTER = re.compile(r"^Глава\s+\d+(?:\.\d+)?\.\s")
@@ -45,6 +48,11 @@ _SECTION = re.compile(r"^[IVX]+\.\s+\S")
 _APPROVED = re.compile(r"^УТВЕРЖДЕН[АОЫ]?\b|^Утвержден[аоы]?$", re.IGNORECASE)
 _DOCUMENT_TITLE = re.compile(r"^(?:Порядок|Положение|Правила|Требования)\b")
 _APPENDIX = re.compile(r"^Приложение\b")
+# перечень направлений подготовки (приказ № 1061)
+_DIRECTION_CODE = re.compile(r"\d{2}\.\d{2}\.\d{2}")
+_DIRECTION_LINE = re.compile(r"^(\d{2}\.\d{2}\.\d{2})\s+(.+)$", re.S)
+_LIST_APPENDIX = re.compile(r"^Приложение\s*(?:№|N)\s*\d+")
+_QUALIFICATIONS = ("Бакалавр", "Магистр")
 # пункт части, утративший силу: «3) утратил силу с 5 мая 2020 г. - …»
 _REPEALED_ITEM = re.compile(r"^(?:\d+(?:\.\d+)?|[а-я])\)\s*утратил[аио]?\s+силу", re.I)
 # две части в одном абзаце (парсер не увидел границу): «3. … образования. 4. В Российской…»
@@ -73,6 +81,9 @@ class _Unit:
 
 def chunk_act(parsed: ParsedDocument, info: DocumentInfo, layout: ActLayout) -> CorpusDocument:
     warnings: list[str] = []
+    if layout == "list":
+        fragments = _list_fragments(parsed.blocks, info, warnings)
+        return CorpusDocument(document=info, fragments=fragments, warnings=warnings)
     blocks = _unglued(parsed.blocks)
     if layout == "law":
         units, notes = _law_units(blocks, warnings)
@@ -274,6 +285,99 @@ def _order_body(blocks: list[Block]) -> int | None:
         elif approved and _DOCUMENT_TITLE.match(block.text):
             return i
     return None
+
+
+# Перечень направлений подготовки
+
+
+def _list_fragments(blocks: list[Block], info: DocumentInfo, warnings: list[str]) -> list[Fragment]:
+    """Строки перечней («02.03.02 | Фундаментальная информатика… | Бакалавр») -> фрагменты.
+
+    Перечень начинается после «Приложение № N» абзацем «Перечень направлений…»; строки
+    укрупнённых групп («02.00.00 | КОМПЬЮТЕРНЫЕ И ИНФОРМАЦИОННЫЕ НАУКИ») — `category`.
+    Строка, которую парсер не узнал как строку таблицы, приходит абзацем «26.03.04
+    Инженерно-экономическое Бакалавр обеспечение…»: квалификация «Бакалавр»/«Магистр»
+    вынимается из текста, иначе строка остаётся целиком (с предупреждением); следующие абзацы
+    до новой строки перечня — продолжение названия.
+    """
+    title = group = ""
+    rows: list[dict[str, str]] = []
+    loose = False  # последняя строка пришла абзацем: следующие абзацы — её продолжение
+    for block in blocks:
+        if block.kind == BlockKind.TABLE:
+            if garant.change_note(block) or garant.is_service_table(block) or not title:
+                continue
+            for cells in ([c.replace("\n", " ").strip() for c in row] for row in block.rows):
+                if not cells or not _DIRECTION_CODE.fullmatch(cells[0]):
+                    continue
+                name = cells[1] if len(cells) > 1 else ""
+                if cells[0].endswith(".00.00"):
+                    group = _group(cells[0], name)
+                else:
+                    qualification = cells[2] if len(cells) > 2 else ""
+                    rows.append(_row(cells[0], name, qualification, title, group))
+            loose = False
+            continue
+        text = garant.clean_text(block.text)
+        if _LIST_APPENDIX.match(text):
+            title, loose = "", False
+        elif text.startswith("Перечень") and not title:
+            title = re.split(r"\s+\(утв\.|\s+С изменениями и дополнениями", text)[0]
+        elif not title or garant.is_service_paragraph(text):
+            continue
+        elif match := _DIRECTION_LINE.match(text):
+            code, rest = match.groups()
+            if code.endswith(".00.00"):
+                group, loose = _group(code, rest), False
+                continue
+            name, qualification = _split_qualification(rest)
+            if not qualification:
+                warnings.append(f"{code}: квалификация не отделена от названия")
+            rows.append(_row(code, name, qualification, title, group))
+            loose = True
+        elif loose and rows:  # квалификация из текста — одно слово, продолжение — названия
+            rows[-1]["name"] = f"{rows[-1]['name']} {text}"
+    if not rows:
+        warnings.append("ОШИБКА: не найдено ни одной строки перечня")
+    fragments: dict[str, Fragment] = {}
+    for row in rows:
+        fid = f"{info.doc_id}:{row['code']}"
+        if fid in fragments:
+            warnings.append(f"{row['code']}: повтор строки перечня — оставлена первая")
+            continue
+        text = f"{row['code']} {row['name']}"
+        if row["qualification"]:
+            text += f"\nКвалификация: {row['qualification']}"
+        fragments[fid] = Fragment(
+            id=fid,
+            doc_type=info.doc_type,
+            doc_id=info.doc_id,
+            edition=info.edition,
+            kind="direction",
+            number=row["code"],
+            path=" › ".join(p for p in (row["title"], row["group"]) if p),
+            text=text,
+            codes=[row["code"]],
+            category=row["group"] or None,
+        )
+    return list(fragments.values())
+
+
+def _row(code: str, name: str, qualification: str, title: str, group: str) -> dict[str, str]:
+    return {"code": code, "name": name, "qualification": qualification, "title": title,
+            "group": group}  # fmt: skip
+
+
+def _group(code: str, name: str) -> str:
+    # «ИНФОРМАЦИОННО-БИБЛИОТЕЧ- НОЕ ДЕЛО» — перенос внутри слова в узкой ячейке
+    return f"{code} {re.sub(r'(?<=[А-ЯЁ])- (?=[А-ЯЁ])', '', name)}".strip()
+
+
+def _split_qualification(rest: str) -> tuple[str, str]:
+    for qualification in _QUALIFICATIONS:
+        if f" {qualification}" in rest:
+            return rest.replace(f" {qualification}", "", 1).strip(), qualification
+    return rest.strip(), ""
 
 
 # Фрагменты

@@ -185,7 +185,7 @@ class RegulationFragment(Base):
         ),
         CheckConstraint(
             "kind IN ('clause', 'competency', 'prof_standard_ref', 'prof_standard', "
-            "'generalized_function', 'labor_function')",
+            "'generalized_function', 'labor_function', 'direction')",
             name="ck_regulation_fragments_kind",
         ),
         CheckConstraint("part >= 0", name="ck_regulation_fragments_part_nonnegative"),

@@ -194,3 +194,79 @@ def test_order_is_cut_into_points_of_the_approved_document() -> None:
 def test_order_without_approved_document_is_an_error() -> None:
     doc = chunk_act(ParsedDocument(source="x", blocks=[para("1. Утвердить.")]), info("x"), "order")
     assert doc.fragments == [] and any(w.startswith("ОШИБКА") for w in doc.warnings)
+
+
+LIST = ParsedDocument(
+    source="list.pdf",
+    blocks=[
+        para('Приказ Министерства от 12 сентября 2013 г. N 1061 "Об утверждении перечней"', H),
+        para("ГАРАНТ: Настоящий документ признан утратившим силу с 1 сентября 2027 г."),
+        para("1. Утвердить перечни."),
+        para("Приложение N 1", H),
+        para("Перечень направлений подготовки высшего образования - бакалавриата"),
+        para("(утв. приказом Министерства от 12 сентября 2013 г. N 1061)", H),
+        Block(
+            T,
+            "",
+            rows=[
+                ["Коды", "Наименования направлений", "Квалификация"],
+                ["02.00.00", "КОМПЬЮТЕРНЫЕ И ИНФОРМАЦИОННЫЕ НАУКИ", ""],
+                ["02.03.01", "Математика и компьютерные\nнауки", "Бакалавр"],
+                ["02.03.02", "Фундаментальная информатика", "Бакалавр"],
+            ],
+        ),
+        para("09.00.00 ИНФОРМАТИКА И ВЫЧИСЛИТЕЛЬНАЯ ТЕХНИКА"),
+        # строка, не узнанная как строка таблицы: квалификация посреди названия
+        para("09.03.03 Прикладная Бакалавр"),
+        para("информатика"),
+        para("53.03.01 Музыкальное искусство эстрады Концертный исполнитель."),
+        para("Артист ансамбля"),
+        para("Приложение N 2", H),
+        para("Перечень направлений подготовки высшего образования - магистратуры"),
+        Block(T, "", rows=[["02.04.02", "Фундаментальная информатика", "Магистр"]]),
+    ],
+)
+
+
+def test_list_rows_become_directions_with_group_and_qualification() -> None:
+    doc = chunk_act(LIST, info("order-1061"), "list")
+    by_id = {f.id: f for f in doc.fragments}
+    assert list(by_id) == [
+        "order-1061:02.03.01",
+        "order-1061:02.03.02",
+        "order-1061:09.03.03",
+        "order-1061:53.03.01",
+        "order-1061:02.04.02",
+    ]  # строки укрупнённых групп — не фрагменты, а `category`
+    first = by_id["order-1061:02.03.01"]
+    assert (first.kind, first.number, first.codes) == ("direction", "02.03.01", ["02.03.01"])
+    assert first.text == "02.03.01 Математика и компьютерные науки\nКвалификация: Бакалавр"
+    assert first.category == "02.00.00 КОМПЬЮТЕРНЫЕ И ИНФОРМАЦИОННЫЕ НАУКИ"
+    assert first.path == (
+        "Перечень направлений подготовки высшего образования - бакалавриата"
+        " › 02.00.00 КОМПЬЮТЕРНЫЕ И ИНФОРМАЦИОННЫЕ НАУКИ"
+    )
+    loose = by_id["order-1061:09.03.03"]
+    assert loose.text == "09.03.03 Прикладная информатика\nКвалификация: Бакалавр"
+    assert loose.category == "09.00.00 ИНФОРМАТИКА И ВЫЧИСЛИТЕЛЬНАЯ ТЕХНИКА"
+    # квалификацию не отделить — строка целиком, без подписи, с предупреждением
+    assert by_id["order-1061:53.03.01"].text == (
+        "53.03.01 Музыкальное искусство эстрады Концертный исполнитель. Артист ансамбля"
+    )
+    assert doc.warnings == ["53.03.01: квалификация не отделена от названия"]
+    master = by_id["order-1061:02.04.02"]
+    assert master.path.startswith("Перечень направлений подготовки высшего образования - магистр")
+    assert master.text.endswith("Квалификация: Магистр")
+
+
+def test_list_requisites_note_expiry() -> None:
+    found = garant.act_requisites(LIST)
+    assert found["approval_act"] == (
+        'Приказ Министерства от 12 сентября 2013 г. N 1061 "Об утверждении перечней"'
+        "; утрачивает силу с 01.09.2027"
+    )
+
+
+def test_list_without_rows_is_an_error() -> None:
+    doc = chunk_act(ParsedDocument(source="x", blocks=[para("1. Утвердить.")]), info("x"), "list")
+    assert doc.fragments == [] and doc.warnings[0].startswith("ОШИБКА")

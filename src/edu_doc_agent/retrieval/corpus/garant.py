@@ -27,6 +27,9 @@ _SINCE = re.compile(r"\b(с \d{1,2} [а-я]+ \d{4} г\.)")
 _ACT = re.compile(r"^(?:Федеральн|Приказ|Постановлени|Указ|Распоряжени)")
 _MONTHS = "января февраля марта апреля мая июня июля августа сентября октября ноября декабря"
 _RU_DATE = re.compile(rf"(\d{{1,2}})\s+({_MONTHS.replace(' ', '|')})\s+(\d{{4}})")
+_EXPIRY = re.compile(
+    rf"документ признан утратившим силу с (\d{{1,2}} (?:{_MONTHS.replace(' ', '|')}) \d{{4}})"
+)
 _NUMBER = re.compile(r"(?:N|№)\s*(\d+(?:/\d+)?(?:-ФЗ)?)")
 _ACT_DATE = re.compile(rf"от\s+(\d{{1,2}}\s+(?:{_MONTHS.replace(' ', '|')})\s+\d{{4}})")
 
@@ -75,11 +78,12 @@ def change_note(block: Block) -> tuple[str, ChangeNote] | None:
 
 
 def act_requisites(parsed: ParsedDocument) -> dict[str, str]:
-    """Название, номер и редакция по шапке выгрузки.
+    """Название, номер, редакция и срок действия по шапке выгрузки.
 
     Название — первый абзац и его продолжения (незакрытые кавычки, строчная буква или «(» в
     начале следующего абзаца); редакция — последняя дата из рамки «С изменениями и дополнениями
-    от:» (у документа без изменений — дата самого акта).
+    от:» (у документа без изменений — дата самого акта); если ГАРАНТ отмечает, что документ
+    утрачивает силу, дата дописывается к `approval_act`.
     """
     texts = [b.text for b in parsed.blocks[:10] if b.kind != BlockKind.TABLE and b.text]
     head = texts[:1]
@@ -102,12 +106,23 @@ def act_requisites(parsed: ParsedDocument) -> dict[str, str]:
         and block.rows[0][0].startswith(EDITION_HEADER)
     ]
     changes = [d for block in frames for row in block.rows[1:] for d in _dates(row[0])]
+    if expiry := _expiry(parsed.blocks[:10]):
+        found["approval_act"] = f"{title}; утрачивает силу с {expiry:%d.%m.%Y}"
     if number:
         if changes:
             found["edition"] = f"{number.group(1)} ред. от {max(changes):%d.%m.%Y}"
         elif signed:
             found["edition"] = f"{number.group(1)} от {_dates(signed.group(1))[0]:%d.%m.%Y}"
     return found
+
+
+def _expiry(blocks: list[Block]) -> date | None:
+    """«ГАРАНТ: … настоящий документ признан утратившим силу с 1 сентября 2027 г.»"""
+    texts = [b.text for b in blocks] + [row[0] for b in blocks for row in b.rows if row]
+    for text in texts:
+        if match := _EXPIRY.search(text):
+            return _dates(match.group(1))[0]
+    return None
 
 
 def _dates(text: str) -> list[date]:

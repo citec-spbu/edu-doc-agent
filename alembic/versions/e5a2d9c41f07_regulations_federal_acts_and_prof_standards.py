@@ -19,7 +19,7 @@ NEW_DOC_TYPES = "doc_type IN ('fgos', 'spbu_standard', 'prof_standard', 'federal
 OLD_KINDS = "kind IN ('clause', 'competency', 'prof_standard_ref')"
 NEW_KINDS = (
     "kind IN ('clause', 'competency', 'prof_standard_ref', 'prof_standard', "
-    "'generalized_function', 'labor_function')"
+    "'generalized_function', 'labor_function', 'direction')"
 )
 
 
@@ -38,7 +38,7 @@ def downgrade() -> None:
     # новые документы и фрагменты не подходят под старые ограничения — удаляем их
     op.execute(
         "DELETE FROM regulation_fragments WHERE kind IN "
-        "('prof_standard', 'generalized_function', 'labor_function')"
+        "('prof_standard', 'generalized_function', 'labor_function', 'direction')"
     )
     op.execute("DELETE FROM regulation_documents WHERE doc_type = 'federal_act'")
     _replace("regulation_fragments", "ck_regulation_fragments_kind", OLD_KINDS)

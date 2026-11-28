@@ -140,4 +140,26 @@ def test_federal_acts_and_prof_standards(tmp_path: Path, monkeypatch: pytest.Mon
     assert len(failures) == 1 and "layout" in failures[0]
     write(documents, tmp_path / "corpus", failures)
     report = (tmp_path / "corpus" / "REPORT.md").read_text(encoding="utf-8")
-    assert "| ps-99.001 |" in report and "| 1 | 0 |" in report  # одна трудовая функция
+    assert "| ps-99.001 |" in report and "| 1 | 0 | 0 |" in report  # одна трудовая функция
+
+
+SCAN = (
+    b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+    b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+    b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]>>endobj\n"
+    b"trailer<</Root 1 0 R>>\n%%EOF\n"
+)
+
+
+def test_prof_standard_pdf(tmp_path: Path) -> None:
+    fixture = Path(__file__).parents[2] / "fixtures" / "profstandard_normal_01.pdf"
+    (tmp_path / "prof_standards").mkdir()
+    (tmp_path / "prof_standards" / "99.001.pdf").write_bytes(fixture.read_bytes())
+    (tmp_path / "prof_standards" / "scan.pdf").write_bytes(SCAN)  # скан: страница без текста
+    manifest = {"sources": [{"files": "prof_standards/*.pdf", "type": "prof_standard"}]}
+    (tmp_path / "manifest.yaml").write_text(yaml.safe_dump(manifest), encoding="utf-8")
+    documents, failures = build(tmp_path / "manifest.yaml")
+    assert [d.document.doc_id for d in documents] == ["ps-99.001"]
+    assert documents[0].document.source_file == "99.001.pdf"
+    assert len(documents[0].fragments) == 4
+    assert len(failures) == 1 and failures[0].startswith("scan.pdf:") and "OCR" in failures[0]

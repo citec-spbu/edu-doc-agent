@@ -1,4 +1,5 @@
-"""Федеральные акты и профстандарты в базе (#50): новые типы, точный поиск по статьям и кодам."""
+"""Федеральные акты и профстандарты в базе (#50): новые типы, точный поиск по статьям, кодам
+функций и строкам перечня направлений."""
 
 import asyncio
 
@@ -15,7 +16,7 @@ from tests.integration.dao.support import Database
 
 pytestmark = pytest.mark.integration
 
-FGOS, LAW, ORDER, PS = "fgos-02.03.02", "273-fz", "order-245", "ps-06.001"
+FGOS, LAW, ORDER, LIST, PS = "fgos-02.03.02", "273-fz", "order-245", "order-1061", "ps-06.001"
 
 
 def document(doc_id: str, doc_type: str, direction: str | None, fragments: list[dict]):
@@ -49,6 +50,22 @@ CORPUS = [
         + [clause(LAW, "ст.2:п.9", "9) образовательная программа - комплекс характеристик")],
     ),
     document(ORDER, "federal_act", None, [clause(ORDER, "15", "15. Трудоемкость программы.")]),
+    document(
+        LIST,
+        "federal_act",
+        None,
+        [
+            {
+                "id": f"{LIST}:02.03.02",
+                "kind": "direction",
+                "number": "02.03.02",
+                "path": "Перечень направлений - бакалавриата › 02.00.00 КОМПЬЮТЕРНЫЕ НАУКИ",
+                "text": "02.03.02 Фундаментальная информатика\nКвалификация: Бакалавр",
+                "codes": ["02.03.02"],
+                "category": "02.00.00 КОМПЬЮТЕРНЫЕ НАУКИ",
+            }
+        ],
+    ),
     document(
         PS,
         "prof_standard",
@@ -99,9 +116,10 @@ def test_new_types_pass_table_constraints(migrated_database: Database, tools) ->
     with migrated_database.engine.connect() as connection:
         kinds = set(connection.scalars(text("SELECT DISTINCT kind FROM regulation_fragments")))
         types = set(connection.scalars(text("SELECT DISTINCT doc_type FROM regulation_documents")))
-    assert {"prof_standard", "generalized_function", "labor_function"} <= kinds
+    assert {"prof_standard", "generalized_function", "labor_function", "direction"} <= kinds
     assert "federal_act" in types
-    assert tools.doc_ids == [LAW, FGOS, ORDER, PS]  # акты и профстандарты — для любой программы
+    # акты и профстандарты — для любой программы
+    assert tools.doc_ids == [LAW, FGOS, LIST, ORDER, PS]
 
 
 def test_article_parts_are_found_exactly_in_number_order(tools) -> None:
@@ -125,3 +143,10 @@ def test_labor_functions_are_found_by_code(tools) -> None:
     )
     (generalized, *_) = run(tools.search_prof_standards("06.001 ОТФ D"))
     assert (generalized.id, generalized.method) == (f"{PS}:D", "exact")
+
+
+def test_direction_row_is_found_by_code_in_list_question(tools) -> None:
+    (row, *_) = run(tools.search_federal_acts("Какая квалификация присваивается по 02.03.02?"))
+    assert (row.id, row.kind, row.method) == (f"{LIST}:02.03.02", "direction", "exact")
+    hits = run(tools.search_all_regulations("Объем программы 02.03.02"))
+    assert all(h.method != "exact" for h in hits)  # код направления без вопроса о перечне

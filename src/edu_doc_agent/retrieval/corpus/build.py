@@ -18,9 +18,9 @@
         edition: "11144/1 от 24.08.2026"
       - file: laws/273-fz.pdf             # выгрузка из ГАРАНТа: название и редакция — по шапке
         type: federal_act
-        layout: law                      # law — по статьям и частям, order — по пунктам
+        layout: law                      # law — статьи и части, order — пункты, list — перечень
         doc_id: 273-fz
-      - files: "prof_standards/*.txt"    # профстандарт — текст карточки, всё по тексту
+      - files: "prof_standards/*.pdf"    # профстандарт: PDF с текстом (или .txt карточки с сайта)
         type: prof_standard
 
 Новый ФГОС или профстандарт добавляется без кода: положить файл в папку из `files` и
@@ -42,7 +42,7 @@ from edu_doc_agent.retrieval.corpus import garant
 from edu_doc_agent.retrieval.corpus.acts import LAYOUTS, chunk_act
 from edu_doc_agent.retrieval.corpus.chunker import chunk_document, detect_info
 from edu_doc_agent.retrieval.corpus.models import CorpusDocument, DocumentInfo, Overrides
-from edu_doc_agent.retrieval.corpus.prof_standard import chunk_prof_standard
+from edu_doc_agent.retrieval.corpus.prof_standard import card_from_pdf, chunk_prof_standard
 
 _META_KEYS = (
     "doc_id",
@@ -77,7 +77,11 @@ def _build_one(
 ) -> CorpusDocument:
     doc_type = entry["type"]
     if doc_type == "prof_standard":
-        return chunk_prof_standard(path.read_text(encoding="utf-8"), path.name, **given)
+        if path.suffix.lower() == ".pdf":
+            text = card_from_pdf(path)
+        else:
+            text = path.read_text(encoding="utf-8")
+        return chunk_prof_standard(text, path.name, **given)
     if doc_type == "federal_act":
         layout = entry.get("layout")
         if layout not in LAYOUTS:
@@ -146,9 +150,9 @@ def _report(documents: list[CorpusDocument], errors: list[str]) -> str:
     lines = ["# Корпус нормативов: отчёт сборки", ""]
     lines += [
         "| doc_id | Документ | Редакция | Пункты | Компетенции | Профстандарты "
-        "| Трудовые функции | Части |"
+        "| Трудовые функции | Направления | Части |"
     ]
-    lines += ["| --- | --- | --- | --- | --- | --- | --- | --- |"]
+    lines += ["| --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     for doc in documents:
         kinds = Counter(f.kind for f in doc.fragments if f.part == 0)
         parts = sum(1 for f in doc.fragments if f.part > 0)
@@ -156,7 +160,8 @@ def _report(documents: list[CorpusDocument], errors: list[str]) -> str:
         d = doc.document
         lines.append(
             f"| {d.doc_id} | {d.title} | {d.edition} | {kinds['clause']} | "
-            f"{kinds['competency']} | {kinds['prof_standard_ref']} | {functions} | {parts} |"
+            f"{kinds['competency']} | {kinds['prof_standard_ref']} | {functions} | "
+            f"{kinds['direction']} | {parts} |"
         )
     lines += ["", "## Замечания", ""]
     for doc in documents:

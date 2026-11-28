@@ -14,7 +14,8 @@ DocType = Literal["fgos", "spbu_standard", "prof_standard", "federal_act"]
 # clause — пункт норматива, часть статьи закона; competency — компетенция ФГОС или ОС;
 # prof_standard_ref — строка перечня профстандартов в приложении ФГОС;
 # prof_standard — общие сведения профстандарта; generalized_function / labor_function —
-# обобщённая трудовая функция и трудовая функция профстандарта
+# обобщённая трудовая функция и трудовая функция профстандарта; direction — строка перечня
+# направлений подготовки (приказ № 1061)
 FragmentKind = Literal[
     "clause",
     "competency",
@@ -22,6 +23,7 @@ FragmentKind = Literal[
     "prof_standard",
     "generalized_function",
     "labor_function",
+    "direction",
 ]
 DOC_TYPES: tuple[str, ...] = DocType.__args__
 FRAGMENT_KINDS: tuple[str, ...] = FragmentKind.__args__

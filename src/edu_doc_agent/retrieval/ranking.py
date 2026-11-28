@@ -48,12 +48,17 @@ _GENERALIZED_FUNCTION = re.compile(
     r"(?<![\wЁё.])([A-ZА-ЯЁ])\.\d(?![\d.])|\bОТФ\s*[«\"]?([A-ZА-ЯЁ])\b"
 )
 _LATIN = str.maketrans("АВСЕНКМОРТХ", "ABCEHKMOPTX")
+# код направления «02.03.02» — точный ключ строки перечня (приказ 1061), только в вопросе
+# о перечне: иначе любой вопрос о программе 02.03.02 начинался бы со строки перечня
+_DIRECTION_CODE = re.compile(r"(?<![\d.])\d{2}\.\d{2}\.\d{2}(?![\d.])")
+_ABOUT_LIST = re.compile(r"перечн|1061|наименовани|квалификаци(?!и\b)|присваива", re.I)
 
 
 @dataclass(frozen=True)
 class QueryKeys:
     """Что в запросе можно найти точно: коды компетенций, профстандартов и трудовых функций,
-    номера пунктов ФГОС и ОС («2.3»), пунктов приказов («15») и частей статей («ст.13:ч.5»)."""
+    направлений в вопросе о перечне, номера пунктов ФГОС и ОС («2.3»), пунктов приказов
+    («15») и частей статей («ст.13:ч.5»)."""
 
     codes: tuple[str, ...] = ()
     numbers: tuple[str, ...] = ()
@@ -76,6 +81,8 @@ def query_keys(query: str) -> QueryKeys:
         if not _INDICATOR_TAIL.match(upper, m.end())
     ]
     codes = [*competencies, *_prof_standard_codes(query)]
+    if _ABOUT_LIST.search(query):
+        codes += _DIRECTION_CODE.findall(query)
     numbers = [
         number
         for match in _CLAUSE_NUMBERS.findall(query)
